@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "secure-storage": "dist/cli/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "lint": "eslint src test --ext .ts",
@@ -15,6 +18,8 @@
     "synapse:down": "./throwaway_synapse/down.sh"
   },
   "dependencies": {
+    "commander": "^15.0.0",
+    "fake-indexeddb": "^6.2.5",
     "matrix-encrypt-attachment": "1.0.3",
     "matrix-js-sdk": "41.9.0"
   },
@@ -23,7 +28,7 @@
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "eslint": "^9.0.0",
-    "fake-indexeddb": "^6.2.5",
+    "tsx": "^4.23.1",
     "typescript": "^5.6.0",
     "vitest": "^2.0.0"
   }

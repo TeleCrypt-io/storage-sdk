@@ -404,4 +404,60 @@ describe("sharing", () => {
       stopTestClient(bob);
     }
   });
+
+  it("3.9 listMembers reports participants and their roles from membership + power levels", async () => {
+    const aliceUser = await registerTestUser("share_a");
+    const bobUser = await registerTestUser("share_b");
+    const charlieUser = await registerTestUser("share_c");
+    const alice = await createTestClient(aliceUser);
+    const bob = await createTestClient(bobUser);
+    try {
+      const aliceStore = new SecureStorage(alice);
+
+      const tree = await aliceStore.createTree("Members");
+      await waitFor(() => tree.room.name === "Members");
+
+      // Alice (the creator/owner) should already be reported even before
+      // anyone else is invited.
+      const soloMembers = await aliceStore.listMembers(tree);
+      expect(soloMembers.some((m) => m.userId === aliceUser.userId && m.role === "owner")).toBe(
+        true,
+      );
+
+      // Invite Bob as (default) viewer; he shows up as "invite" until he joins.
+      await tree.invite(bobUser.userId);
+      const invitedMembers = await waitFor(
+        async () => {
+          const members = await aliceStore.listMembers(tree);
+          const b = members.find((m) => m.userId === bobUser.userId);
+          return b ? members : null;
+        },
+        { label: "bob visible as invited", timeoutMs: 10000 },
+      );
+      const bobInvited = invitedMembers.find((m) => m.userId === bobUser.userId)!;
+      expect(bobInvited.role).toBe(TreePermissions.Viewer);
+      expect(bobInvited.membership).toBe("invite");
+
+      // Bob joins, and Alice promotes him to editor.
+      await bob.joinRoom(tree.id);
+      await tree.setPermissions(bobUser.userId, TreePermissions.Editor);
+      const joinedMembers = await waitFor(
+        async () => {
+          const members = await aliceStore.listMembers(tree);
+          const b = members.find((m) => m.userId === bobUser.userId);
+          return b?.membership === "join" && b.role === TreePermissions.Editor ? members : null;
+        },
+        { label: "bob joined as editor", timeoutMs: 10000 },
+      );
+      const bobJoined = joinedMembers.find((m) => m.userId === bobUser.userId)!;
+      expect(bobJoined.role).toBe(TreePermissions.Editor);
+      expect(bobJoined.membership).toBe("join");
+
+      // Charlie, who was never invited, must not appear at all.
+      expect(joinedMembers.some((m) => m.userId === charlieUser.userId)).toBe(false);
+    } finally {
+      stopTestClient(alice);
+      stopTestClient(bob);
+    }
+  });
 });

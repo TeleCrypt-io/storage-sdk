@@ -1,7 +1,7 @@
 import { ClientEvent, createClient, MatrixClient, SyncState } from "matrix-js-sdk";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
-import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api";
-import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
+import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api/index.js";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -283,8 +283,61 @@ export class SecureStorage {
     };
   }
 
+  /**
+   * Creates a new top-level shared folder (tree space).
+   *
+   * Works around a genuine race in matrix-js-sdk's own
+   * `unstableCreateFileTree()`: it creates the room via a plain
+   * `createRoom()` HTTP call, then immediately wraps the result by looking
+   * the room up in the *local* client store (`new MSC3089TreeSpace(this,
+   * roomId)` calls `client.getRoom(roomId)` and throws `Error("Unknown
+   * room")` if it's not there yet). The local store is only populated by
+   * the client's background sync processing, which is asynchronous and can
+   * easily not have caught up in the few milliseconds between the HTTP
+   * response and that lookup — especially right after a client has just
+   * started. The room really was created server-side by that point (that's
+   * how we get "Unknown room" at all); this method waits for the client's
+   * own ongoing sync loop to surface it, then wraps it directly via
+   * `unstableGetFileTreeSpace`, instead of surfacing a spurious failure for
+   * a folder that in fact exists.
+   */
   async createTree(name: string): Promise<TreeSpace> {
-    return this.client.unstableCreateFileTree(name) as unknown as TreeSpace;
+    const knownRoomIdsBefore = new Set(this.client.getRooms().map((r) => r.roomId));
+    try {
+      // The `await` here is load-bearing: without it, the promise's
+      // eventual rejection would happen after this try/catch has already
+      // returned, bypassing the recovery logic below entirely.
+      return (await this.client.unstableCreateFileTree(name)) as unknown as TreeSpace;
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== "Unknown room") throw err;
+
+      const newRoomId = await new Promise<string>((resolve, reject) => {
+        const deadline = Date.now() + 15000;
+        const poll = () => {
+          const found = this.client.getRooms().find((r) => !knownRoomIdsBefore.has(r.roomId));
+          if (found) {
+            resolve(found.roomId);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            reject(
+              new Error(
+                "createTree: room was created server-side but never appeared in this client's local sync state",
+              ),
+            );
+            return;
+          }
+          setTimeout(poll, 200);
+        };
+        poll();
+      });
+
+      const tree = this.client.unstableGetFileTreeSpace(newRoomId) as unknown as TreeSpace | null;
+      if (!tree) {
+        throw new Error(`createTree: room ${newRoomId} appeared but is not a valid file tree space`);
+      }
+      return tree;
+    }
   }
 
   async listTrees(): Promise<TreeSpace[]> {
@@ -307,6 +360,74 @@ export class SecureStorage {
     ) as unknown as TreeSpace | null;
   }
 
+  /**
+   * Lists the participants of a shared folder (tree space) and their role,
+   * derived from room membership (join/invite state) + power levels.
+   * Includes invited-but-not-yet-joined members as well as joined ones;
+   * excludes anyone who has left/been kicked/banned.
+   *
+   * Deliberately reads directly from the server's authoritative REST state
+   * endpoints (`GET .../members`, `GET .../state/m.room.power_levels/`)
+   * rather than from the client's locally synced `tree.room`/`currentState`.
+   * On a freshly-started client (as every CLI command is — see
+   * docs/CLI_SPEC.md and src/cli/cryptoSnapshot.ts), room membership and
+   * power-level state can take several more `/sync` round trips to fully
+   * converge locally after a change, even though the room itself is already
+   * visible — reading the same data straight from the server sidesteps that
+   * sync-convergence lag entirely. The role thresholds mirror
+   * `MSC3089TreeSpace.getPermissions()` exactly (userLevel >= adminLevel ->
+   * owner, >= editLevel -> editor, else viewer).
+   */
+  async listMembers(
+    tree: TreeSpace,
+  ): Promise<{ userId: string; role: string; membership: string }[]> {
+    const clientAny = this.client as unknown as {
+      getHomeserverUrl: () => string;
+      getAccessToken: () => string | null;
+    };
+    const baseUrl = clientAny.getHomeserverUrl();
+    const token = clientAny.getAccessToken();
+    const authHeaders = { Authorization: `Bearer ${token}` };
+    const roomPath = `${baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(tree.id)}`;
+
+    const [membersRes, powerLevelsRes] = await Promise.all([
+      fetch(`${roomPath}/members`, { headers: authHeaders }),
+      fetch(`${roomPath}/state/m.room.power_levels/`, { headers: authHeaders }),
+    ]);
+    if (!membersRes.ok) {
+      throw new Error(`listMembers: failed to fetch room members (${membersRes.status})`);
+    }
+    const membersBody = (await membersRes.json()) as {
+      chunk: { state_key: string; content: { membership?: string } }[];
+    };
+    const pls = powerLevelsRes.ok
+      ? ((await powerLevelsRes.json()) as {
+          users_default?: number;
+          events_default?: number;
+          events?: Record<string, number>;
+          users?: Record<string, number>;
+        })
+      : {};
+
+    const viewLevel = pls.users_default ?? 0;
+    const editLevel = pls.events_default ?? 50;
+    const adminLevel = pls.events?.["m.room.power_levels"] ?? 100;
+    const roleFor = (userId: string): string => {
+      const userLevel = pls.users?.[userId] ?? viewLevel;
+      if (userLevel >= adminLevel) return "owner";
+      if (userLevel >= editLevel) return "editor";
+      return "viewer";
+    };
+
+    return membersBody.chunk
+      .filter((e) => e.content.membership === "join" || e.content.membership === "invite")
+      .map((e) => ({
+        userId: e.state_key,
+        membership: e.content.membership as string,
+        role: roleFor(e.state_key),
+      }));
+  }
+
   async uploadFile(
     tree: TreeSpace,
     name: string,
@@ -327,7 +448,18 @@ export class SecureStorage {
     branch: FileBranch,
   ): Promise<{ data: ArrayBuffer; mimetype: string }> {
     const { info } = await branch.getFileInfo();
-    const mxcUrl = info.url as string;
+    // If the underlying room event couldn't be decrypted (e.g. this device
+    // never received/recovered the megolm session for it), matrix-js-sdk
+    // hands back a placeholder with no usable `info` rather than throwing —
+    // so without this check, callers would hit an opaque
+    // "Cannot read properties of undefined" a few lines down instead of a
+    // clear, actionable error.
+    if (!info || typeof info.url !== "string") {
+      throw new Error(
+        "downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)",
+      );
+    }
+    const mxcUrl = info.url;
     const clientAny = this.client as unknown as {
       mxcUrlToHttp: (
         mxc: string,

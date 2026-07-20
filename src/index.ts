@@ -1,1 +1,1 @@
-export { SecureStorage } from "./SecureStorage";
+export { SecureStorage } from "./SecureStorage.js";
