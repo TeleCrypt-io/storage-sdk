@@ -1,12 +1,16 @@
 # Appended to the generated homeserver.yaml by up.sh.
 # THROWAWAY TEST CONFIG ONLY — never use these settings on a real server.
 #
-# Purpose: open registration (no email/captcha) and effectively disable every
-# rate limiter, so a functional test suite can create users and hammer the server
-# without hitting M_LIMIT_EXCEEDED (see TRAP 2 in IMPLEMENTATION_PLAN.md).
-
-enable_registration: true
-enable_registration_without_verification: true
+# Purpose: effectively disable every rate limiter, so a functional test suite
+# can create users and hammer the server without hitting M_LIMIT_EXCEEDED (see
+# TRAP 2 in IMPLEMENTATION_PLAN.md).
+#
+# NOTE: enable_registration/enable_registration_without_verification are
+# deliberately NOT set here — Synapse refuses to start with
+# "Registration cannot be enabled when OAuth delegation is enabled". Account
+# creation goes through MAS now (see matrix_authentication_service block
+# appended separately by up.sh, and test/harness/users.ts / ui/test/e2e/testUsers.ts,
+# which provision accounts via `mas-cli manage register-user`).
 
 # Media: allow large-ish uploads for file tests. Local media is not purged by
 # default (no media_retention lifetimes set), which is what we want for a storage

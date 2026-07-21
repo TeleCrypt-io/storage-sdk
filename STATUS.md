@@ -17,6 +17,249 @@
 | 7 | **`core/` extraction** — platform-agnostic operations + typed result contract, shared by the CLI now and a future UI | ✅ |
 | 8 | **Public rebrand + npm Trusted Publishing** — `TeleCryptIOStorage`, `@telecrypt-io/storage`, `telecrypt-io storage` CLI, OIDC publish workflow | ✅ |
 | 9 | **React web UI (`ui/`)** — thin adapter over `core/`, browser-native IndexedDB, Vitest wiring + Playwright E2E (real Synapse) | ✅ |
+| 10 | **MAS/OAuth login** — CLI device-code grant, UI authorization-code+PKCE, local MAS-delegated throwaway stack, additive to password login | ✅ |
+
+## Phase 10 — MAS/OAuth login (this session)
+
+Added MAS/OIDC login as an **additive** auth path alongside the existing password
+login, to both the CLI and the web UI, plus a local MAS-delegated Synapse in the
+throwaway test stack to verify it end-to-end. Full spec: `docs/OAUTH_SPEC.md`.
+Rationale + actual outcome: `docs/DECISIONS.md` D6 (updated with what actually
+happened, since reality differed from the plan in a few places — see below).
+
+**Part A — local MAS stack (`throwaway_synapse/`), architecture: unified.**
+The advisor-recommended probe (register a user via `mas-cli`, log in via
+compat, run `bootstrapCrossSigning` + `bootstrapSecretStorage`/key backup)
+passed cleanly against a MAS-delegated Synapse — cross-signing/recovery work
+fine under MSC3861 delegation, no extra reauth needed for a brand-new
+account. So the decision was **architecture A (unified)**: ONE MAS-delegated
+Synapse now serves both the 51 pre-existing tests AND the new OAuth tests,
+not a second parallel stack.
+
+`throwaway_synapse/up.sh`/`down.sh` now bring up 4 containers on a shared
+podman network (`throwaway-net`), still off by default, still idempotent
+(`--fresh` wipes and regenerates):
+- **Postgres** (`throwaway-mas-db`) — MAS requires it, no SQLite support.
+- **MAS** (`throwaway-mas`, image `ghcr.io/element-hq/matrix-authentication-service:latest`)
+  — config generated once via `mas-cli config generate`, then patched
+  (`throwaway_synapse/patch_mas_config.py`) for: the throwaway Postgres URI;
+  `matrix.homeserver`/`secret`/`endpoint` (shared secret with Synapse,
+  generated once via `openssl rand -hex 32`, cached in `data/mas-shared-secret`,
+  gitignored); `http.public_base`/`issuer` = `http://localhost:8082/` (MAS
+  gets its own direct host port — simpler for local dev than mimicking
+  prod's same-origin `/auth/` path, since both the Node test process and a
+  real browser just need MAS reachable, not necessarily same-origin as the
+  homeserver); a permissive dev-only DCR policy (`allow_host_mismatch`,
+  `allow_insecure_uris`); and generous `rate_limiting.login`/`registration`
+  overrides (MAS's own defaults, burst 3 / very slow refill, are far too
+  tight for a test suite hammering `/login` — same rationale as
+  `homeserver.extra.yaml`'s existing `rc_login` override, just MAS's own
+  separate limiter now that MAS handles compat login, not Synapse) —
+  plus `database.max_connections: 50` (default 10 was tight enough to
+  contribute to a transient 500 under full-suite concurrency, see below).
+- **Synapse** (`throwaway-synapse`) — same base config as before, with
+  `matrix_authentication_service: {enabled: true, endpoint, secret}`
+  appended. One real config conflict found and fixed:
+  `enable_registration`/`enable_registration_without_verification` (the
+  existing throwaway overrides) make Synapse refuse to start at all once
+  OAuth delegation is enabled ("Registration cannot be enabled when OAuth
+  delegation is enabled") — removed from `homeserver.extra.yaml`, since
+  account creation goes through MAS now regardless.
+- **Caddy front door** (`throwaway-proxy`, image `docker.io/library/caddy`)
+  now owns the public `:8008` "homeserver" URL every test/CLI/UI default
+  already points at (`throwaway_synapse/Caddyfile`). MAS's own docs are
+  explicit that three Matrix C-S API endpoints — `/_matrix/client/*/login`,
+  `*/logout`, `*/refresh` — must be proxied to MAS directly once delegated;
+  Synapse no longer serves them itself. Caddy routes those three paths to
+  MAS, everything else to Synapse — confirmed via the front door still
+  advertising `m.login.password` in its login flows (compatibility mode) and
+  `versions` proxying through to Synapse untouched.
+
+**The one real harness change** (as the spec anticipated): account creation
+moved from `POST /_matrix/client/v3/register` (Synapse now refuses this —
+403 once delegated) to `mas-cli manage register-user <username> --password
+<pw> --yes --ignore-password-complexity` (shelled out via `podman exec
+throwaway-mas`, see `test/harness/users.ts`'s `registerUserInMas`).
+Password *login* is completely unchanged — a plain
+`POST /_matrix/client/v3/login`, now transparently proxied by Caddy to MAS's
+compat endpoint. Three call sites needed this swap: `test/harness/users.ts`
+(`registerTestUser`, used by all 47 non-CLI functional tests),
+`ui/test/e2e/testUsers.ts` (`registerE2eUser`, the 4 UI E2E tests), and
+`test/functional/cli.test.ts`'s own `registerProfile` helper (which drove
+the CLI's own `storage register` command — that command still works fine
+against a plain, non-MAS Synapse, its implementation is untouched, but it
+can't work against this now-delegated throwaway stack, so the test helper
+provisions via MAS then drives the CLI's `storage login` instead).
+
+**Two real bugs found and fixed while getting the 51 green again:**
+1. **MAS enforces the Matrix user ID grammar strictly (lowercase
+   localpart)** — the old plain `POST /register` silently accepted mixed
+   case; `mas-cli manage register-user` doesn't ("Username not available on
+   homeserver" for anything with an uppercase letter). A few existing test
+   prefixes were historically mixed-case (`cli.test.ts`'s `"multiA"`,
+   `"membersA"`, etc.) — fixed by lowercasing defensively in the three
+   username-generation call sites, not by renaming the prefixes (smaller
+   diff, and defensive lowercasing is correct regardless of what future
+   prefixes get added).
+2. **MAS provisions the Synapse-side account *asynchronously*** — confirmed
+   via MAS's own logs (`job-provision-user`, `job-sync-devices` background
+   jobs): `mas-cli manage register-user` returns as soon as the account
+   exists in MAS's own database, but a login attempted before the
+   background job finishes creating the account+device on Synapse's side
+   gets a transient `500` (Synapse 404 "User not found" on
+   `/_synapse/mas/upsert_device`, surfaced by MAS as "failed to provision
+   device"). Invisible under light load (the job finishes well within the
+   gap between register and login); became a real, reproducible flake once
+   the OAuth test file brought the suite to 9 concurrent files all
+   registering/logging in around the same time. Fixed by retrying login
+   specifically on a 500 (bounded, ~20 attempts / 300ms apart — polls the
+   real condition, not a fixed sleep; any other status still fails fast) in
+   `test/harness/users.ts` (`registerTestUser`'s internal `loginWithRetry`,
+   plus a new `registerAndWaitForMasProvisioning` for callers like
+   `cli.test.ts` that need to drive their own subsequent login) and the
+   UI E2E harness's matching `registerE2eUser`. Verified deterministic
+   after the fix: full 53-test suite run 3 times (including one from a
+   completely fresh `--fresh` stack), zero flakiness.
+
+**Part B — OAuth in `src/core/oidc.ts` (shared by CLI and UI).** Thin
+wrapper over matrix-js-sdk's real OIDC API
+(`node_modules/matrix-js-sdk/lib/oidc/`) — discovery
+(`client.getAuthMetadata()`), dynamic client registration
+(`registerOidcClient`), device-code grant (matrix-js-sdk already wraps RFC
+8628 — `startDeviceAuthorization`/`waitForDeviceAuthorization` — no need to
+hand-roll polling), authorization-code+PKCE (`generateOidcAuthorizationUrl`/
+`completeAuthorizationCodeGrant`), plus small shared helpers
+(`extractDeviceIdFromScope` — the authorization-code flow's granted
+`device_id` only surfaces via the token response's `scope` string;
+`whoAmI` — neither flow's token response includes the Matrix user ID).
+`TeleCryptIOStorage.createFromOidc(...)` mirrors `create()` (refactored to
+share a private `bootstrap()` helper) but sourced from an OIDC token set,
+with an optional `tokenRefreshFunction` wired into the underlying
+`MatrixClient` for transparent mid-request refresh.
+
+**Deliberately NOT using matrix-js-sdk's `OidcTokenRefresher`** for token
+refresh — found via direct testing, not guessed: it unconditionally
+constructs an internal `oidc-client-ts` `OidcClient` requiring
+`window.sessionStorage`/`window.localStorage`, even though a plain
+`grant_type=refresh_token` exchange never actually reads or writes them.
+Under Node this throws `ReferenceError: window is not defined` before ever
+reaching the token endpoint. Fixed by NOT using it: `core/oidc.ts`'s
+`refreshOidcToken`/`buildTokenRefreshFunction` do a plain hand-rolled
+`fetch` POST to the token endpoint instead (public client — DCR registers
+`token_endpoint_auth_method: "none"` — so refresh needs only `client_id` in
+the body, no secret). Works identically in Node and the browser, so both
+adapters share the exact same code, zero platform-specific refresh logic.
+`client.getAuthMetadata()` (used once, at discovery time) has the same
+`window` dependency, unavoidably (it's matrix-js-sdk's own recommended,
+non-deprecated discovery path) — handled narrowly by
+`src/cli/oidcWindowPolyfill.ts`'s `withOidcWindowShim()`, a *scoped*
+install-then-remove of a minimal in-memory `Storage` stub, used only around
+that one call at CLI login time. Deliberately NOT a permanent
+`globalThis.window` assignment: that broke something else entirely —
+`@matrix-org/matrix-sdk-crypto-wasm`'s own environment detection
+(`typeof window !== "undefined"` → assumes real browser IndexedDB) started
+failing with "Unsupported environment" the moment `window` existed at all,
+since the CLI's whole crypto-persistence design (`docs/DECISIONS.md` D1)
+depends on Node being detected as Node. Confirmed safe to scope narrowly:
+the shim is installed and removed within one `await`, at login time, before
+any `TeleCryptIOStorage`/`MatrixClient`/crypto WASM exists in the process —
+never overlapping with anything crypto-related. The UI never needs this at
+all (a real browser has real `window.localStorage`/`sessionStorage`
+natively) — `StorageContext.tsx` just re-discovers the issuer's
+`token_endpoint` on each session restore, cheap and safe client-side.
+
+**Part C — CLI device-code login.** `telecrypt-io storage login --oidc`
+(`src/cli/oidc.ts`'s `runDeviceCodeLogin`): discovery → DCR (client metadata
+`clientUri: "https://telecrypt.io/"`, `redirectUris: ["http://localhost:0/"]`
+— a DCR-schema placeholder never actually dereferenced, since device-code
+never redirects a browser; **unverified against production MAS's DCR
+policy**, only exercised against the permissive local dev MAS — see
+`docs/DECISIONS.md` D6) → start device authorization with a CLI-chosen
+`device_id` (`generateScope(deviceId)` embeds it, confirmed identical to the
+resulting Matrix `device_id` via `/whoami`) → prints the verification URL +
+short user code to **stderr** (never stdout — keeps the `--json`/text
+stdout contract intact for scripts) → best-effort browser auto-open
+(`xdg-open`/`open`/`start`, swallows failure) → polls until approved →
+persists the full OIDC token set (`accessToken`, `refreshToken`,
+`oidcIssuer`, `oidcClientId`, `oidcTokenEndpoint`) into the existing
+profile's `session.json`, so later commands reuse it and refresh transparently
+(`src/cli/storage.ts`'s `buildStorageForSession`, which wires a
+`tokenRefreshFunction` that persists any refreshed tokens straight back to
+`session.json`). Existing password `login`/`register` are completely
+unchanged. Verified manually end-to-end against the local MAS (register via
+`mas-cli`, run `storage login --oidc`, approve headlessly over HTTP — see
+Part A tests below — then `storage whoami`/`storage folder create` both
+work on the resulting session) before writing the automated test.
+
+**Part D — Web UI authorization-code + PKCE.** `ui/src/lib/oidcAuth.ts`:
+`beginOidcLogin` — discover → DCR (client_id cached in `localStorage` keyed
+by issuer, never re-registered on repeat logins) → PKCE authorization URL →
+`window.location.href = url` redirect. PKCE `code_verifier`/`state` are
+**not** managed by our code at all — `generateOidcAuthorizationUrl`
+persists them itself via `oidc-client-ts`'s `WebStorageStateStore` into
+`window.sessionStorage` (`mx_oidc_`-prefixed keys), and
+`completeAuthorizationCodeGrant` reads them back the same way on return; the
+one thing genuinely worth trying to hand-manage turned out to need no
+hand-management at all. `completeOidcLoginFromCallback` — detects `?code&state`
+on load, exchanges it, extracts `device_id` from the granted scope, confirms
+identity via `/whoami`, clears the query params (`history.replaceState`,
+so a reload can't replay a spent code), stores the token set in
+`localStorage`. `StorageContext.tsx` wires `TeleCryptIOStorage.createFromOidc`
+with a `tokenRefreshFunction` that persists refreshed tokens back to
+`localStorage`, same pattern as the CLI's `session.json`. Redirect URI is
+`window.location.origin + "/"` — works unchanged for both
+`http://localhost:5173/` (dev, local MAS) and the eventual
+`https://storage.telecrypt.io/` (prod, real MAS). Existing password
+login/register untouched; a new "Log in with MAS/OIDC" button
+(`data-testid="oidc-login"`) sits alongside them in `LoginScreen`.
+
+**Tests — all real, no mocks, run against the local MAS:**
+- `test/functional/oidc.test.ts` (2 new root-suite tests):
+  - **O.1** — full device-code grant end-to-end: discovery, DCR, start
+    device authorization, approve it *exactly* as a human would (real MAS
+    login form + device-link form + consent form — driven headlessly over
+    plain HTTP with a hand-rolled cookie jar, `test/harness/oidcApproval.ts`'s
+    `approveDeviceCodeViaHttp`; MAS's pages turned out to be plain
+    server-rendered forms with CSRF tokens and no JS challenge, so this
+    needed no browser at all), poll for the token, confirm via `/whoami`,
+    build a `TeleCryptIOStorage.createFromOidc`, create a folder and confirm
+    it's listable — the same "genuinely usable storage, not just a token
+    whoami accepts" bar the rest of this suite holds itself to.
+  - **O.2** — token refresh: a raw `refreshOidcToken` call yields a
+    genuinely different access token, confirmed independently usable
+    (`/whoami` + a real `createFolder`); separately exercises
+    `buildTokenRefreshFunction`'s persistence-hook wiring directly (the
+    exact function both `src/cli/storage.ts` and
+    `ui/src/context/StorageContext.tsx` wire into `createFromOidc`).
+  - Both run twice in a row deterministically (plus 3x as part of the full
+    53-test suite, including one from a fresh `--fresh` stack).
+- `ui/test/e2e/oidc.spec.ts` (1 new Playwright E2E test) — authorization-code
+  + PKCE, driven through the **real** MAS login + consent pages in a real
+  browser (no mocks, no shortcuts): click "Log in with MAS/OIDC", fill MAS's
+  real login form, approve the real consent screen, land back logged into
+  the app, then create a folder to prove the token is fully functional. This
+  is the spec's "ideal" path for the PKCE requirement (a Playwright test
+  driving the real MAS login UI) — the login UI turned out straightforward
+  to drive (plain forms, `getByLabel`/`getByRole` selectors), so no
+  programmatic-fallback test was needed for this bullet. Passed on the first
+  real run; ran 3x total (2x isolated + once as part of the full 5-test UI
+  E2E suite) with zero flakiness.
+- No `.skip`/`.only`/`.todo` anywhere.
+
+**Final verification:** fresh `throwaway_synapse/up.sh --fresh` (previous
+`./down.sh --wipe`) → root `npm test` **53/53**, run 3 times total (2 on
+warm state, 1 on the fresh stack) → `ui/` `npm test` **11/11** (unchanged
+wiring tests, still mocked at the `core/` boundary) → `ui/` `npm run e2e`
+**5/5**, run 3 times total (2 warm, 1 fresh) → root `npm run lint` +
+`npm run build` clean → `ui/` `npm run lint` + `npm run build` clean (one
+pre-existing harmless `react-refresh` warning, same as before this session).
+Stack brought back down (`throwaway_synapse/down.sh`) at the end, off by
+default as required.
+
+No `BLOCKERS.md` was needed — every obstacle (Synapse's registration
+conflict, MAS's stricter username grammar, the async-provisioning race, the
+`OidcTokenRefresher`/`window` gap) had a real fix, not a workaround that
+weakened a test or skipped a requirement.
 
 ## Phase 9 — React web UI (this session)
 

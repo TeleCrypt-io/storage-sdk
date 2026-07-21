@@ -2,6 +2,7 @@ import { ClientEvent, createClient, MatrixClient, SyncState } from "matrix-js-sd
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
 import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
+import type { TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -85,6 +86,35 @@ export interface CreateTeleCryptIOStorageOptions {
   cryptoCallbacks?: CryptoCallbacks;
 }
 
+/**
+ * Options for `TeleCryptIOStorage.createFromOidc` — mirrors
+ * `CreateTeleCryptIOStorageOptions` but sourced from an OIDC/MAS login
+ * (device-code or authorization-code+PKCE, see `src/core/oidc.ts`) instead
+ * of a password login. Same resulting shape either way: a ready
+ * `TeleCryptIOStorage` with a persistent crypto store.
+ */
+export interface CreateFromOidcOptions {
+  baseUrl: string;
+  userId: string;
+  accessToken: string;
+  deviceId: string;
+  /** If provided (together with `tokenRefreshFunction`), wires the
+   * underlying MatrixClient so an expired access token is transparently
+   * refreshed mid-request. */
+  refreshToken?: string;
+  /** See `src/core/oidc.ts`'s `buildTokenRefreshFunction` — a plain
+   * `(refreshToken) => Promise<AccessTokens>`, deliberately NOT
+   * matrix-js-sdk's `OidcTokenRefresher` (see that file's doc comment for
+   * why: it requires `window.sessionStorage`, which doesn't exist under
+   * Node). */
+  tokenRefreshFunction?: TokenRefreshFunction;
+  persistentCryptoStore?: boolean;
+  cryptoDatabasePrefix?: string;
+  initialSyncLimit?: number;
+  syncTimeoutMs?: number;
+  cryptoCallbacks?: CryptoCallbacks;
+}
+
 export class TeleCryptIOStorage {
   constructor(private client: MatrixClient) {}
 
@@ -114,6 +144,41 @@ export class TeleCryptIOStorage {
       cryptoCallbacks: opts.cryptoCallbacks ?? {},
     });
 
+    return TeleCryptIOStorage.bootstrap(client, opts);
+  }
+
+  /**
+   * As `create()`, but the resulting `MatrixClient` was authenticated via
+   * OIDC/MAS (device-code or authorization-code+PKCE — see
+   * `src/core/oidc.ts`) rather than `m.login.password`. If `refreshToken` +
+   * `tokenRefresher` are both given, the client's `tokenRefreshFunction` is
+   * wired so an expired access token is transparently refreshed mid-request
+   * — same mechanism matrix-js-sdk uses for any refresh-token-capable login.
+   */
+  static async createFromOidc(opts: CreateFromOidcOptions): Promise<TeleCryptIOStorage> {
+    const client = createClient({
+      baseUrl: opts.baseUrl,
+      userId: opts.userId,
+      accessToken: opts.accessToken,
+      deviceId: opts.deviceId,
+      refreshToken: opts.refreshToken,
+      tokenRefreshFunction:
+        opts.refreshToken && opts.tokenRefreshFunction ? opts.tokenRefreshFunction : undefined,
+      cryptoCallbacks: opts.cryptoCallbacks ?? {},
+    });
+
+    return TeleCryptIOStorage.bootstrap(client, opts);
+  }
+
+  /** Shared post-construction bootstrap for `create()`/`createFromOidc()`:
+   * persistent crypto store, first sync, wrap in a `TeleCryptIOStorage`. */
+  private static async bootstrap(
+    client: MatrixClient,
+    opts: Pick<
+      CreateTeleCryptIOStorageOptions,
+      "userId" | "deviceId" | "persistentCryptoStore" | "cryptoDatabasePrefix" | "initialSyncLimit" | "syncTimeoutMs"
+    >,
+  ): Promise<TeleCryptIOStorage> {
     const persistent = opts.persistentCryptoStore ?? true;
     await client.initRustCrypto({
       useIndexedDB: persistent,

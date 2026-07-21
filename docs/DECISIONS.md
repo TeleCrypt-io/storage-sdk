@@ -57,6 +57,81 @@ standard and low-risk per request, but relaxing prod MAS's DCR policy to accept 
 is a *standing* loosening of two guardrails (HTTPS-only + coherent-host) affecting every future
 DCR client — small but permanent surface increase. A disposable local MAS avoids it entirely.
 
+**ACTUAL OUTCOME (built 2026-07-21, same session as the decision above — see `STATUS.md`
+Phase 10 for the full account). Reality matched the plan on the big calls, diverged on a
+few implementation details worth recording so they don't get re-litigated:**
+
+- **Local-MAS architecture: unified, not dual-stack.** Before building anything, ran the
+  advisor-recommended probe — register a user via `mas-cli`, log in via compat, run
+  `bootstrapCrossSigning`/`bootstrapSecretStorage`/key backup — against a real MAS-delegated
+  Synapse. It passed cleanly (no extra reauth needed for cross-signing on a brand-new
+  account under MSC3861 delegation). So the throwaway stack now runs **one** MAS-delegated
+  Synapse serving both the 51 pre-existing tests and the new OAuth tests — not point 4's
+  literal "disposable MAS next to the disposable Synapse" as a separate parallel stack.
+  Simpler to maintain, and it's what "the one real harness change is routing test-user
+  creation through MAS" (point 4) already implied.
+- **A front-door reverse proxy (Caddy) turned out to be required, not optional.** MAS's own
+  docs are explicit that `/_matrix/client/*/login`, `*/logout`, `*/refresh` must be proxied
+  to MAS directly once delegated — Synapse stops serving them itself (confirmed: a bare
+  delegated Synapse 404s "Unrecognized request" on `/login`). `throwaway_synapse/Caddyfile`
+  now owns the public `:8008` URL, routing those three paths to MAS and everything else to
+  Synapse, so every existing test/CLI/UI default (`http://localhost:8008`) keeps working
+  unchanged. This mirrors what a real production reverse proxy (e.g. the owner's own Caddy in
+  front of telecrypt.io) must already be doing.
+- **`OidcTokenRefresher` (matrix-js-sdk's class) is unusable under Node** — confirmed by
+  direct testing, not assumed: it unconditionally constructs an `oidc-client-ts` `OidcClient`
+  requiring `window.sessionStorage`/`window.localStorage`, even though a plain
+  `grant_type=refresh_token` exchange never reads or writes them. Fixed by NOT using it:
+  `src/core/oidc.ts`'s `refreshOidcToken`/`buildTokenRefreshFunction` hand-roll the refresh
+  as a plain `fetch` POST instead (the DCR'd client is public — `token_endpoint_auth_method:
+  "none"` — so refresh needs only `client_id`, no secret). Works identically in Node and the
+  browser; both the CLI and UI adapters share the exact same refresh code now, which is
+  *more* unified than the original plan, not less. `client.getAuthMetadata()` (discovery)
+  has the same underlying `window` dependency and is unavoidable (it's matrix-js-sdk's own
+  recommended non-deprecated discovery path) — handled with a narrowly *scoped*
+  install-then-remove `window` stub (`src/cli/oidcWindowPolyfill.ts`), used only around that
+  one call at CLI login time. A *permanent* `globalThis.window` was tried first and broke
+  something unrelated: `@matrix-org/matrix-sdk-crypto-wasm`'s own environment detection
+  (`typeof window !== "undefined"` → assumes real browser IndexedDB) started throwing
+  "Unsupported environment" the moment `window` existed at all, since the CLI's whole
+  crypto-persistence design (D1) depends on Node being detected as Node.
+- **DCR redirect URIs for the CLI's device-code client remain unverified against production
+  MAS.** The local dev MAS's permissive policy (`allow_host_mismatch`, `allow_insecure_uris`)
+  accepts a placeholder `http://localhost:0/` redirect URI that's never actually
+  dereferenced (device-code never redirects a browser). Point 2 above ("device code also
+  means the CLI needs no prod-MAS policy change at all") is about the *grant flow* needing
+  no redirect — it's still true that no *authorization* redirect happens — but dynamic
+  *client registration* itself still requires *some* syntactically valid `redirect_uris`
+  entry, and whether telecrypt.io's stricter prod DCR policy accepts a loopback-style
+  placeholder for a `native` client is unverified; only exercised against the local MAS.
+  Do not assume this works against telecrypt.io without testing it there first.
+- **Two real MAS-specific gotchas surfaced while getting the 51 tests green again** (full
+  detail in `STATUS.md` Phase 10): Synapse refuses to start with delegation enabled AND the
+  throwaway stack's old `enable_registration: true` override present ("Registration cannot
+  be enabled when OAuth delegation is enabled") — removed the override, since account
+  creation goes through MAS regardless. And MAS enforces the Matrix user ID grammar strictly
+  (lowercase localpart only), unlike the old plain `POST /register`, which silently accepted
+  mixed case — a few historically mixed-case test username prefixes needed defensive
+  lowercasing.
+- **A genuine flake, root-caused, not papered over:** MAS provisions the Synapse-side account
+  *asynchronously* (confirmed via MAS's own background-job logs) — a login attempted before
+  that job finishes can transiently 500. Invisible under light load, real under the full
+  suite's concurrency once the OAuth test file joined it. Fixed by retrying login
+  specifically on a 500 (bounded, polls the real condition), not a fixed sleep.
+- **The PKCE "Playwright vs. programmatic" fallback question resolved itself:** MAS's login
+  and consent pages turned out to be plain server-rendered forms with CSRF tokens and no JS
+  challenge — easy to drive both in a real Playwright browser (`ui/test/e2e/oidc.spec.ts`,
+  the spec's "ideal" path, built and green) and headlessly over raw HTTP with a hand-rolled
+  cookie jar (used for the CLI's device-code approval in `test/functional/oidc.test.ts`,
+  since that test needs to act as "the approving party" without a browser at all). No
+  programmatic PKCE fallback was needed in addition to the Playwright test — the Playwright
+  test alone satisfies that requirement.
+
+All three deliverables (CLI device-code, UI PKCE, local MAS) ended up built and verified
+end-to-end: 53/53 root tests (51 original + 2 new OIDC), 5/5 UI E2E (4 original + 1 new
+OIDC/PKCE), all run multiple times including from a fresh `--fresh` stack, zero flakiness
+after the fixes above. No `BLOCKERS.md` was needed.
+
 ---
 
 ## D5 — UI is a thin adapter over `core/`; browser IndexedDB is native, no snapshot

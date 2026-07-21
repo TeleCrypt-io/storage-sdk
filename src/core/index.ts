@@ -3,3 +3,4 @@
 export * from "./types.js";
 export * from "./operations.js";
 export * from "./errors.js";
+export * from "./oidc.js";
