@@ -4,6 +4,61 @@ Short records of choices that would otherwise get re-litigated. Newest first.
 
 ---
 
+## D6 — MAS/OAuth auth (additive), hosted UI on storage.telecrypt.io, llms.txt
+
+**Decided 2026-07-21. Verified live against real telecrypt.io MAS before deciding.**
+
+Goal: host the web UI at `storage.telecrypt.io` (GitHub Pages), authenticating against
+telecrypt.io only; add MAS/OAuth login to BOTH the CLI and the web UI; drop an `llms.txt`
+for agent use.
+
+**Verified facts (curled telecrypt.io, 2026-07-21):**
+- Homeserver `https://telecrypt.io`; MAS issuer `https://telecrypt.io/auth/`.
+- MAS has **dynamic client registration** (`.../auth/oauth2/registration`), **device grant**
+  (`.../auth/oauth2/device`), `authorization_code` + `refresh_token`, PKCE S256.
+- **Password login STILL works** on telecrypt.io — `m.login.password` is offered alongside
+  `m.login.sso` (`org.matrix.msc3824.delegated_oidc_compatibility`). So MAS runs in
+  **compatibility mode**. This is why OAuth is *additive*, not a replacement.
+- matrix-js-sdk (installed, v41) exposes the OIDC API we need:
+  `discoverAndValidateOIDCIssuerWellKnown`, `registerOidcClient`, `generateOidcAuthorizationUrl`,
+  `completeAuthorizationCodeGrant`, `OidcTokenRefresher`, `client.getAuthMetadata()`.
+
+**Decisions:**
+1. **OAuth is additive; the 51 storage/E2EE tests and the password path stay unchanged.**
+   OAuth is a new door yielding the same `{token, MatrixClient}`. Do NOT convert the existing
+   harness away from password login.
+2. **CLI uses the OAuth device-code grant** (RFC 8628). A terminal has no redirect URL; device
+   code needs none — CLI prints a short `user_code` + verification URL, user approves in a
+   browser, CLI polls the token endpoint. (Rejected loopback/RFC-8252: it would require
+   allowing `http://localhost` redirects, and SSH-headless was explicitly a non-goal, so the
+   only merit of loopback vanished while its cost — a MAS localhost-redirect policy relaxation —
+   remained.) Device code also means the CLI needs **no prod-MAS policy change at all**.
+3. **Web UI uses OIDC authorization-code + PKCE** with dynamic client registration. Cache the
+   DCR `client_id` in localStorage (do NOT re-register every load); persist PKCE verifier +
+   `state` in sessionStorage across the redirect; handle the `?code&state` callback on load;
+   tokens in localStorage with `OidcTokenRefresher`. Production redirect URI is
+   `https://storage.telecrypt.io/` — passes MAS's default DCR policy (real HTTPS host), so
+   **production MAS is never modified**.
+4. **Testing OAuth: add a LOCAL MAS to the throwaway stack; production stays strict/untouched.**
+   Run a disposable MAS next to the disposable Synapse (in **compatibility mode**, so
+   `m.login.password` still works and the 51 tests stay green — the one real harness change is
+   routing test-user *creation* through MAS). We own that dev MAS, so its DCR policy can allow
+   `http://localhost` redirects freely — dev/CI concern only, zero prod exposure. This is the
+   clean resolution of the "loosen prod?" question: never loosen prod; use our own dev MAS.
+5. **Hosting:** web UI built from `ui/` and deployed to **GitHub Pages** at
+   `storage.telecrypt.io` (CNAME file in the Pages artifact + a DNS CNAME record — DNS is the
+   owner's action). The deployed UI hardcodes homeserver = `https://telecrypt.io` (no
+   homeserver field — "auth against telecrypt.io only").
+6. **`llms.txt`** at repo root (agents browsing the repo) AND served at the site root
+   (`storage.telecrypt.io/llms.txt`, llmstxt.org convention) — CLI usage rules for agents.
+
+**Localhost-redirect risk (why we avoid loosening prod):** loopback+PKCE is the RFC-8252
+standard and low-risk per request, but relaxing prod MAS's DCR policy to accept `http://localhost`
+is a *standing* loosening of two guardrails (HTTPS-only + coherent-host) affecting every future
+DCR client — small but permanent surface increase. A disposable local MAS avoids it entirely.
+
+---
+
 ## D5 — UI is a thin adapter over `core/`; browser IndexedDB is native, no snapshot
 
 **Decision:** the React web UI (`ui/`) contains **no E2EE, sharing, or recovery logic of its
