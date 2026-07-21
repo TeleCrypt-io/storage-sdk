@@ -9,16 +9,19 @@ name: Production tests (post-deploy)
 # and nothing here rolls it back. Failures must be loud (non-zero exit,
 # visible in the Actions tab / notifications), never silently swallowed.
 #
-# Needs NO secrets — redpill (Part A) is public/credential-less by design,
-# and the deployed-UI smoke (Part B) stops before any login form input.
+# Part A (functional) uses dedicated operator-VERIFIED test accounts from
+# repo secrets (PROD_TEST_USER_1/PASS_1, PROD_TEST_USER_2/PASS_2) so the full
+# upload/share round-trip runs for real. If those secrets are absent it falls
+# back to redpill (unverified → uploads runtime-skip). Part B (deployed-UI
+# smoke) needs no secrets and stops before any login input.
 #
-# TWO INDEPENDENT JOBS, deliberately not two steps in one job: Part A
-# currently has known-failing cases (see BLOCKERS.md — uploads are denied
-# for unverified/redpill accounts by telecrypt.io's verification policy;
-# the suite runtime-skips those specific cases rather than faking them, but
-# a genuinely new Part A regression would still fail the job). Part B (the
-# deployed-UI smoke — the blank-page/entrypoints regression catcher) must
-# run and report regardless of Part A's outcome, or it would silently never
+# NOTE: the verified test accounts must have a Synapse per-user rate-limit
+# override (the MSC3089 file-tree ops are state-event-heavy; without it the
+# suite trips M_LIMIT_EXCEEDED on prod). See docs/PROD_TESTING_SPEC.md.
+#
+# TWO INDEPENDENT JOBS, deliberately not two steps in one job: Part B (the
+# deployed-UI smoke — the blank-page/entrypoints regression catcher) must run
+# and report regardless of Part A's outcome, or it would silently never
 # execute under GitHub Actions' default per-step `if: success()` chaining.
 on:
   workflow_run:
@@ -46,8 +49,13 @@ jobs:
       - name: Install root dependencies
         run: npm ci
 
-      - name: Run production functional suite (Part A — real telecrypt.io via redpill)
+      - name: Run production functional suite (Part A — real telecrypt.io, verified accounts)
         run: npm run test:prod
+        env:
+          PROD_TEST_USER_1: ${{ secrets.PROD_TEST_USER_1 }}
+          PROD_TEST_PASS_1: ${{ secrets.PROD_TEST_PASS_1 }}
+          PROD_TEST_USER_2: ${{ secrets.PROD_TEST_USER_2 }}
+          PROD_TEST_PASS_2: ${{ secrets.PROD_TEST_PASS_2 }}
 
   deployed-ui-smoke:
     # Independent of prod-functional's outcome — see the note above.

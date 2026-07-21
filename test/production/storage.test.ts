@@ -30,6 +30,7 @@ import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 import * as core from "../../src/core/operations";
 import { waitFor } from "../harness/waitFor";
 import { provisionRedpillAccounts, type RedpillAccount } from "./redpillClient";
+import { loginVerifiedAccounts } from "./verifiedAccounts";
 
 let accountA: RedpillAccount;
 let accountB: RedpillAccount;
@@ -104,9 +105,14 @@ async function probeUploadsRestricted(storage: TeleCryptIOStorage): Promise<bool
 }
 
 beforeAll(async () => {
-  // SERIAL, capped at 2 (well under the ≤3 budget) — account A covers
-  // round-trip, plaintext, and recovery; account B only joins A's share.
-  const [a, b] = await provisionRedpillAccounts(2);
+  // Prefer the dedicated operator-VERIFIED test accounts (from env/secrets)
+  // when available — those can actually upload media, so P.1-P.3 run for
+  // real. Fall back to redpill (unverified → uploads blocked, P.1-P.3
+  // runtime-skip) when the secrets aren't present, so a local run with no
+  // secrets still works. Either source yields the same account shape; both
+  // provision serially (well under redpill's 5/min budget).
+  const verified = await loginVerifiedAccounts();
+  const [a, b] = verified ?? (await provisionRedpillAccounts(2));
   accountA = a;
   accountB = b;
   storageA = await buildStorage(accountA);
