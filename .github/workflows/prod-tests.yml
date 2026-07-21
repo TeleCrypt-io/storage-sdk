@@ -1,0 +1,64 @@
+name: Production tests (post-deploy)
+
+# Runs the production functional suite + deployed-UI smoke
+# (docs/PROD_TESTING_SPEC.md) against REAL telecrypt.io, automatically after
+# every successful UI deploy — plus workflow_dispatch for manual runs.
+#
+# A failing run here is a post-deploy ALERT, not a gate: the deploy already
+# published (deploy-ui.yml completed successfully by the time this runs),
+# and nothing here rolls it back. Failures must be loud (non-zero exit,
+# visible in the Actions tab / notifications), never silently swallowed.
+#
+# Needs NO secrets — redpill (Part A) is public/credential-less by design,
+# and the deployed-UI smoke (Part B) stops before any login form input.
+on:
+  workflow_run:
+    workflows: ["Deploy UI to GitHub Pages"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  prod-tests:
+    # Only run for an actual successful deploy, or an explicit manual trigger.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      # Part A (test:prod) needs only the root tree (src/core + the library
+      # itself). Part B's Playwright comes from the root devDependency too.
+      # ui/ dependencies aren't actually imported by either suite (the smoke
+      # test talks to the already-deployed live site, not a local build),
+      # but installed for parity with deploy-ui.yml and in case a future
+      # addition needs them.
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install UI dependencies
+        run: cd ui && npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run production functional suite (Part A — real telecrypt.io via redpill)
+        run: npm run test:prod
+
+      - name: Run deployed-UI smoke (Part B — real storage.telecrypt.io)
+        run: npm run test:prod:smoke
+
+      - name: Upload Playwright trace on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-smoke-trace
+          path: test-results/
+          retention-days: 7

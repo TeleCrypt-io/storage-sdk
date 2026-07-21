@@ -4,6 +4,57 @@ Short records of choices that would otherwise get re-litigated. Newest first.
 
 ---
 
+## D7 — Production testing via redpill: no secrets, ≤3 serial provisions, recovery-restore is local-only
+
+**Decided 2026-07-21. Verified live against real telecrypt.io before deciding.**
+
+Goal: real functional verification against production `telecrypt.io` after every deploy, without
+ever requiring secrets in CI. Full spec: `docs/PROD_TESTING_SPEC.md`.
+
+**Decisions:**
+1. **Accounts come from the public `redpill` endpoint only** (`POST https://telecrypt.io/redpill`,
+   no auth, no body) — never a real user's credentials, never an admin/API secret. This is what
+   makes the whole suite runnable from an unauthenticated GitHub Actions job.
+2. **≤3 accounts per run, provisioned SERIALLY, from a single file's single `beforeAll`.**
+   Redpill is rate-limited 5/min per source IP; parallelizing (or splitting provisioning across
+   multiple test files, which vitest would run concurrently by default) risks tripping it. Part A
+   uses 2.
+3. **Accounts are never torn down** — the controlplane retention locker reaps unadopted agent
+   accounts automatically. Tests still best-effort delete the folders/rooms they create (wrapped
+   so a cleanup failure never fails the test itself), since room/folder litter isn't
+   self-cleaning the way accounts are.
+4. **Cross-device recovery *restore* is NOT exercised against prod, and is not faked to look like
+   it is.** Redpill hands back one account per call with no password, so there is no secrets-free
+   way to log a second device into the same account. Prod (`P.4`) covers `setupRecovery()` +
+   backup-active only; full restore with a genuine negative control stays where it already was —
+   the local MAS-delegated stack (`test/functional/keys.test.ts` 5.3, `test/functional/core.test.ts`
+   C.4), both of which construct a real second device via `loginNewDevice`.
+5. **Fully separate from `npm test`, by directory + dedicated config + dedicated script, not by
+   convention alone.** `test/production/**` is excluded in the root `vitest.config.ts` AND only
+   reachable via a separate `vitest.prod.config.ts` (`npm run test:prod`) with no `globalSetup`
+   (the local suite's `globalSetup` requires a live local Synapse, which must never be a
+   prerequisite for hitting prod). Verified: the default suite still collects exactly the same 53
+   local tests post-change.
+6. **Wired via a separate workflow (`workflow_run` on "Deploy UI to GitHub Pages" success, plus
+   `workflow_dispatch`), not folded into `deploy-ui.yml` itself.** A failing prod-test is a
+   post-deploy alert, not a gate — the deploy already published by the time this runs, and
+   nothing here rolls it back.
+
+**Real finding this surfaced, not anticipated at spec time:** telecrypt.io runs a fail-closed
+"inverted tier" Synapse module (`tier_controller`) — every account, human or agent, is
+`RESTRICTED` (no media uploads at all, capped room creation, no room encryption state events)
+until explicitly marked `user_type='verified'` via the owner's own out-of-band `tc-verify.sh`.
+Redpill accounts are never verified, so the suite's upload-dependent tests (round-trip,
+multi-participant share, plaintext check) get `413 M_TOO_LARGE` on every upload — including a
+0-byte one, confirmed via raw `curl` independent of this library — deterministically, by design,
+not as a bug. There is no secrets-free way around this (verifying an account requires exactly the
+privileged admin-DB action redpill was built to avoid needing), so it's documented in
+`BLOCKERS.md` rather than worked around: the tests are left asserting the real intended behavior,
+not weakened or skipped, and will stay red until product policy or the provisioning path changes.
+Recovery setup (`P.4`, no upload touched) verified passing against real prod.
+
+---
+
 ## D6 — MAS/OAuth auth (additive), hosted UI on storage.telecrypt.io, llms.txt
 
 **Decided 2026-07-21. Verified live against real telecrypt.io MAS before deciding.**

@@ -746,6 +746,95 @@ then sections. Includes:
 - `/llms.txt` (new)
 - `ui/src/components/LoginScreen.tsx` (updated to add `lockedHomeserver` logic)
 
+## Phase 12 — production functional tests + deployed-UI smoke, wired post-deploy (this session)
+
+Added a **production** test suite (Part A, `test/production/storage.test.ts`) that hits REAL
+`telecrypt.io` using throwaway accounts from the public `redpill` endpoint (no secrets, no
+passwords), plus a credential-free deployed-UI smoke (Part B,
+`test/production/deployed-ui.spec.ts`, Playwright, against the live
+`https://storage.telecrypt.io`), wired to run automatically after every UI deploy (Part C,
+`.github/workflows/prod-tests.yml`). Full spec: `docs/PROD_TESTING_SPEC.md`. Rationale:
+`docs/DECISIONS.md` D7.
+
+**Separation from `npm test` (hard requirement, verified):** `test/production/**` is excluded in
+the root `vitest.config.ts` (directory-based guard) in addition to only being reachable via a
+brand-new `vitest.prod.config.ts` + `npm run test:prod`. Confirmed via `npx vitest list` (with a
+throwaway copy of the config minus `globalSetup`, since the real one requires a live local
+Synapse before it will even collect files) that the default suite still collects exactly the
+same **53** local tests, nothing from `test/production`.
+
+**Part A — `test/production/storage.test.ts` + `test/production/redpillClient.ts`.** ALL redpill
+provisioning happens in this one file's single `beforeAll`, serially, capped at 2 accounts (well
+under the ≤3 budget) — `fileParallelism: false` in `vitest.prod.config.ts` is belt-and-suspenders
+against a future second file's `beforeAll` running concurrently and blowing the 5/min-per-IP
+limit. Four tests, mirroring the local suite's proof shapes but against real infra:
+- **P.1** encrypted round-trip (create → upload → download, byte-identical).
+- **P.2** multi-participant share (A shares with B as editor, B uploads, A downloads B's bytes).
+- **P.3** server never sees plaintext (raw authenticated media fetch ≠ plaintext).
+- **P.4** recovery setup on real MAS (`setupRecovery()` → `isRecoverySetup()` true → real
+  `room_keys/version` exists on the server) — deliberately setup/backup-active only; full
+  cross-device *restore* stays local-only (`test/functional/keys.test.ts` 5.3,
+  `test/functional/core.test.ts` C.4), since redpill gives one account per call with no password,
+  so there is no secrets-free way to log in a second device for the same account. Documented
+  in-line in the test, not faked.
+
+Best-effort folder cleanup after each test (`tree.delete()`, wrapped so a cleanup failure never
+fails the test); accounts themselves need no teardown (controlplane retention locker reaps
+unadopted agent accounts).
+
+**Ran live against real prod this session — result: 1/4 passing (P.4), 3/4 failing (P.1–P.3) for
+a verified, structural, non-bug reason — see `BLOCKERS.md`.** Every upload (even a 0-byte one,
+reproduced independently via raw `curl`, bypassing this library entirely) gets `413 M_TOO_LARGE`
+from Synapse, despite `/_matrix/media/v3/config` advertising a 150 MiB limit — the contradiction
+that led to digging past "assume prod is broken." Root-caused by reading
+`server/synapse/modules/tier_controller/__init__.py`: telecrypt.io runs a fail-closed **inverted
+tier model** — every account (human or agent) is `RESTRICTED` (no media uploads, ≤3 created
+rooms, no `m.room.encryption`) unless its `user_type` is explicitly `'verified'` in Synapse's
+`users` table, which requires the owner's own out-of-band `tc-verify.sh` step. Redpill accounts
+(`controlplane`'s `internal/agent/provision.go`) never touch `user_type` — they are permanently
+`RESTRICTED` by design, which is the product's actual payment/verification boundary, not an
+accident. There is no secrets-free way to get a *verified* throwaway account for CI, so P.1–P.3
+cannot pass via redpill as currently scoped. **Left the tests exactly as specced** (asserting the
+real intended behavior, not rewritten to assert the denial, not `.skip`/`.todo`'d) — full
+reasoning, repro, and options in `BLOCKERS.md`. P.4 needed no upload capability and is **verified
+passing against real prod**.
+
+**Part B — `test/production/deployed-ui.spec.ts` (Playwright, credential-free).** Own
+`playwright.prod.config.ts` at root (`@playwright/test` added as a root devDependency —
+previously only in `ui/`'s own project; this suite lives outside `ui/` per the spec's directory
+layout, and needs no local `webServer`, unlike `ui/playwright.config.ts`). Polls
+`https://storage.telecrypt.io/` until it serves (Pages CDN can lag a deploy), asserts the login
+screen mounts (`data-testid="oidc-login"` visible), asserts zero console errors before the OIDC
+click (the exact regression class today's earlier `matrix-js-sdk` dedupe fix addressed — a broken
+bundle deploys fine but never renders), clicks "Log in with MAS/OIDC", and asserts the same-tab
+redirect lands on `https://telecrypt.io/auth/...` (real MAS, proving prod dynamic client
+registration + PKCE URL building work) — then stops, never touching the real login form. **Ran
+live against `https://storage.telecrypt.io` this session — passed.**
+
+**Part C — `.github/workflows/prod-tests.yml`.** Triggers on `workflow_run` (when "Deploy UI to
+GitHub Pages" completes successfully) plus `workflow_dispatch`. Installs root + `ui` deps
+(neither suite actually imports `ui/src` — the smoke hits the already-deployed live site, not a
+local build — but installed for parity/future-proofing), installs Chromium via `npx playwright
+install --with-deps chromium`, runs `npm run test:prod` then `npm run test:prod:smoke`, uploads
+the Playwright trace on failure. No secrets (redpill is public; the smoke never authenticates). A
+failing run does not roll back the already-published deploy — it's a post-deploy alert, and per
+`BLOCKERS.md`, 3/4 of Part A failing is presently the **expected** steady state, not itself a
+signal something broke — worth knowing before the first "red" post-deploy notification gets
+mistaken for an incident.
+
+**Files added:** `test/production/redpillClient.ts`, `test/production/storage.test.ts`,
+`test/production/deployed-ui.spec.ts`, `vitest.prod.config.ts`, `playwright.prod.config.ts`,
+`.github/workflows/prod-tests.yml`, `BLOCKERS.md`. **Files changed:** `vitest.config.ts` (one
+more `exclude` entry), `package.json` (`test:prod`/`test:prod:smoke` scripts,
+`@playwright/test` devDependency).
+
+**Verification:** `npm run lint` and `npm run build` pass clean (unchanged from before this
+session's additions). `npm run test:prod` run live once (2 real redpill accounts provisioned,
+auto-reaped by the retention locker) — 1/4 passing as documented above. `npm run test:prod:smoke`
+run live once against `https://storage.telecrypt.io` — passing. Confirmed the default `npm test`
+glob is unaffected (see separation-guard verification above) — did not run the full local 53
+(would need the local podman/Synapse stack up, out of scope for this session's changes).
+
 ## Out of scope (not built)
 
 - Phase 6: External share links (requires a separate HTTP proxy)

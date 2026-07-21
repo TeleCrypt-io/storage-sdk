@@ -9,6 +9,12 @@ export default defineConfig({
     // core/) — exclude it here so the root suite stays exactly the 51
     // library/CLI tests and doesn't double-run (or environment-clash with)
     // the UI's wiring tests.
-    exclude: ["**/node_modules/**", "ui/**"],
+    //
+    // test/production/** hits REAL telecrypt.io (redpill-provisioned
+    // throwaway accounts) and must NEVER run as part of a normal local/CI
+    // `npm test`. Excluded here (directory-based guard) in addition to only
+    // being reachable via the separate vitest.prod.config.ts + `npm run
+    // test:prod` — see docs/PROD_TESTING_SPEC.md.
+    exclude: ["**/node_modules/**", "ui/**", "test/production/**"],
   },
 });

@@ -28,6 +28,8 @@
     "lint": "eslint src test --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:prod": "vitest run --config vitest.prod.config.ts",
+    "test:prod:smoke": "playwright test --config playwright.prod.config.ts",
     "synapse:up": "./throwaway_synapse/up.sh",
     "synapse:fresh": "./throwaway_synapse/up.sh --fresh",
     "synapse:down": "./throwaway_synapse/down.sh"
@@ -39,6 +41,7 @@
     "matrix-js-sdk": "41.9.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^22.0.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
