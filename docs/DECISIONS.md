@@ -40,18 +40,17 @@ ever requiring secrets in CI. Full spec: `docs/PROD_TESTING_SPEC.md`.
    post-deploy alert, not a gate — the deploy already published by the time this runs, and
    nothing here rolls it back.
 
-**Real finding this surfaced, not anticipated at spec time:** telecrypt.io runs a fail-closed
-"inverted tier" Synapse module (`tier_controller`) — every account, human or agent, is
-`RESTRICTED` (no media uploads at all, capped room creation, no room encryption state events)
-until explicitly marked `user_type='verified'` via the owner's own out-of-band `tc-verify.sh`.
-Redpill accounts are never verified, so the suite's upload-dependent tests (round-trip,
-multi-participant share, plaintext check) get `413 M_TOO_LARGE` on every upload — including a
-0-byte one, confirmed via raw `curl` independent of this library — deterministically, by design,
-not as a bug. There is no secrets-free way around this (verifying an account requires exactly the
-privileged admin-DB action redpill was built to avoid needing), so it's documented in
-`BLOCKERS.md` rather than worked around: the tests assert the real intended behavior, never a
-faked success. A runtime preflight (`probeUploadsRestricted` in `beforeAll`) detects this exact,
-verified denial signature and `ctx.skip()`s the three affected tests with a loud reason, so the
+**Real finding this surfaced, not anticipated at spec time:** telecrypt.io restricts media
+uploads (and some other actions) for **unverified** accounts — a deliberate operator-side
+verification/entitlement boundary, not a defect. Redpill accounts are unverified by design, so
+the suite's upload-dependent tests (round-trip, multi-participant share, plaintext check) get an
+upload rejection on every upload — including a 0-byte one, confirmed via raw `curl` independent of
+this library — deterministically, by design, not as a bug. There is no secrets-free way around
+this (verifying an account requires a privileged operator action redpill was built to avoid
+needing), so it's documented in `BLOCKERS.md` rather than worked around: the tests assert the real
+intended behavior, never a faked success. A runtime preflight (`probeUploadsRestricted` in
+`beforeAll`) detects this exact, verified restriction signature and `ctx.skip()`s the three
+affected tests with a loud reason, so the
 suite stays green-when-healthy (a real regression is still distinguishable) instead of being
 permanently, uninformatively red — self-correcting if the policy ever changes, no code change
 needed. Recovery setup (`P.4`, no upload touched) verified passing against real prod, both

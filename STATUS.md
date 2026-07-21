@@ -784,20 +784,16 @@ unadopted agent accounts).
 
 **Ran live against real prod this session — result: 1/4 passing (P.4), 3/4 failing (P.1–P.3) for
 a verified, structural, non-bug reason — see `BLOCKERS.md`.** Every upload (even a 0-byte one,
-reproduced independently via raw `curl`, bypassing this library entirely) gets `413 M_TOO_LARGE`
-from Synapse, despite `/_matrix/media/v3/config` advertising a 150 MiB limit — the contradiction
-that led to digging past "assume prod is broken." Root-caused by reading
-`server/synapse/modules/tier_controller/__init__.py`: telecrypt.io runs a fail-closed **inverted
-tier model** — every account (human or agent) is `RESTRICTED` (no media uploads, ≤3 created
-rooms, no `m.room.encryption`) unless its `user_type` is explicitly `'verified'` in Synapse's
-`users` table, which requires the owner's own out-of-band `tc-verify.sh` step. Redpill accounts
-(`controlplane`'s `internal/agent/provision.go`) never touch `user_type` — they are permanently
-`RESTRICTED` by design, which is the product's actual payment/verification boundary, not an
-accident. There is no secrets-free way to get a *verified* throwaway account for CI, so P.1–P.3
-cannot pass via redpill as currently scoped. **Left the tests exactly as specced** (asserting the
-real intended behavior, not rewritten to assert the denial, not `.skip`/`.todo`'d) — full
-reasoning, repro, and options in `BLOCKERS.md`. P.4 needed no upload capability and is **verified
-passing against real prod**.
+reproduced independently via raw `curl`, bypassing this library entirely) is rejected — not a
+size issue, not a client bug. Root cause: telecrypt.io restricts media uploads (and some other
+actions) for **unverified** accounts — a deliberate operator-side verification/entitlement
+boundary. Redpill accounts are unverified by design (redpill is the zero-secret, zero-admin
+onboarding path; it never performs the operator's verification step), so they are restricted
+from uploading. There is no secrets-free way to get a *verified* throwaway account for CI, so
+P.1–P.3 cannot pass via redpill as currently scoped. **Left the tests exactly as specced**
+(asserting the real intended behavior, not rewritten to assert the rejection, not
+`.skip`/`.todo`'d) — full reasoning, repro, and options in `BLOCKERS.md`. P.4 needed no upload
+capability and is **verified passing against real prod**.
 
 **Part B — `test/production/deployed-ui.spec.ts` (Playwright, credential-free).** Own
 `playwright.prod.config.ts` at root (`@playwright/test` added as a root devDependency —
@@ -831,8 +827,8 @@ more `exclude` entry), `package.json` (`test:prod`/`test:prod:smoke` scripts,
 `@playwright/test` devDependency).
 
 **Runtime-skip, not fake-green:** `storage.test.ts`'s `beforeAll` runs a real 1-byte upload
-preflight (`probeUploadsRestricted`) against account A; if it sees the exact tier_controller
-denial signature (413/M_TOO_LARGE), P.1–P.3 call `ctx.skip()` at the top of each test body with a
+preflight (`probeUploadsRestricted`) against account A; if it sees the exact upload-restriction
+signature, P.1–P.3 call `ctx.skip()` at the top of each test body with a
 loud `console.warn` pointing at `BLOCKERS.md`, instead of either asserting a success that can't
 happen or being permanently red. Any OTHER preflight failure (network error, a real unrelated
 size limit, auth failure, etc.) propagates and fails the suite loudly — only the one verified,

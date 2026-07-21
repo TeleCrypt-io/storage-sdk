@@ -18,7 +18,7 @@
 //
 // P.1-P.3 runtime-skip (not fake, not fail) when a beforeAll preflight
 // (probeUploadsRestricted) detects that this account is currently denied
-// media uploads by telecrypt.io's tier_controller policy — a verified,
+// media uploads by telecrypt.io's verification policy — a verified,
 // structural fact about unverified/redpill accounts, not a transient prod
 // outage. See BLOCKERS.md and docs/DECISIONS.md D7 for the full story. This
 // keeps the suite green-when-healthy (so a real regression is still
@@ -38,7 +38,7 @@ let storageB: TeleCryptIOStorage;
 
 // Set by the beforeAll preflight (see probeUploadsRestricted below). true if
 // THIS account is currently denied media uploads by telecrypt.io's
-// tier_controller policy (see BLOCKERS.md / docs/DECISIONS.md D7) — a
+// verification policy (see BLOCKERS.md / docs/DECISIONS.md D7) — a
 // verified, structural fact about redpill-provisioned ("unverified")
 // accounts, not a guess.
 let uploadsRestricted = false;
@@ -70,8 +70,8 @@ async function cleanupFolder(storage: TeleCryptIOStorage, folderId: string): Pro
 /**
  * Runtime capability probe, NOT a guess: attempts a genuine 1-byte upload
  * and checks whether the server denies it as "too large" — the exact,
- * verified signature of telecrypt.io's tier_controller module fail-closed
- * denying uploads to a non-"verified" account (see BLOCKERS.md). Any OTHER
+ * verified signature of telecrypt.io restricting uploads for
+ * unverified accounts (see BLOCKERS.md). Any OTHER
  * failure here (network error, auth error, a real size-limit response with
  * a different shape, etc.) is NOT swallowed — it propagates and fails the
  * suite loudly, exactly as it should for a genuinely unexpected problem.
@@ -116,7 +116,7 @@ beforeAll(async () => {
   if (uploadsRestricted) {
     console.warn(
       "[production suite] uploads are currently denied for this (unverified, redpill-provisioned) " +
-        "account by telecrypt.io's tier_controller policy — P.1-P.3 will be SKIPPED, not faked. " +
+        "account by telecrypt.io's verification policy — P.1-P.3 will be SKIPPED, not faked. " +
         "See BLOCKERS.md for the verified root cause. P.4 (recovery setup, no upload) still runs.",
     );
   }

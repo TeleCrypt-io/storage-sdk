@@ -14,7 +14,7 @@ name: Production tests (post-deploy)
 #
 # TWO INDEPENDENT JOBS, deliberately not two steps in one job: Part A
 # currently has known-failing cases (see BLOCKERS.md — uploads are denied
-# for unverified/redpill accounts by telecrypt.io's tier_controller policy;
+# for unverified/redpill accounts by telecrypt.io's verification policy;
 # the suite runtime-skips those specific cases rather than faking them, but
 # a genuinely new Part A regression would still fail the job). Part B (the
 # deployed-UI smoke — the blank-page/entrypoints regression catcher) must
