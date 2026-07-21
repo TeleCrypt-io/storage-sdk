@@ -1,0 +1,102 @@
+# TeleCrypt.io Storage CLI
+
+> E2EE file storage and sharing on Matrix. Install globally with `npm i -g @telecrypt-io/storage`, then run `telecrypt-io storage` commands. Files are encrypted end-to-end; the server never sees plaintext. All commands support `--json` for machine-readable output.
+
+## What it is
+
+TeleCrypt.io Storage is a CLI and web UI for encrypted file storage and sharing on Matrix homeservers. Files are encrypted locally before upload; the server stores only ciphertext. Sharing is by Matrix user ID (format: `@localpart:homeserver.io`). Essential for agents: save recovery keys (only way to recover on a new device), and understand that the server cannot decrypt your files.
+
+### Installation
+
+```bash
+npm i -g @telecrypt-io/storage
+```
+
+## CLI command tree
+
+All commands use the format `telecrypt-io --json storage <command>`. The `--json` flag is **global** and must come before the subcommand to enable machine-readable output (JSON on success, `{"error": "..."}` on failure with exit code 1).
+
+### Session management
+
+**`login`** — Log in and persist the session to the local profile
+- `telecrypt-io --json storage login --homeserver https://telecrypt.io --user alice --password secret` (password login)
+- `telecrypt-io --json storage login --homeserver https://telecrypt.io --oidc` (OIDC/MAS device-code grant; opens browser for approval)
+
+**`register`** — Create a new account and log in (**dev/test only**; will not work against the public telecrypt.io server)
+- `telecrypt-io --json storage register --homeserver http://localhost:8008 --user bob --password secret`
+
+**`whoami`** — Print the current session identity
+- `telecrypt-io --json storage whoami`
+
+**`logout`** — Clear the local profile and session
+- `telecrypt-io --json storage logout`
+
+### Recovery (cross-signing & key backup)
+
+**`recovery setup`** — Set up server-side key backup and print the Recovery Key
+- `telecrypt-io --json storage recovery setup`
+- Output includes `recoveryKey` (a long string); **save this** — it is the only way to recover your files on a new device
+
+**`recovery restore`** — Restore keys on a new device from a Recovery Key
+- `telecrypt-io --json storage recovery restore RECOVERY_KEY_HERE`
+
+### Folders (shared storage spaces)
+
+**`folder create`** — Create a new shared folder
+- `telecrypt-io --json storage folder create "My Secure Folder"`
+
+**`folder list`** — List folders you have access to
+- `telecrypt-io --json storage folder list`
+
+**`folder join`** — Accept a pending folder invitation
+- `telecrypt-io --json storage folder join '!roomid:homeserver.io'`
+
+**`folder share`** — Invite a user to a folder with a specific role
+- `telecrypt-io --json storage folder share '!roomid:homeserver.io' @alice:homeserver.io` (default: viewer role)
+- `telecrypt-io --json storage folder share '!roomid:homeserver.io' @alice:homeserver.io --role editor`
+
+**`folder members`** — List participants and their roles in a folder
+- `telecrypt-io --json storage folder members '!roomid:homeserver.io'`
+
+**`folder unshare`** — Remove a participant from a folder
+- `telecrypt-io --json storage folder unshare '!roomid:homeserver.io' @alice:homeserver.io`
+
+### File operations
+
+**`file upload`** — Encrypt and upload a local file into a folder
+- `telecrypt-io --json storage file upload '!roomid:homeserver.io' /path/to/document.pdf`
+- `telecrypt-io --json storage file upload '!roomid:homeserver.io' /path/to/document.pdf --name "My Document"` (custom name)
+
+**`file list`** — List files in a folder
+- `telecrypt-io --json storage file list '!roomid:homeserver.io'`
+
+**`file download`** — Download and decrypt a file to a local path
+- `telecrypt-io --json storage file download '!roomid:homeserver.io' FILE_ID /path/to/dest`
+
+## Machine-readable output
+
+All commands with `--json` return structured JSON on success:
+
+```json
+{"userId": "@alice:telecrypt.io", "deviceId": "ABCD1234", "homeserver": "https://telecrypt.io"}
+```
+
+On error (command exits with code 1):
+
+```json
+{"error": "login failed: Invalid username or password"}
+```
+
+Agents should check exit code (0 = success, 1 = failure) and parse stderr for error JSON.
+
+## Gotchas for agents
+
+1. **Recovery Key is irreplaceable.** After `recovery setup`, the output includes `recoveryKey`: a long string. Save it somewhere persistent and retrievable. It is the **only** way to recover your files if you log in on a new device or factory-reset your current one. If lost, your keys are gone forever.
+
+2. **Sharing uses Matrix User IDs.** When sharing a folder with `folder share`, the recipient must be identified by their full Matrix User ID (e.g., `@alice:homeserver.io`), not just a username. You must know their homeserver to construct the ID.
+
+3. **Files are end-to-end encrypted; the server never decrypts.** The server stores only the encrypted bytes. Even if an attacker gains access to the server's database, they see only ciphertext. Encryption keys are stored in the local profile (cross-signing keys + per-file keys derived from the folder's shared secret).
+
+4. **Session/profile is local.** The session and crypto store live in `~/.config/telecrypt-io/` (Linux/macOS) or `%APPDATA%\TeleCrypt.io` (Windows). Logging out deletes the local profile. A new device means a new profile and the need to restore keys via `recovery restore`.
+
+5. **Homeserver is required for login.** Always specify `--homeserver` with the full URL (e.g., `https://telecrypt.io`). The CLI does not default to any public server; you must pass it explicitly.

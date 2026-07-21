@@ -682,6 +682,70 @@ all green.
 - Test 4.6 (fresh-client version history) requires a **persistent** crypto store to mean anything — the harness's default `useIndexedDB: false` makes "fresh client, same user" crypto-amnesiac (in-memory store discarded on restart), so it could never have recovered real history no matter what `getVersionHistory()` did. Fixed 2026-07-20 by scoping `useIndexedDB: true` (via `fake-indexeddb`, dev-dependency) to just this test, plus polling for the full 3-version chain (re-fetching the branch and calling `getVersionHistory()` each iteration) instead of asserting on the first read — the chain walk depends on v2/v3 finishing local decryption and relation aggregation, which is asynchronous and can still be settling right after the (unencrypted) branch state events land. The initial version of this fix (persistence alone, first-read assertion) was flaky (~1-in-10 runs recovered only 2 of 3 versions); adding the poll made it deterministic across 15 consecutive runs. Note this genuinely depends on the chain being recoverable — if key-denial were real, the poll times out and the test fails, it doesn't mask anything.
 - An earlier hypothesis for 4.6's root cause — that `getVersionHistory()` only scans the live timeline without paginating, and a shallow `initialSyncLimit: 10` sync misses older events — was tested (forced `client.scrollback()`) and disproved: the fresh client's first `/sync` already contained all 19 timeline events for the room. The actual cause was crypto-store persistence + decryption-settling timing, not pagination.
 
+## Phase 11 — GitHub Pages deployment + llms.txt (this session)
+
+Deployed the React web UI (`ui/`) to GitHub Pages on a custom domain (`storage.telecrypt.io`)
+and created a machine-readable CLI guide for agents (`llms.txt`). This is a deploy+docs task
+that **does not touch auth code, the library, `core/`, or tests**.
+
+**Part A — GitHub Pages static hosting at storage.telecrypt.io:**
+
+1. **Workflow file** (`.github/workflows/deploy-ui.yml`): triggers on push to `main` affecting `ui/**`
+   (and `workflow_dispatch`). Steps: checkout → Node 22 setup → `cd ui && npm ci && npm run build` →
+   `configure-pages` → `upload-pages-artifact` of `ui/dist` → `deploy-pages`. Permissions:
+   `pages: write, id-token: write, contents: read`. Runs in the `github-pages` environment.
+
+2. **Custom domain file** (`ui/public/CNAME`): contains exactly `storage.telecrypt.io` (one line).
+   Vite's `public/` → `dist/` copy ensures it lands at the root of the published artifact.
+
+3. **Homeserver locked to production**: the deployed UI authenticates against `telecrypt.io`
+   only. Added a Vite env var `VITE_HOMESERVER` (defaults to `https://telecrypt.io` for production
+   builds, undefined for dev). In `ui/src/components/LoginScreen.tsx`: computed a `lockedHomeserver`
+   value from `import.meta.env.VITE_HOMESERVER ?? (import.meta.env.PROD ? "https://telecrypt.io" : undefined)`,
+   then conditionally hid the homeserver input (`{!lockedHomeserver && <input .../>}`) while keeping
+   both the password login and OAuth/PKCE paths using the locked homeserver value. Local dev (`npm run dev`)
+   still shows the input and defaults to `localhost:8008`. The OIDC redirect URI is already
+   `window.location.origin + "/"` (becomes `https://storage.telecrypt.io/` in prod) — unchanged.
+
+4. **SPA fallback**: verified the UI uses only state/tab routing (no React Router / path-based routes),
+   so no `404.html` fallback is needed.
+
+5. **Build verification**: `cd ui && npm run build` succeeds; `ui/dist/` contains `CNAME`, `llms.txt`,
+   and `index.html`. `npm run dev` still works.
+
+**Part B — llms.txt (CLI agent guide):**
+
+Created `/llms.txt` at repo root (and copied to `ui/public/llms.txt` for serving at
+`https://storage.telecrypt.io/llms.txt`). Follows llmstxt.org structure: H1 title, blockquote summary,
+then sections. Includes:
+- What the tool is (E2EE file storage on Matrix; installation via `npm i -g @telecrypt-io/storage`).
+- Exact CLI command tree pulled from `src/cli/index.ts` (no invented commands):
+  - Session: `login --homeserver <url> [--user] [--password] [--oidc]`, `register`, `whoami`, `logout`
+  - Recovery: `recovery setup`, `recovery restore <key>`
+  - Folders: `folder create <name>`, `folder list`, `folder join <id>`, `folder share <id> <userId> [--role]`,
+    `folder members <id>`, `folder unshare <id> <userId>`
+  - Files: `file upload <folderId> <path> [--name]`, `file list <folderId>`, `file download <folderId> <fileId> <dest>`
+- The `--json` flag (global, placed before the subcommand: `telecrypt-io --json storage ...`) for
+  machine-readable output; non-zero exit code on error.
+- Gotchas for agents: recovery key is irreplaceable; sharing uses Matrix User IDs; files are E2EE
+  (server never sees plaintext); session/profile is local; homeserver is required.
+
+**Verification:** `cd ui && npm run build` succeeds and emits `ui/dist/` with `CNAME` + `llms.txt` at root.
+
+**Human steps still required (document in GitHub and DNS config, not done from here):**
+1. **Enable GitHub Pages** in repo settings (`Settings → Pages → Source = GitHub Actions`).
+2. **DNS CNAME record** (already created by the owner): `storage.telecrypt.io → telecrypt-io.github.io`.
+3. **Custom domain in Pages settings** (or auto-detected from the CNAME file once Pages is enabled).
+4. **HTTPS provisioning**: GitHub will provision an auto-renewing cert for `storage.telecrypt.io` after
+   the DNS record is confirmed. This typically takes a few minutes.
+
+**Files changed:**
+- `.github/workflows/deploy-ui.yml` (new)
+- `ui/public/CNAME` (new)
+- `ui/public/llms.txt` (new, identical to `/llms.txt`)
+- `/llms.txt` (new)
+- `ui/src/components/LoginScreen.tsx` (updated to add `lockedHomeserver` logic)
+
 ## Out of scope (not built)
 
 - Phase 6: External share links (requires a separate HTTP proxy)
