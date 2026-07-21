@@ -4,6 +4,51 @@ Short records of choices that would otherwise get re-litigated. Newest first.
 
 ---
 
+## D3 — Core extraction: what's shared vs adapter
+
+**Decision:** extracted `src/core/` (`operations.ts` + `types.ts`, plus `poll.ts`/`errors.ts`
+re-homed from `src/cli/`) as the platform-agnostic operation layer both the CLI and a future UI
+call, sitting between the already-shared `SecureStorage` library and the Node-only CLI adapter.
+Full rationale and scope: `docs/CORE_EXTRACTION_SPEC.md`.
+
+**What's shared (`src/core/`):** one function per user action (`createFolder`, `listFolders`,
+`joinFolder`, `shareFolder`, `unshareFolder`, `listMembers`, `listFiles`, `uploadFile`,
+`downloadFile`, `setupRecovery`, `restoreRecovery`), taking an already-created `SecureStorage` +
+plain inputs, returning the typed results in `core/types.ts`. Bytes in/out are `Uint8Array`, never
+file paths. Folder/file resolution-with-polling (the old `requireTree`/`requireFile`) lives here
+too, as an internal `resolveTree`/`resolveFile` — every operation taking a `folderId`/`fileId`
+needs it, and there's nothing Node-specific about polling a Matrix client's local sync state.
+
+**What's adapter (stays in `src/cli/`):** anything that's actually about being a *short-lived Node
+process* rather than about the Matrix operation itself — `cryptoSnapshot.ts` (disk-persisting
+`fake-indexeddb` across process exits), `profile.ts` (session.json on disk), `storage.ts`
+(`openStorage` = profile + snapshot + `SecureStorage.create`; `waitForBackupSettled`, which exists
+specifically because a CLI command's process might exit before the SDK's fire-and-forget backup
+upload loop finishes — a concern a long-lived browser tab doesn't have), `output.ts`/`runAction`
+(stdout/`--json`/exit-code rendering), all `commander` wiring, and `login`/`register`/`whoami`/
+`logout` (session-bound, and `login`/`register` construct their own client rather than receiving
+an already-created `SecureStorage`, so they're outside `core/`'s contract by construction).
+
+**Why the split there and not, say, at `SecureStorage` alone:** `SecureStorage` was already 100%
+shared, but every *command's* actual logic (the invite-then-setPermissions dance in `folder
+share`, "already in room means role-change not error", the top-level filter in `folder list`, the
+not-found-vs-not-yet-synced polling) lived inline in `commander` closures — unreachable without
+going through arg-parsing and stdout. `core/` is the maximum-reuse endpoint: a UI now needs zero
+new business logic, only a new adapter (client construction/storage config + rendering), exactly
+mirroring what `src/cli/storage.ts`+`output.ts` already do for the CLI.
+
+**Verification, not just intent:** `core/` importing `node:fs`/`node:path`/`node:v8`/`process`/
+`commander`/`fake-indexeddb` would silently break this contract, so it's checked by grep (see
+`STATUS.md` Phase 7) rather than asserted — currently clean (only imports `../SecureStorage.js`
+and its own siblings).
+
+**Behavior-preserving gate:** all 47 pre-existing tests pass unchanged; a new
+`test/functional/core.test.ts` (4 tests) calls `core.*` directly (no CLI subprocess) against the
+real Synapse as the standalone-consumability proof. No `BLOCKERS.md` entry was needed — nothing
+had to change externally observable behavior to make this split.
+
+---
+
 ## D2 — Runtime: Node.js for the CLI at v1 (not Bun)
 
 **Decision:** the CLI runs on **Node.js** for v1. Do not migrate to Bun now.

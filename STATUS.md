@@ -1,6 +1,6 @@
 # STATUS — TeleCrypt Secure Storage
 
-**Date:** 2026-07-20
+**Date:** 2026-07-21
 
 ## Phases complete
 
@@ -14,6 +14,74 @@
 | 5 | Key management — cross-signing bootstrap, secret storage, recovery key generation and decoding | ✅ |
 | 5B | **Real key recovery** — server-side Secure Backup + restore on a genuinely new device (the "lost laptop" case) | ✅ |
 | 6 | **`secure-storage` CLI** — session, recovery, shared folders, files; driven end-to-end by the library | ✅ |
+| 7 | **`core/` extraction** — platform-agnostic operations + typed result contract, shared by the CLI now and a future UI | ✅ |
+
+## Phase 7 — `core/` extraction (this session)
+
+Behavior-preserving refactor (`docs/CORE_EXTRACTION_SPEC.md`): pulled the operation logic that used
+to live inline inside `commander` `.action()` closures in `src/cli/index.ts` out into a new
+**platform-agnostic `src/core/`** module, so a future React UI can call the exact same tested logic
+and the exact same typed result contract instead of re-deriving them from the CLI.
+
+**The layering now:**
+
+```
+  src/SecureStorage.ts   library — raw MSC3089/crypto ops (unchanged)
+        │
+  src/core/              operations.ts (one fn per action) + types.ts (typed
+        │                result contract) + poll.ts / errors.ts. Browser-safe:
+        │                no node:fs / node:path / node:v8 / process / commander
+        │                / fake-indexeddb — verified by grep, see below.
+   ┌────┴────┐
+  src/cli/   (future) UI  thin adapters: parse args → openStorage() → one
+                          core.* call → wrap into {json, text} → runAction
+```
+
+- **`src/core/types.ts`** — the shared typed result contract (`FolderInfo`, `FileInfo`, `Member`,
+  `ShareResult`, `UnshareResult`, `JoinResult`, `DownloadedFile`, `RecoverySetup`,
+  `RecoveryRestore`). These types ARE the CLI's `--json` schema (or a trivial projection of it —
+  e.g. `FolderInfo.id` becomes the CLI's `folderId` key, to keep existing CLI output byte-for-byte
+  unchanged) and are the future UI's data model.
+- **`src/core/operations.ts`** — `createFolder`, `listFolders`, `joinFolder`, `shareFolder`,
+  `unshareFolder`, `listMembers`, `listFiles`, `uploadFile`, `downloadFile`, `setupRecovery`,
+  `restoreRecovery`. Each takes an already-created `SecureStorage` plus plain inputs; bytes in/out
+  are always `Uint8Array`, never file paths. Folder/file resolution-with-polling (formerly
+  `requireTree`/`requireFile` in `src/cli/storage.ts`) moved here as internal `resolveTree`/
+  `resolveFile` helpers, since every operation that takes a `folderId`/`fileId` needs it — this is
+  genuinely platform-agnostic logic, not a CLI concern.
+- **`src/core/poll.ts`** and **`src/core/errors.ts`** — re-homed from `src/cli/` (no behavior
+  change); `src/cli/poll.ts` and `src/cli/errors.ts` are now thin re-exports so existing CLI
+  imports keep working unchanged.
+- **What stayed in `src/cli/`** (Node/CLI-only, per the spec): `cryptoSnapshot.ts` (disk
+  persistence), `profile.ts` (fs session), `storage.ts` (`openStorage`/`close` = profile +
+  snapshot + `SecureStorage.create`, plus `waitForBackupSettled` — a short-lived-*process*
+  concern, not something a long-lived UI tab needs), `output.ts` (`runAction`), all `commander`
+  wiring, and the `login`/`register`/`whoami`/`logout` commands (session/profile-bound, and
+  `login`/`register` build their own client rather than receiving an already-created
+  `SecureStorage`, so they're out of scope for `core/` by the spec's own rule).
+- One deliberate, harmless divergence from a literal "parse args → openStorage → one core.* call"
+  shape: `folder share`'s `--role` validation is still checked in the CLI closure *before*
+  `openStorage()` (so a bad `--role` fails exactly as fast as before, without even attempting
+  login), and `core.shareFolder` repeats the identical check internally so it's still safe to call
+  standalone. Confirmed via the full CLI test suite that command-level JSON/text output is
+  unchanged.
+
+**Browser-safety verification:** `grep -rnE "node:fs|node:path|node:v8|process\.|commander|fake-indexeddb" src/core/` returns nothing — `src/core/` imports only `../SecureStorage.js` and its own
+siblings. This is the proof a browser bundle can consume `core/` directly.
+
+**New test:** `test/functional/core.test.ts` (4 tests, C.1–C.4) calls `core.*` functions
+**in-process** (no CLI subprocess) against the real disposable Synapse: folder create/list;
+a multi-participant share where userB uploads and userA `downloadFile`s userB's bytes
+byte-identical; an upload/download `Uint8Array` round-trip; `setupRecovery` + `restoreRecovery`
+on a genuinely fresh device (with a negative control before restore). This is the direct
+UI-readiness proof, parallel to what `keys.test.ts`/`sharing.test.ts` already proved for the raw
+library.
+
+**Test results:** all 47 pre-existing tests pass unchanged, plus the 4 new core tests — **51/51**.
+Verified with 3 consecutive full-suite runs (including a from-scratch `synapse:down && synapse:up`
+before the first), all green, no flakiness. `npm run lint` and `npm run build` pass clean.
+
+No `BLOCKERS.md` was needed — every command's behavior was preserved exactly.
 
 ## Phase 5B — real key recovery (this session)
 
