@@ -16,6 +16,112 @@
 | 6 | **`telecrypt-io storage` CLI** — session, recovery, shared folders, files; driven end-to-end by the library | ✅ |
 | 7 | **`core/` extraction** — platform-agnostic operations + typed result contract, shared by the CLI now and a future UI | ✅ |
 | 8 | **Public rebrand + npm Trusted Publishing** — `TeleCryptIOStorage`, `@telecrypt-io/storage`, `telecrypt-io storage` CLI, OIDC publish workflow | ✅ |
+| 9 | **React web UI (`ui/`)** — thin adapter over `core/`, browser-native IndexedDB, Vitest wiring + Playwright E2E (real Synapse) | ✅ |
+
+## Phase 9 — React web UI (this session)
+
+Built `ui/` — a React + Vite + TypeScript app that is a **thin adapter over `src/core/`**,
+exactly like the CLI: no E2EE/sharing/recovery logic of its own, just session construction for
+the browser + rendering the typed `core/` results. Full spec: `docs/UI_SPEC.md`. Rationale:
+`docs/DECISIONS.md` D5.
+
+**Where it lives:** `ui/` with its own `package.json`/`node_modules`/lint/build — does not touch
+the library's `package.json` or `dist/`. Imports only `src/core/*` and `src/TeleCryptIOStorage.ts`
+directly from library source (never `src/cli/*`, never `dist/`).
+
+**The one real setup hurdle (solved first, per the spec):** matrix-js-sdk's WASM rust-crypto +
+`Buffer.from()` calls don't exist natively in a browser. Fix was small and surgical — no
+`vite-plugin-node-polyfills` needed:
+- `vite.config.ts`: `define: { global: "globalThis" }`.
+- `src/main.tsx`: imports the `buffer` npm package and assigns `globalThis.Buffer` before
+  anything else runs (must happen before matrix-js-sdk's rust-crypto init).
+- The WASM itself needed nothing special: `@matrix-org/matrix-sdk-crypto-wasm`'s default (non
+  "matrix-org:wasm-esm") export uses `new URL("./pkg/....wasm", import.meta.url)` + `fetch`,
+  which Vite's built-in asset handling resolves correctly in both dev and build with zero extra
+  plugins or config.
+- `ui/tsconfig.app.json` had to drop the new-Vite-scaffold defaults `verbatimModuleSyntax` and
+  `erasableSyntaxOnly` (TS options, not runtime ones) — the library's own source
+  (`src/TeleCryptIOStorage.ts`'s parameter-property constructor, `src/core/operations.ts`'s
+  non-type-only type imports) predates those stricter styles, and `tsc -b`'s program-wide
+  compiler options apply to every file pulled in via import, including files outside `ui/`.
+- Root `vitest.config.ts` gained one line, `exclude: ["ui/**"]`, so the root suite stays exactly
+  the 51 library/CLI tests and doesn't pick up `ui/`'s own jsdom wiring tests (different
+  environment, different mocks) or double-run anything.
+
+**Browser persistence is genuinely native**, the payoff the whole `core/`-extraction design was
+for: `TeleCryptIOStorage.create({...})` (default `persistentCryptoStore: true`) uses the browser's
+real IndexedDB directly — no `fake-indexeddb`, no snapshot/restore code, none of `src/cli/
+cryptoSnapshot.ts`'s complexity. The UI only persists one small thing itself, in `localStorage`:
+`{homeserver, userId, deviceId, accessToken}` (`src/lib/session.ts`).
+
+**Flows implemented** (mirror `telecrypt-io storage` commands): password login + dev-only
+register (`src/lib/auth.ts`, same endpoints/shapes as the CLI's `login`/`register`); folder list
+(auto-polls every 2.5s while mounted — a folder another session just shared/created can take a
+few `/sync` round trips to surface locally, so the UI keeps refetching instead of a one-shot
+fetch), create, and **join by ID** (`core.joinFolder` — needed because `listTrees()` only
+surfaces rooms this account has actually joined, so a shared-with-me folder needs an explicit
+join step before it's usable, same as the CLI's `folder join`); inside a folder — file list
+(also polls), upload (File → Uint8Array → `core.uploadFile`), download (`core.downloadFile` →
+Blob → real browser download via an anchor `click()`), share (invite + viewer/editor role),
+members list, unshare; recovery — set up (shows the Recovery Key once, with a copy button and an
+explicit "save this now" warning) and restore (paste key → `core.restoreRecovery` → shows
+imported/total). State lives in React hooks + one `StorageContext`, no Redux. Plain CSS, no
+component library.
+
+**Tests:**
+- **Vitest + React Testing Library (jsdom), `ui/src/App.test.tsx`, 11 tests**: mocks `core/`+
+  `auth` at the module boundary and asserts each user action calls the right `core.*` function
+  with the right arguments and renders its result — login, folder create/join, open a folder and
+  list its files, upload, download, share/unshare, recovery setup/restore. `npm test` in `ui/`.
+- **Playwright E2E (`ui/test/e2e/`, real disposable Synapse, zero mocks), 4 tests, all covering
+  the spec's mandatory flows**:
+  - `basic.spec.ts` — login → create folder → appears in the list; upload a file → appears →
+    download it → bytes byte-identical to the original.
+  - `share.spec.ts` — **the core product flow**: two independent `BrowserContext`s (two real
+    devices). userA creates a folder, shares it with userB as editor; userB joins (by the
+    folder ID read straight out of userA's DOM via `data-folder-id`) and uploads a file; userA
+    sees it appear and downloads it, bytes identical.
+  - `recovery.spec.ts` — mirrors `test/functional/keys.test.ts` 5.3 through the UI: set up
+    recovery on device A, capture the shown key, poll the server's `/room_keys/version` count
+    (not just `isRecoverySetup()`, which only proves the engine believes it's active) before
+    moving on, then a genuinely fresh `BrowserContext` logs in as the same account (real
+    password login → new `device_id`/`access_token`, empty IndexedDB) as "device B". Keeps the
+    library test's **negative control**: device B's first download attempt must fail before
+    restoring. Restores from the pasted key, then re-downloads — retrying on failure, since
+    post-restore decryption settling is real async work — and asserts the bytes match the
+    original upload.
+  - All pass individually and together; **ran the full suite 3 times** (once combined, twice
+    isolating `share.spec.ts` + `recovery.spec.ts`) with zero flakiness. `npm run e2e` in `ui/`
+    (starts its own Vite dev server + `throwaway_synapse` via Playwright's `webServer`, so it's a
+    single self-contained command).
+
+**Verification, not just "tests green":** `ui`'s `npm run build` (`tsc -b && vite build`) and
+`npm run lint` (`oxlint`, zero errors — one harmless `react-refresh` fast-refresh warning) both
+pass clean. Root suite re-run after all UI work: **51/51 passing**, unchanged — confirms `ui/`'s
+new `vitest.config.ts` and the root's one-line `exclude` addition didn't cross-contaminate either
+suite. Synapse brought back down (`npm run synapse:down`) at the end of the session.
+
+**Known limitation, not a blocker:** the shared MSC3089 file-tree crypto has one small quirk
+inherited from the library/CLI, not introduced by the UI — cross-signing verification between
+independently-provisioned dev accounts isn't set up, so matrix-js-sdk logs a benign
+`shareRoomHistoryWithUser(...): Not sharing message history as the current device is not
+verified` warning during sharing. It doesn't affect correctness (`share.spec.ts` proves userB
+still decrypts userA's shares and vice versa) — it is the exact same behavior the CLI's own
+`sharing.test.ts`/`cli.test.ts` already exercise successfully; only visible here because the
+browser's console surfaces matrix-js-sdk's log lines the CLI silences (`console.*` is muted in
+`src/cli/index.ts` unless `TELECRYPT_IO_STORAGE_DEBUG=1`; the UI has no equivalent yet, so these
+routine SDK log lines just show up in devtools — never asserted on or worked around in any test).
+
+**How to run it:**
+```
+cd ui
+npm install                 # first time only
+npm run dev                 # dev server → http://localhost:5173 (needs `npm run synapse:up` from repo root)
+npm test                    # Vitest wiring tests (jsdom, mocked core/)
+npm run e2e                 # Playwright E2E (starts Vite + Synapse itself)
+npm run build                # tsc -b && vite build
+npm run lint                 # oxlint
+```
 
 ## Phase 8 — public rebrand + npm Trusted Publishing (this session)
 

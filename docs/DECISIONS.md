@@ -4,6 +4,50 @@ Short records of choices that would otherwise get re-litigated. Newest first.
 
 ---
 
+## D5 — UI is a thin adapter over `core/`; browser IndexedDB is native, no snapshot
+
+**Decision:** the React web UI (`ui/`) contains **no E2EE, sharing, or recovery logic of its
+own** — it builds a session, calls `src/core/*` directly, and renders the typed results, exactly
+mirroring what `src/cli/*` already does. Full spec: `docs/UI_SPEC.md`; what was built and how it
+was tested: `STATUS.md` Phase 9.
+
+**Why this was cheap:** this is the payoff of D3 (the `core/` extraction) — a UI needed zero new
+business logic, only a new adapter layer (browser session construction + rendering), the same
+shape as the CLI's `src/cli/storage.ts` + `output.ts`. Every hard, tested behavior (the
+invite-then-setPermissions dance, not-found-vs-not-yet-synced polling, recovery bootstrap/restore)
+was already sitting in `core/`, platform-agnostic by construction.
+
+**Browser persistence needed zero new code**, which is the payoff of D1 (snapshot
+`fake-indexeddb`, not a disk-native shim): D1 already established that CLI and browser call the
+exact same `initRustCrypto({ useIndexedDB: true })` API — only the CLI needed extra machinery
+(`fake-indexeddb` + snapshot-to-disk) because Node has no native IndexedDB. A browser tab does,
+so `TeleCryptIOStorage.create({...})` (default `persistentCryptoStore: true`) just works, with the
+crypto store persisting across reloads automatically. The UI persists exactly one thing itself,
+in `localStorage`: `{homeserver, userId, deviceId, accessToken}` — everything else (megolm
+sessions, cross-signing keys, backup state) lives in the browser's own IndexedDB, untouched by
+UI code.
+
+**The only genuinely new problem was a browser/bundler one, not a design one:** matrix-js-sdk's
+WASM rust-crypto and `Buffer.from()` calls assume a Node-ish global environment a browser
+doesn't have. Solved narrowly — `global: "globalThis"` in `vite.config.ts` plus a `buffer`
+package polyfill wired to `globalThis.Buffer` in `main.tsx` — rather than reaching for a
+kitchen-sink polyfill plugin; the WASM asset itself needed no special handling, since Vite's
+built-in `new URL(..., import.meta.url)` asset resolution already covers how
+`@matrix-org/matrix-sdk-crypto-wasm` loads its `.wasm` file. Full details in STATUS.md Phase 9.
+
+**Verification, not just "the page renders":** a passing UI with silently-broken crypto would be
+the exact silent-failure mode this project's own testing discipline warns against, so "boots" was
+defined as login + a real `core.listFolders()` call succeeding with a clean console *before* any
+further feature work — verified via a real Playwright run against a real Synapse, not a jsdom
+mock. From there: 11 Vitest/RTL wiring tests (core/ mocked at the boundary — this is explicitly
+where mocking is allowed) plus 4 Playwright E2E tests with zero mocks (real Synapse, real
+rust-crypto, real two-`BrowserContext` multi-participant share, real fresh-device recovery
+mirroring `test/functional/keys.test.ts` 5.3) — the full E2E suite run 3 times with zero
+flakiness. Root suite re-confirmed at 51/51 after all UI work, with `ui/` excluded from the root
+`vitest.config.ts` so the two suites can't cross-contaminate.
+
+---
+
 ## D4 — Public rebrand + npm Trusted Publishing
 
 **Decision:** rebranded the library/CLI to their public identity and set up automated,
