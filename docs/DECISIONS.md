@@ -4,16 +4,67 @@ Short records of choices that would otherwise get re-litigated. Newest first.
 
 ---
 
+## D4 — Public rebrand + npm Trusted Publishing
+
+**Decision:** rebranded the library/CLI to their public identity and set up automated,
+tokenless npm publishing.
+
+**Naming scheme:**
+- Main library class: `SecureStorage` → **`TeleCryptIOStorage`** (`src/SecureStorage.ts` →
+  `src/TeleCryptIOStorage.ts`; its options type `CreateSecureStorageOpts` →
+  `CreateTeleCryptIOStorageOptions`). The `core/` operation function names (`createFolder`,
+  `uploadFile`, etc.) were deliberately left alone — they're generic verbs, not brand-bound.
+- npm package: `@telecrypt/secure-storage` → **`@telecrypt-io/storage`** (matches the
+  `telecrypt-io` npm org and the `TeleCrypt-io/secure-storage` GitHub repo).
+- CLI binary: `secure-storage` → **`telecrypt-io`**, with every existing command nested one
+  level deeper under a `storage` namespace (`telecrypt-io storage folder create ...`, `telecrypt-io
+  storage login ...`, etc.) — this reserves the top-level `telecrypt-io` binary for other
+  TeleCrypt.io command groups later, without another rename.
+- Profile env var: `SECURE_STORAGE_HOME` → **`TELECRYPT_IO_STORAGE_HOME`** (default dir
+  `~/.telecrypt-io/storage`); `SECURE_STORAGE_DEBUG` → `TELECRYPT_IO_STORAGE_DEBUG` for the same
+  reason (same family of env var, left inconsistent otherwise).
+- `LICENSE`'s "Licensed Work" field updated from "TeleCrypt Secure Storage" to "TeleCrypt.io
+  Storage" to match; licence terms (BUSL-1.1) themselves untouched.
+
+**Why nest the CLI under `storage` instead of just renaming the binary:** the class/package
+rename is 1:1, but the CLI binary rename is 1:many in spirit — `telecrypt-io` is meant to be the
+one binary for the TeleCrypt.io product line, of which encrypted storage is the first command
+group, not the only one. Nesting now avoids a second breaking CLI reshuffle later.
+
+**Trusted Publishing (`.github/workflows/publish.yml`):** publishes on any `v*` tag push via npm
+OIDC Trusted Publishing + provenance — no `NODE_AUTH_TOKEN`/npm token secret in the repo at all.
+Requires `permissions: id-token: write`, `registry-url` set through `actions/setup-node`, and
+`npm publish --provenance`; pins `npm install -g npm@latest` in the job since Trusted Publishing
+needs npm CLI ≥ 11.5.1, which is newer than what some Node setup-node versions bundle. The
+matching one-time human step (registering this repo + `publish.yml` as a Trusted Publisher on
+npmjs.com for `@telecrypt-io/storage`) is documented in `RELEASING.md`, along with the routine
+release flow (bump version, tag, push tag). **Unverified:** this workflow has not been exercised
+against a real npm publish — that requires the human npmjs.com-side configuration and a real tag
+push, neither of which happened this session. It's written to match npm's current Trusted
+Publishing docs; the first real release is what proves it end-to-end.
+
+**Verification:** exhaustively grepped the whole repo (excluding `node_modules`/`dist`/`.git`)
+for `SecureStorage`, `secure-storage`, `SECURE_STORAGE`, and `CreateSecureStorageOpts` after the
+rename — the only remaining hit was the generated `package-lock.json`, refreshed by `npm
+install`. All 51 pre-existing functional tests pass unchanged in substance (the CLI subprocess
+tests were updated to the new `storage`-nested command paths and the new env var, per the
+rename — no test assertions were weakened). `npm run lint` and `npm run build` pass clean; the
+compiled `dist/cli/index.js storage --help` (and a real `--json` error path) were run directly
+under `node` to confirm the renamed entry point and its imports actually work post-build, not
+just under `tsx`.
+
+---
+
 ## D3 — Core extraction: what's shared vs adapter
 
 **Decision:** extracted `src/core/` (`operations.ts` + `types.ts`, plus `poll.ts`/`errors.ts`
 re-homed from `src/cli/`) as the platform-agnostic operation layer both the CLI and a future UI
-call, sitting between the already-shared `SecureStorage` library and the Node-only CLI adapter.
+call, sitting between the already-shared `TeleCryptIOStorage` library and the Node-only CLI adapter.
 Full rationale and scope: `docs/CORE_EXTRACTION_SPEC.md`.
 
 **What's shared (`src/core/`):** one function per user action (`createFolder`, `listFolders`,
 `joinFolder`, `shareFolder`, `unshareFolder`, `listMembers`, `listFiles`, `uploadFile`,
-`downloadFile`, `setupRecovery`, `restoreRecovery`), taking an already-created `SecureStorage` +
+`downloadFile`, `setupRecovery`, `restoreRecovery`), taking an already-created `TeleCryptIOStorage` +
 plain inputs, returning the typed results in `core/types.ts`. Bytes in/out are `Uint8Array`, never
 file paths. Folder/file resolution-with-polling (the old `requireTree`/`requireFile`) lives here
 too, as an internal `resolveTree`/`resolveFile` — every operation taking a `folderId`/`fileId`
@@ -22,14 +73,14 @@ needs it, and there's nothing Node-specific about polling a Matrix client's loca
 **What's adapter (stays in `src/cli/`):** anything that's actually about being a *short-lived Node
 process* rather than about the Matrix operation itself — `cryptoSnapshot.ts` (disk-persisting
 `fake-indexeddb` across process exits), `profile.ts` (session.json on disk), `storage.ts`
-(`openStorage` = profile + snapshot + `SecureStorage.create`; `waitForBackupSettled`, which exists
+(`openStorage` = profile + snapshot + `TeleCryptIOStorage.create`; `waitForBackupSettled`, which exists
 specifically because a CLI command's process might exit before the SDK's fire-and-forget backup
 upload loop finishes — a concern a long-lived browser tab doesn't have), `output.ts`/`runAction`
 (stdout/`--json`/exit-code rendering), all `commander` wiring, and `login`/`register`/`whoami`/
 `logout` (session-bound, and `login`/`register` construct their own client rather than receiving
-an already-created `SecureStorage`, so they're outside `core/`'s contract by construction).
+an already-created `TeleCryptIOStorage`, so they're outside `core/`'s contract by construction).
 
-**Why the split there and not, say, at `SecureStorage` alone:** `SecureStorage` was already 100%
+**Why the split there and not, say, at `TeleCryptIOStorage` alone:** `TeleCryptIOStorage` was already 100%
 shared, but every *command's* actual logic (the invite-then-setPermissions dance in `folder
 share`, "already in room means role-change not error", the top-level filter in `folder list`, the
 not-found-vs-not-yet-synced polling) lived inline in `commander` closures — unreachable without
@@ -39,7 +90,7 @@ mirroring what `src/cli/storage.ts`+`output.ts` already do for the CLI.
 
 **Verification, not just intent:** `core/` importing `node:fs`/`node:path`/`node:v8`/`process`/
 `commander`/`fake-indexeddb` would silently break this contract, so it's checked by grep (see
-`STATUS.md` Phase 7) rather than asserted — currently clean (only imports `../SecureStorage.js`
+`STATUS.md` Phase 7) rather than asserted — currently clean (only imports `../TeleCryptIOStorage.js`
 and its own siblings).
 
 **Behavior-preserving gate:** all 47 pre-existing tests pass unchanged; a new

@@ -1,4 +1,4 @@
-# TeleCrypt Secure Storage
+# TeleCrypt.io Storage
 
 End-to-end encrypted file storage and sharing, built on Matrix.
 

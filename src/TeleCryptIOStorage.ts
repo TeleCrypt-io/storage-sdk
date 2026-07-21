@@ -49,7 +49,7 @@ export interface FileBranch {
   ): Promise<{ event_id: string }>;
 }
 
-export interface CreateSecureStorageOpts {
+export interface CreateTeleCryptIOStorageOptions {
   /** Matrix homeserver base URL, e.g. "https://matrix.example.com". */
   baseUrl: string;
   userId: string;
@@ -85,7 +85,7 @@ export interface CreateSecureStorageOpts {
   cryptoCallbacks?: CryptoCallbacks;
 }
 
-export class SecureStorage {
+export class TeleCryptIOStorage {
   constructor(private client: MatrixClient) {}
 
   /** The underlying matrix-js-sdk client (e.g. to stop it, or for advanced/interop use). */
@@ -96,7 +96,7 @@ export class SecureStorage {
   /**
    * Recommended entry point: builds the MatrixClient with a persistent crypto
    * store and the secret-storage callback wiring `keys.*` needs, starts the
-   * client, waits for the first sync, and returns a ready SecureStorage.
+   * client, waits for the first sync, and returns a ready TeleCryptIOStorage.
    *
    * The plain constructor remains available for advanced callers who need to
    * build/configure the MatrixClient themselves; in that case `keys.*` only
@@ -105,7 +105,7 @@ export class SecureStorage {
    * captures a single callbacks object at MatrixClient construction, so it
    * must exist before `initRustCrypto` runs, not be added afterwards).
    */
-  static async create(opts: CreateSecureStorageOpts): Promise<SecureStorage> {
+  static async create(opts: CreateTeleCryptIOStorageOptions): Promise<TeleCryptIOStorage> {
     const client = createClient({
       baseUrl: opts.baseUrl,
       userId: opts.userId,
@@ -118,7 +118,7 @@ export class SecureStorage {
     await client.initRustCrypto({
       useIndexedDB: persistent,
       cryptoDatabasePrefix:
-        opts.cryptoDatabasePrefix ?? `secure-storage::${opts.userId}::${opts.deviceId}`,
+        opts.cryptoDatabasePrefix ?? `telecrypt-io-storage::${opts.userId}::${opts.deviceId}`,
     });
 
     await client.startClient({ initialSyncLimit: opts.initialSyncLimit ?? 10 });
@@ -139,14 +139,14 @@ export class SecureStorage {
       });
     });
 
-    return new SecureStorage(client);
+    return new TeleCryptIOStorage(client);
   }
 
   private requireCrypto() {
     const crypto = this.client.getCrypto();
     if (!crypto) {
       throw new Error(
-        "SecureStorage: this client's crypto was never initialised (call client.initRustCrypto() first, or use SecureStorage.create())",
+        "TeleCryptIOStorage: this client's crypto was never initialised (call client.initRustCrypto() first, or use TeleCryptIOStorage.create())",
       );
     }
     return crypto;

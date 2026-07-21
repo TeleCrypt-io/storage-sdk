@@ -1,12 +1,27 @@
 {
-  "name": "@telecrypt/secure-storage",
+  "name": "@telecrypt-io/storage",
   "version": "0.1.0",
   "license": "BUSL-1.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "bin": {
-    "secure-storage": "dist/cli/index.js"
+    "telecrypt-io": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",

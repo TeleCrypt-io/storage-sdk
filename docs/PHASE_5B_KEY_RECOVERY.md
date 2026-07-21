@@ -23,26 +23,26 @@ implements crypto — `matrix-js-sdk` does; we orchestrate it.
 
 ---
 
-## Part A — Move the boundary: `SecureStorage.create()` + a `keys` API
+## Part A — Move the boundary: `TeleCryptIOStorage.create()` + a `keys` API
 
 **Problem being fixed (a real footgun):** the library currently takes an already-built client
-(`new SecureStorage(client)`), and the harness built clients with `useIndexedDB: false` — an
+(`new TeleCryptIOStorage(client)`), and the harness built clients with `useIndexedDB: false` — an
 in-memory, amnesiac crypto store. That is how the "no recovery" gap slipped in unnoticed. The
 secure configuration must be the *default*, not something each caller wires by hand.
 
-1. Add a factory `static async SecureStorage.create(opts)` that:
+1. Add a factory `static async TeleCryptIOStorage.create(opts)` that:
    - Creates the `MatrixClient` and calls `initRustCrypto` with a **persistent** store by
      default (browser: IndexedDB; Node/tests: `fake-indexeddb`). Persistent is the default;
      an explicit opt-out may exist but must be a deliberate, named choice.
    - Wires the `cryptoCallbacks.getSecretStorageKey` / `cacheSecretStorageKey` needed for
      secret-storage access (see the existing pattern in `test/functional/keys.test.ts` 5.2).
-   - Starts the client, waits for first sync, returns a ready `SecureStorage`.
+   - Starts the client, waits for first sync, returns a ready `TeleCryptIOStorage`.
    - Accepts credentials (`baseUrl`, `userId`, `accessToken`, `deviceId`) and an optional
      injected key store, so platforms can supply their own.
    - Keep the existing constructor for advanced callers, but `create()` is the recommended and
      documented path.
 
-2. Add a key-management API on `SecureStorage` (a `keys` sub-object or methods). Minimum:
+2. Add a key-management API on `TeleCryptIOStorage` (a `keys` sub-object or methods). Minimum:
    - `setupRecovery(): Promise<{ recoveryKey: string }>` — bootstrap cross-signing + secret
      storage **with a new key backup**, and return the Recovery Key string for the UI to show.
    - `isRecoverySetup(): Promise<boolean>` — is there an active key backup + secret storage?

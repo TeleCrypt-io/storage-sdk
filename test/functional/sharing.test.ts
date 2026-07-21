@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage } from "../../src/SecureStorage";
+import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 import { TreePermissions } from "matrix-js-sdk/src/models/MSC3089TreeSpace";
 
 async function waitForTree(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   treeId: string,
   label = "tree visible",
 ) {
@@ -39,8 +39,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("Shared");
       await waitFor(() => tree.room.name === "Shared");
@@ -67,8 +67,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("DecryptTest");
       await waitFor(() => tree.room.name === "DecryptTest");
@@ -112,8 +112,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("EditTest");
       await waitFor(() => tree.room.name === "EditTest");
@@ -158,8 +158,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("NoUpload");
       await waitFor(() => tree.room.name === "NoUpload");
@@ -184,8 +184,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const charlie = await createTestClient(charlieUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const charlieStore = new SecureStorage(charlie);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const charlieStore = new TeleCryptIOStorage(charlie);
 
       const tree = await aliceStore.createTree("Private");
       await waitFor(() => tree.room.name === "Private");
@@ -204,7 +204,7 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
+      const aliceStore = new TeleCryptIOStorage(alice);
 
       const tree = await aliceStore.createTree("PermTest");
       await waitFor(() => tree.room.name === "PermTest");
@@ -236,8 +236,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const parent = await aliceStore.createTree("Parent");
       await waitFor(() => parent.room.name === "Parent");
@@ -274,8 +274,8 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
-      const bobStore = new SecureStorage(bob);
+      const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("Revocation");
       await waitFor(() => tree.room.name === "Revocation");
@@ -412,7 +412,7 @@ describe("sharing", () => {
     const alice = await createTestClient(aliceUser);
     const bob = await createTestClient(bobUser);
     try {
-      const aliceStore = new SecureStorage(alice);
+      const aliceStore = new TeleCryptIOStorage(alice);
 
       const tree = await aliceStore.createTree("Members");
       await waitFor(() => tree.room.name === "Members");

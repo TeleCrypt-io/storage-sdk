@@ -239,7 +239,7 @@ project owner, **not** by you. If any is still unanswered when you reach it, sto
 
 A user's folders are Matrix rooms. Across a fresh session there is no magic index — the library
 must be able to **enumerate the caller's file trees** by listing their joined rooms and
-filtering for the MSC3089 tree marker. Your `SecureStorage` API (Phase 1) must expose something
+filtering for the MSC3089 tree marker. Your `TeleCryptIOStorage` API (Phase 1) must expose something
 like `listTrees(): MSC3089TreeSpace[]`. Add a Phase 1 test that a *fresh* client for the same
 user can find a tree created in an earlier session.
 
@@ -270,7 +270,7 @@ Create `package.json`:
 
 ```json
 {
-  "name": "@telecrypt/secure-storage",
+  "name": "@telecrypt-io/storage",
   "version": "0.1.0",
   "license": "BUSL-1.1",
   "type": "module",
@@ -442,7 +442,7 @@ Create `test/functional/smoke.test.ts` proving the harness works end to end:
 
 Encryption is deliberately excluded here so tree semantics are isolated from crypto.
 
-Create `src/SecureStorage.ts` wrapping the raw API with a friendlier interface. Design it
+Create `src/TeleCryptIOStorage.ts` wrapping the raw API with a friendlier interface. Design it
 yourself, but it must cover everything the tests below need.
 
 Write `test/functional/tree.test.ts` covering:
@@ -468,7 +468,7 @@ Write `test/functional/tree.test.ts` covering:
 
 Re-read **TRAP 1** in §3 before starting. You will hit it otherwise.
 
-Add upload/download to `src/SecureStorage.ts`:
+Add upload/download to `src/TeleCryptIOStorage.ts`:
 - `uploadFile(tree, name, data: ArrayBuffer, mimetype: string): Promise<string>`
 - `downloadFile(branch): Promise<{ data: ArrayBuffer; mimetype: string }>`
 
@@ -589,7 +589,7 @@ ISC) are fine. If unsure about a dependency's licence, do not add it — note it
 
 **Pin dependencies exactly.** `matrix-js-sdk` is pinned to an exact version (`41.9.0`, no `^`)
 because the MSC3089 API uses `unstable*` names that can move between minor releases. Do not
-loosen the pin. Keep all MSC3089 calls behind your own `SecureStorage` interface so that a
+loosen the pin. Keep all MSC3089 calls behind your own `TeleCryptIOStorage` interface so that a
 future SDK bump breaks in one file, not across the codebase.
 
 **Keep storage and crypto pluggable.** `matrix-js-sdk` is browser-first: its Rust crypto is

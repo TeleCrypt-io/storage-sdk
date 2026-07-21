@@ -3,7 +3,7 @@
 // a real Synapse, asserting on the typed results from src/core/types.ts.
 // This is the UI-readiness proof — everything exercised here is exactly
 // what a future React UI would call directly, with the exact same
-// SecureStorage + core layer the CLI uses.
+// TeleCryptIOStorage + core layer the CLI uses.
 //
 // Layer 2 (server-side Secure Backup + restore, C.4) needs a persistent
 // crypto store so a genuinely new device's own crypto state survives its
@@ -16,7 +16,7 @@ import { describe, it, expect } from "vitest";
 import { registerTestUser, loginNewDevice } from "../harness/users";
 import { stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage } from "../../src/SecureStorage";
+import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 import * as core from "../../src/core/operations";
 
 const BASE_URL = "http://localhost:8008";
@@ -25,8 +25,8 @@ async function createStorage(user: {
   userId: string;
   accessToken: string;
   deviceId: string;
-}): Promise<SecureStorage> {
-  return SecureStorage.create({
+}): Promise<TeleCryptIOStorage> {
+  return TeleCryptIOStorage.create({
     baseUrl: BASE_URL,
     userId: user.userId,
     accessToken: user.accessToken,

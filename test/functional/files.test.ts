@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage, MSC3089Branch } from "../../src/SecureStorage";
+import { TeleCryptIOStorage, MSC3089Branch } from "../../src/TeleCryptIOStorage";
 
 function randomBuffer(size: number): ArrayBuffer {
   const buf = new Uint8Array(size);
@@ -30,7 +30,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("Files");
       await waitFor(() => tree.room.name === "Files", {
         label: "tree name visible",
@@ -57,7 +57,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("Binaries");
       await waitFor(() => tree.room.name === "Binaries", {
         label: "tree name visible",
@@ -78,7 +78,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("ListTest");
       await waitFor(() => tree.room.name === "ListTest", {
         label: "tree name visible",
@@ -98,7 +98,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("NameTest");
       await waitFor(() => tree.room.name === "NameTest", {
         label: "tree name visible",
@@ -120,7 +120,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("Unicode");
       await waitFor(() => tree.room.name === "Unicode", {
         label: "tree name visible",
@@ -141,7 +141,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("MimeTest");
       await waitFor(() => tree.room.name === "MimeTest", {
         label: "tree name visible",
@@ -162,7 +162,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("CryptoTest");
       await waitFor(() => tree.room.name === "CryptoTest", {
         label: "tree name visible",
@@ -225,7 +225,7 @@ describe("encrypted files", () => {
     const user = await registerTestUser("file");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("DelTest");
       await waitFor(() => tree.room.name === "DelTest", {
         label: "tree name visible",

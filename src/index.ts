@@ -1,1 +1,1 @@
-export { SecureStorage } from "./SecureStorage.js";
+export { TeleCryptIOStorage } from "./TeleCryptIOStorage.js";

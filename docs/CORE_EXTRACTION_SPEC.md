@@ -10,13 +10,13 @@ entangled with arg-parsing and stdout. That logic can't be reused by the future 
 it into a **platform-agnostic `src/core/` module** that both the CLI and the UI call, so the UI
 runs the same tested code and the same typed data contract instead of re-deriving them.
 
-This is the maximum-reuse endpoint we agreed on: the `SecureStorage` library is already 100%
+This is the maximum-reuse endpoint we agreed on: the `TeleCryptIOStorage` library is already 100%
 shared; this adds the thin operation/orchestration layer + the result-type contract on top.
 
 ## The layering after this change
 
 ```
-  src/SecureStorage.ts   library — raw MSC3089/crypto ops (already shared, unchanged)
+  src/TeleCryptIOStorage.ts   library — raw MSC3089/crypto ops (already shared, unchanged)
         │
   src/core/              NEW — platform-agnostic: operations + typed results.
         │                NO node:fs / node:path / node:v8 / process / commander / stdout.
@@ -32,7 +32,7 @@ UI later). At minimum: `FolderInfo { id, name }`, `FileInfo { id, name, mimetype
 `RecoveryRestore { imported, total }`. These types ARE the CLI's `--json` schema and the UI's
 data model — unify them here.
 
-`core/operations.ts` — one function per operation, taking an already-created `SecureStorage`
+`core/operations.ts` — one function per operation, taking an already-created `TeleCryptIOStorage`
 plus plain inputs, returning the typed results above. **Bytes in/out are `Uint8Array` — never
 file paths.** No I/O, no stdout, no process. Cover every current command's logic, including the
 1:1 ones, so the UI can do *everything* through `core` and never touch the library directly:
@@ -54,7 +54,7 @@ Also move the genuinely platform-agnostic helpers into core: `poll.ts` and the e
 ## What STAYS in `src/cli/` (do not move — these are Node/CLI-only adapters)
 
 - `cryptoSnapshot.ts` (disk persistence), `profile.ts` (fs session), `storage.ts`
-  (`openStorage`/`close` = profile + snapshot + `SecureStorage.create`).
+  (`openStorage`/`close` = profile + snapshot + `TeleCryptIOStorage.create`).
 - `output.ts` (`runAction`, stdout/`--json`/exit-code rendering) and all `commander` wiring.
 - Each command becomes a thin wrapper: parse args → `openStorage()` → call one `core.*` function
   → wrap the typed result into `{ json, text }` → `runAction`. The `json` field should be the
@@ -67,7 +67,7 @@ Also move the genuinely platform-agnostic helpers into core: `poll.ts` and the e
 library. **Verify** this at the end (grep core/ for those imports; there must be none). This is
 the proof the UI can consume it.
 
-`core/` receives an already-created `SecureStorage` — it never creates the client itself (store
+`core/` receives an already-created `TeleCryptIOStorage` — it never creates the client itself (store
 config is platform-specific and stays in the adapters).
 
 ## Tests
@@ -80,7 +80,7 @@ config is platform-specific and stays in the adapters).
    proof. Cover at least: folder create/list; a multi-participant share where userB uploads and
    userA `downloadFile`s userB's bytes byte-identical; upload/download `Uint8Array` round-trip;
    `setupRecovery` + `restoreRecovery` on a fresh device. These use the existing harness
-   (`registerTestUser`, `loginNewDevice`, `SecureStorage.create` with `fake-indexeddb`).
+   (`registerTestUser`, `loginNewDevice`, `TeleCryptIOStorage.create` with `fake-indexeddb`).
 3. Keep the existing CLI subprocess tests as integration smoke — do not delete them.
 
 ## Constraints

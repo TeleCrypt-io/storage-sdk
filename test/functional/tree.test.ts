@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage, MSC3089TreeSpace } from "../../src/SecureStorage";
+import { TeleCryptIOStorage, MSC3089TreeSpace } from "../../src/TeleCryptIOStorage";
 
 async function waitForName(
   tree: MSC3089TreeSpace,
@@ -17,7 +17,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("My Folder");
       expect(tree.id).toBeTruthy();
       expect(typeof tree.id).toBe("string");
@@ -32,7 +32,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
@@ -55,7 +55,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const l1 = await storage.createTree("L1");
       await waitForName(l1, "L1");
 
@@ -87,7 +87,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("Original");
       await waitForName(tree, "Original");
 
@@ -103,7 +103,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
@@ -134,7 +134,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
@@ -158,7 +158,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
@@ -191,7 +191,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
@@ -206,7 +206,7 @@ describe("tree operations", () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const t1 = await storage.createTree("List A");
       const t2 = await storage.createTree("List B");
 
@@ -234,7 +234,7 @@ describe("tree operations", () => {
     const clientA = await createTestClient(user);
     let treeId: string;
     try {
-      const storageA = new SecureStorage(clientA);
+      const storageA = new TeleCryptIOStorage(clientA);
       const tree = await storageA.createTree("Persist");
       treeId = tree.id;
 
@@ -253,7 +253,7 @@ describe("tree operations", () => {
     // Fresh client, same user
     const clientB = await createTestClient(user);
     try {
-      const storageB = new SecureStorage(clientB);
+      const storageB = new TeleCryptIOStorage(clientB);
       const treesB = await waitFor<MSC3089TreeSpace[]>(
         async () => {
           const trees = await storageB.listTrees();

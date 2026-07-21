@@ -10,14 +10,14 @@ import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage } from "../../src/SecureStorage";
+import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 
 describe("versioning", () => {
   it("4.1 createNewVersion increments version", async () => {
     const user = await registerTestUser("ver");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("VersionTest");
       await waitFor(() => tree.room.name === "VersionTest");
 
@@ -67,7 +67,7 @@ describe("versioning", () => {
     const user = await registerTestUser("ver");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("HistTest");
       await waitFor(() => tree.room.name === "HistTest");
 
@@ -114,7 +114,7 @@ describe("versioning", () => {
     const user = await registerTestUser("ver");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("OldVer");
       await waitFor(() => tree.room.name === "OldVer");
 
@@ -163,7 +163,7 @@ describe("versioning", () => {
     const user = await registerTestUser("ver");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("ListAll");
       await waitFor(() => tree.room.name === "ListAll");
 
@@ -217,7 +217,7 @@ describe("versioning", () => {
     const user = await registerTestUser("ver");
     const client = await createTestClient(user);
     try {
-      const storage = new SecureStorage(client);
+      const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("RenameVer");
       await waitFor(() => tree.room.name === "RenameVer");
 
@@ -260,7 +260,7 @@ describe("versioning", () => {
     const clientA = await createTestClient(user, { useIndexedDB: true });
     let treeId: string;
     try {
-      const storageA = new SecureStorage(clientA);
+      const storageA = new TeleCryptIOStorage(clientA);
       const tree = await storageA.createTree("FreshHist");
       await waitFor(() => tree.room.name === "FreshHist");
       treeId = tree.id;
@@ -315,7 +315,7 @@ describe("versioning", () => {
     // clientA wrote to, so it should inherit the megolm sessions it needs.
     const clientB = await createTestClient(user, { useIndexedDB: true });
     try {
-      const storageB = new SecureStorage(clientB);
+      const storageB = new TeleCryptIOStorage(clientB);
       const trees = await waitFor(
         async () => {
           const ts = await storageB.listTrees();

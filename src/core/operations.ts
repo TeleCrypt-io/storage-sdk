@@ -1,17 +1,17 @@
 /**
  * Platform-agnostic operations: one function per user-facing action, each
- * taking an already-created `SecureStorage` plus plain inputs and returning
+ * taking an already-created `TeleCryptIOStorage` plus plain inputs and returning
  * one of the typed results in `./types.ts`. No I/O beyond the Matrix client
  * itself, no stdout, no `process`, no file paths — bytes in/out are always
  * `Uint8Array`. This is what the CLI's command actions call today and what
  * a future React UI calls directly, so both run the exact same tested logic
  * and share the exact same result shapes.
  *
- * `core/` never creates the `SecureStorage`/`MatrixClient` itself — store
+ * `core/` never creates the `TeleCryptIOStorage`/`MatrixClient` itself — store
  * config (persistent crypto store, session credentials, etc.) is
  * platform-specific and stays with the caller (see `src/cli/storage.ts`).
  */
-import { FileBranch, SecureStorage, TreeSpace } from "../SecureStorage.js";
+import { FileBranch, TeleCryptIOStorage, TreeSpace } from "../TeleCryptIOStorage.js";
 import { CliError } from "./errors.js";
 import { waitForCondition } from "./poll.js";
 import type {
@@ -33,7 +33,7 @@ import type {
  * later — real async settling, not an instant "not found". Throws a clean
  * error if the folder still isn't visible once the poll times out.
  */
-async function resolveTree(storage: SecureStorage, folderId: string): Promise<TreeSpace> {
+async function resolveTree(storage: TeleCryptIOStorage, folderId: string): Promise<TreeSpace> {
   try {
     return await waitForCondition(() => storage.getTree(folderId), {
       timeoutMs: 15000,
@@ -58,18 +58,18 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
-export async function createFolder(storage: SecureStorage, name: string): Promise<FolderInfo> {
+export async function createFolder(storage: TeleCryptIOStorage, name: string): Promise<FolderInfo> {
   const tree = await storage.createTree(name);
   return { id: tree.id, name };
 }
 
 /** Top-level folders only — excludes subdirectories of an existing tree. */
-export async function listFolders(storage: SecureStorage): Promise<FolderInfo[]> {
+export async function listFolders(storage: TeleCryptIOStorage): Promise<FolderInfo[]> {
   const trees = await storage.listTrees();
   return trees.filter((t) => t.isTopLevel).map((t) => ({ id: t.id, name: t.room.name }));
 }
 
-export async function joinFolder(storage: SecureStorage, folderId: string): Promise<JoinResult> {
+export async function joinFolder(storage: TeleCryptIOStorage, folderId: string): Promise<JoinResult> {
   try {
     await storage.getClient().joinRoom(folderId);
   } catch (err) {
@@ -87,7 +87,7 @@ export async function joinFolder(storage: SecureStorage, folderId: string): Prom
  * (e.g. unknown user) propagates.
  */
 export async function shareFolder(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   folderId: string,
   userId: string,
   role: string,
@@ -108,7 +108,7 @@ export async function shareFolder(
 }
 
 export async function unshareFolder(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   folderId: string,
   userId: string,
 ): Promise<UnshareResult> {
@@ -121,18 +121,18 @@ export async function unshareFolder(
   return { folderId, userId, removed: true };
 }
 
-export async function listMembers(storage: SecureStorage, folderId: string): Promise<Member[]> {
+export async function listMembers(storage: TeleCryptIOStorage, folderId: string): Promise<Member[]> {
   const tree = await resolveTree(storage, folderId);
   return storage.listMembers(tree);
 }
 
-export async function listFiles(storage: SecureStorage, folderId: string): Promise<FileInfo[]> {
+export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
   const tree = await resolveTree(storage, folderId);
   return tree.listFiles().map((f) => ({ id: f.id, name: f.getName() }));
 }
 
 export async function uploadFile(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   folderId: string,
   name: string,
   bytes: Uint8Array,
@@ -144,7 +144,7 @@ export async function uploadFile(
 }
 
 export async function downloadFile(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   folderId: string,
   fileId: string,
 ): Promise<DownloadedFile> {
@@ -163,12 +163,12 @@ export async function downloadFile(
   };
 }
 
-export async function setupRecovery(storage: SecureStorage): Promise<RecoverySetup> {
+export async function setupRecovery(storage: TeleCryptIOStorage): Promise<RecoverySetup> {
   return storage.keys.setupRecovery();
 }
 
 export async function restoreRecovery(
-  storage: SecureStorage,
+  storage: TeleCryptIOStorage,
   recoveryKey: string,
 ): Promise<RecoveryRestore> {
   return storage.keys.restoreFromRecoveryKey(recoveryKey);

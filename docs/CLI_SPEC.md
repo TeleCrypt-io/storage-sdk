@@ -1,4 +1,4 @@
-# Spec: `secure-storage` CLI (shared folders + recovery)
+# Spec: `telecrypt-io storage` CLI (shared folders + recovery)
 
 **Status:** to build. **Prereq:** library Phases 0–5B green (41 tests), key recovery works.
 **Scope:** a terminal CLI over the existing library. **No web UI. No external share links.**
@@ -7,7 +7,7 @@
 
 A scriptable command-line tool that lets a user log in, set up recovery, create **shared
 folders**, invite other participants, and have participants **add files that other participants
-can read** — all end-to-end encrypted, driven entirely by the existing `SecureStorage` library.
+can read** — all end-to-end encrypted, driven entirely by the existing `TeleCryptIOStorage` library.
 This is both a usable MVP and the behavior contract the eventual React UI will follow.
 
 Priority order: **reliability > completeness > polish.** Every command must be provable by a
@@ -39,9 +39,9 @@ process, and the decrypted bytes match the original. If that passes across two r
 invocations, persistence works. If you cannot make it pass, document exactly why in
 `BLOCKERS.md` — do not paper over it.
 
-State lives under a **profile directory**, overridable by env var `SECURE_STORAGE_HOME`
-(default e.g. `~/.secure-storage`). This is essential for tests: each simulated user/device
-gets its own `SECURE_STORAGE_HOME`, so tests can run two participants in isolation. The profile
+State lives under a **profile directory**, overridable by env var `TELECRYPT_IO_STORAGE_HOME`
+(default e.g. `~/.telecrypt-io/storage`). This is essential for tests: each simulated user/device
+gets its own `TELECRYPT_IO_STORAGE_HOME`, so tests can run two participants in isolation. The profile
 holds the session JSON (homeserver, userId, deviceId, accessToken) and the crypto store.
 
 ---
@@ -54,7 +54,7 @@ holds the session JSON (homeserver, userId, deviceId, accessToken) and the crypt
 - **Every command supports `--json`** — machine-readable output on stdout for test assertions.
   Human-readable text is the default; `--json` is what tests parse. Errors: non-zero exit code
   + a JSON `{ "error": "..." }` on stderr under `--json`.
-- Reuse the library (`SecureStorage.create`, `keys.*`, folders, files). Do **not** reimplement
+- Reuse the library (`TeleCryptIOStorage.create`, `keys.*`, folders, files). Do **not** reimplement
   crypto or Matrix logic in the CLI — the CLI is a thin driver.
 
 ---
@@ -91,7 +91,7 @@ Files:
 
 ## Small library addition needed
 
-Add `listMembers()` to the tree/folder API in `src/SecureStorage.ts`: return each participant
+Add `listMembers()` to the tree/folder API in `src/TeleCryptIOStorage.ts`: return each participant
 (userId) and their role (viewer/editor/owner), read from room membership + power levels. Cover
 it with a library test. `folder members` wraps it. (`invite` stays single-user; the CLI loops.)
 
@@ -101,7 +101,7 @@ it with a library test. `folder members` wraps it. (`invite` stays single-user; 
 
 Under `test/functional/` (or a `test/cli/` dir). All against the real disposable Synapse via
 podman. Spawn the CLI as a **subprocess** (`child_process`), each with its own
-`SECURE_STORAGE_HOME`, and assert on `--json` stdout / exit codes.
+`TELECRYPT_IO_STORAGE_HOME`, and assert on `--json` stdout / exit codes.
 
 Required scenarios:
 1. **Cross-process persistence** (the mandatory proof above): register+login, `recovery setup`,
@@ -109,7 +109,7 @@ Required scenarios:
    invocation `file download` and assert byte-identical to the original. Proves the crypto store
    survived across processes.
 2. **Multi-participant shared folder — the core use case.** Two profiles (userA, userB, each own
-   `SECURE_STORAGE_HOME`): A `folder create`, A `folder share <id> @userB --role editor`, B
+   `TELECRYPT_IO_STORAGE_HOME`): A `folder create`, A `folder share <id> @userB --role editor`, B
    accepts/joins + `file upload`, then **A `file download`s B's file and it decrypts** — proving
    a participant added a file and another participant read it. Then a third who was never invited
    cannot list it.

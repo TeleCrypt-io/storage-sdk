@@ -9,7 +9,7 @@ import { decodeRecoveryKey } from "matrix-js-sdk/src/crypto-api/recovery-key";
 import { registerTestUser, loginNewDevice } from "../harness/users";
 import { stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
-import { SecureStorage } from "../../src/SecureStorage";
+import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 
 const BASE_URL = "http://localhost:8008";
 
@@ -17,8 +17,8 @@ async function createStorage(user: {
   userId: string;
   accessToken: string;
   deviceId: string;
-}): Promise<SecureStorage> {
-  return SecureStorage.create({
+}): Promise<TeleCryptIOStorage> {
+  return TeleCryptIOStorage.create({
     baseUrl: BASE_URL,
     userId: user.userId,
     accessToken: user.accessToken,

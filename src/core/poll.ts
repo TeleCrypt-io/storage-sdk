@@ -6,7 +6,7 @@
  * (Matrix eventual-consistency-on-fresh-sync), not a bug to paper over with
  * a fixed delay: poll the actual condition, bounded by a timeout, leveraging
  * the client's own live background sync loop (already running in this
- * process since SecureStorage.create() started it).
+ * process since TeleCryptIOStorage.create() started it).
  */
 export async function waitForCondition<T>(
   check: () => T | null | undefined,
