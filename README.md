@@ -1,11 +1,49 @@
 # TeleCrypt.io Storage
 
+[![npm](https://img.shields.io/npm/v/@telecrypt-io/storage)](https://www.npmjs.com/package/@telecrypt-io/storage)
+
 End-to-end encrypted file storage and sharing, built on Matrix.
 
 Files are encrypted on the client before upload. The server stores only opaque ciphertext and
-never holds the decryption keys.
+never holds the decryption keys. Shared folders let multiple people add and read files, and a
+Recovery Key restores your files on a new device — even if you lose the original.
 
-**Status:** early development. Not yet usable.
+**Status:** published and usable — library, CLI, and a React web UI.
+
+## Install
+
+```bash
+npm install @telecrypt-io/storage
+```
+
+This gives you both the `TeleCryptIOStorage` library and the `telecrypt-io` CLI.
+
+## Quick start
+
+**Library:**
+
+```ts
+import { TeleCryptIOStorage } from "@telecrypt-io/storage";
+import * as core from "@telecrypt-io/storage/core";
+
+const storage = await TeleCryptIOStorage.create({
+  baseUrl, userId, accessToken, deviceId,
+});
+const folder = await core.createFolder(storage, "Photos");
+await core.uploadFile(storage, folder.id, "cat.jpg", bytes, "image/jpeg");
+```
+
+**CLI:**
+
+```bash
+telecrypt-io storage login --homeserver https://your.server --user alice --password ...
+telecrypt-io storage folder create Photos
+telecrypt-io storage file upload <folderId> ./cat.jpg
+telecrypt-io storage folder share <folderId> @bob:your.server --role editor
+telecrypt-io storage recovery setup     # prints your Recovery Key — save it
+```
+
+**Web UI:** a React app lives in [`ui/`](./ui) (`cd ui && npm install && npm run dev`).
 
 ## How it works
 
@@ -34,9 +72,11 @@ npm test
 npm run synapse:down
 ```
 
-Tests run against a real local Synapse in Docker, never against a production server.
+Tests run against a real local Synapse in podman, never against a production server.
 
-See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the phased build plan.
+See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the phased build plan,
+[RELEASING.md](./RELEASING.md) for how releases publish, and [docs/DECISIONS.md](./docs/DECISIONS.md)
+for the key design decisions.
 
 ## Licence
 
