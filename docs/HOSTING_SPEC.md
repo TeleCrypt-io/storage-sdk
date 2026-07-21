@@ -25,6 +25,13 @@ custom domain `storage.telecrypt.io`.
    `VITE_HOMESERVER`, defaulting to `https://telecrypt.io` for the production build) and, when
    it's set, **hide the homeserver input** and use the fixed value. Local dev can still override
    it (e.g. to the local MAS/Synapse) via the env var. Do not hardcode in a way that blocks dev.
+   **NOTE (OAuth already landed):** the UI now has MAS/OIDC login (authorization-code + PKCE) in
+   addition to password — read the current login component first (`ui/src/components/LoginScreen.tsx`
+   or wherever login now lives) and gate ONLY the homeserver input on `VITE_HOMESERVER`; do not
+   touch the OAuth/PKCE logic. telecrypt.io advertises MAS, so with the homeserver fixed the
+   OIDC "Log in with MAS" path is the natural primary in production. Redirect URI is already
+   `window.location.origin + '/'`, which becomes `https://storage.telecrypt.io/` in prod — no
+   change needed there. Verify `cd ui && npm run build && npm run dev` both still work after.
 5. **SPA fallback:** if the UI uses only state/tab routing (no path-based routes), no 404
    fallback is needed — confirm. If it does use path routes, add a `404.html` copy of
    `index.html` (GitHub Pages SPA trick).
