@@ -11,6 +11,15 @@ name: Production tests (post-deploy)
 #
 # Needs NO secrets — redpill (Part A) is public/credential-less by design,
 # and the deployed-UI smoke (Part B) stops before any login form input.
+#
+# TWO INDEPENDENT JOBS, deliberately not two steps in one job: Part A
+# currently has known-failing cases (see BLOCKERS.md — uploads are denied
+# for unverified/redpill accounts by telecrypt.io's tier_controller policy;
+# the suite runtime-skips those specific cases rather than faking them, but
+# a genuinely new Part A regression would still fail the job). Part B (the
+# deployed-UI smoke — the blank-page/entrypoints regression catcher) must
+# run and report regardless of Part A's outcome, or it would silently never
+# execute under GitHub Actions' default per-step `if: success()` chaining.
 on:
   workflow_run:
     workflows: ["Deploy UI to GitHub Pages"]
@@ -18,7 +27,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  prod-tests:
+  prod-functional:
     # Only run for an actual successful deploy, or an explicit manual trigger.
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -34,23 +43,36 @@ jobs:
           node-version: "22"
           cache: "npm"
 
-      # Part A (test:prod) needs only the root tree (src/core + the library
-      # itself). Part B's Playwright comes from the root devDependency too.
-      # ui/ dependencies aren't actually imported by either suite (the smoke
-      # test talks to the already-deployed live site, not a local build),
-      # but installed for parity with deploy-ui.yml and in case a future
-      # addition needs them.
       - name: Install root dependencies
         run: npm ci
 
-      - name: Install UI dependencies
-        run: cd ui && npm ci
+      - name: Run production functional suite (Part A — real telecrypt.io via redpill)
+        run: npm run test:prod
+
+  deployed-ui-smoke:
+    # Independent of prod-functional's outcome — see the note above.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      # Part B's Playwright is a root devDependency (this suite lives outside
+      # ui/, and needs no local build — it hits the already-deployed live
+      # site directly).
+      - name: Install root dependencies
+        run: npm ci
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
-
-      - name: Run production functional suite (Part A — real telecrypt.io via redpill)
-        run: npm run test:prod
 
       - name: Run deployed-UI smoke (Part B — real storage.telecrypt.io)
         run: npm run test:prod:smoke
