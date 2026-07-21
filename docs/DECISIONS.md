@@ -40,21 +40,29 @@ ever requiring secrets in CI. Full spec: `docs/PROD_TESTING_SPEC.md`.
    post-deploy alert, not a gate — the deploy already published by the time this runs, and
    nothing here rolls it back.
 
-**Real finding this surfaced, not anticipated at spec time:** telecrypt.io restricts media
-uploads (and some other actions) for **unverified** accounts — a deliberate operator-side
-verification/entitlement boundary, not a defect. Redpill accounts are unverified by design, so
-the suite's upload-dependent tests (round-trip, multi-participant share, plaintext check) get an
-upload rejection on every upload — including a 0-byte one, confirmed via raw `curl` independent of
-this library — deterministically, by design, not as a bug. There is no secrets-free way around
-this (verifying an account requires a privileged operator action redpill was built to avoid
-needing), so it's documented in `BLOCKERS.md` rather than worked around: the tests assert the real
-intended behavior, never a faked success. A runtime preflight (`probeUploadsRestricted` in
-`beforeAll`) detects this exact, verified restriction signature and `ctx.skip()`s the three
-affected tests with a loud reason, so the
-suite stays green-when-healthy (a real regression is still distinguishable) instead of being
-permanently, uninformatively red — self-correcting if the policy ever changes, no code change
-needed. Recovery setup (`P.4`, no upload touched) verified passing against real prod, both
-before and after adding the skip logic. Also fixed during this decision: the post-deploy workflow
+**Finding this surfaced, and how it was RESOLVED (2026-07-21):** telecrypt.io restricts media
+uploads (and rate-limits) for **unverified** accounts — a deliberate operator-side
+verification/entitlement boundary. Redpill accounts are unverified, so they can't upload at all →
+the redpill approach is **useless for functional storage tests** (dropped; no fallback). The
+resolution: **dedicated operator-VERIFIED test accounts.** Two accounts (`sstest1`, `sstest2`)
+were created via `mas-cli manage register-user` on the VM, then verified via `scripts/tc-verify.sh`.
+Their password creds live in GitHub Secrets (`PROD_TEST_USER_1/PASS_1`, `_2`); the suite logs them
+in and runs the FULL upload/share/plaintext/recovery flow — **P.1–P.4 all pass against real prod,
+deterministically (verified twice live).**
+
+Two things this also settled:
+- **Rate limits are a verification PERK now.** MSC3089 file-tree ops are state-event-heavy and
+  tripped `M_LIMIT_EXCEEDED` at the free-tier default. Rather than a per-account hack,
+  `tc-verify.sh` now sets a raised per-user Synapse rate-limit override (50/s, burst 1000, tunable)
+  as part of granting verified — so free/unverified users keep the global default, verified users
+  get more, coherently. Revoke removes the override.
+- **P.4 (recovery setup)** is idempotent, guarded by SERVER-SIDE ground truth (does real MAS hold a
+  key backup version?) rather than the fresh device's local trust state, since these accounts
+  persist across runs. Full cross-device *restore* is now technically possible on prod too (verified
+  accounts have passwords → a real second device), a future enhancement; currently prod covers
+  setup/backup-active, with full restore covered locally (keys.test.ts 5.3, core.test.ts C.4).
+
+Also fixed during this decision: the post-deploy workflow
 runs Part A and Part B as two INDEPENDENT jobs, not sequential steps — GitHub Actions' implicit
 `if: success()` chaining between steps would otherwise have silently skipped the deployed-UI
 smoke (Part B) on every run where Part A had a failing step, defeating its purpose as the

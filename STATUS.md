@@ -782,18 +782,18 @@ Best-effort folder cleanup after each test (`tree.delete()`, wrapped so a cleanu
 fails the test); accounts themselves need no teardown (controlplane retention locker reaps
 unadopted agent accounts).
 
-**Ran live against real prod this session — result: 1/4 passing (P.4), 3/4 failing (P.1–P.3) for
-a verified, structural, non-bug reason — see `BLOCKERS.md`.** Every upload (even a 0-byte one,
-reproduced independently via raw `curl`, bypassing this library entirely) is rejected — not a
-size issue, not a client bug. Root cause: telecrypt.io restricts media uploads (and some other
-actions) for **unverified** accounts — a deliberate operator-side verification/entitlement
-boundary. Redpill accounts are unverified by design (redpill is the zero-secret, zero-admin
-onboarding path; it never performs the operator's verification step), so they are restricted
-from uploading. There is no secrets-free way to get a *verified* throwaway account for CI, so
-P.1–P.3 cannot pass via redpill as currently scoped. **Left the tests exactly as specced**
-(asserting the real intended behavior, not rewritten to assert the rejection, not
-`.skip`/`.todo`'d) — full reasoning, repro, and options in `BLOCKERS.md`. P.4 needed no upload
-capability and is **verified passing against real prod**.
+**RESOLVED (2026-07-21) — now P.1–P.4 all pass against real prod, deterministically (twice).**
+Initial run surfaced that telecrypt.io restricts media uploads for **unverified** accounts
+(reproduced with a 0-byte raw `curl`) — the product's verification boundary — so redpill
+(unverified) accounts can't upload and are useless for functional storage tests. Fix: dedicated
+operator-VERIFIED test accounts (`sstest1`, `sstest2`) created via `mas-cli` on the VM + verified
+via `scripts/tc-verify.sh`; creds in GitHub Secrets (`PROD_TEST_USER_1/PASS_1`, `_2`); the suite
+logs them in (`test/production/verifiedAccounts.ts`) and runs the full upload/share/plaintext/
+recovery flow for real. The redpill fallback was removed (pointless). Rate limits (`M_LIMIT_EXCEEDED`
+from state-heavy MSC3089 ops) are now a verification perk — `tc-verify.sh` sets a raised per-user
+Synapse override on grant, so free users keep defaults and verified users get more. P.4 is
+idempotent, guarded by real server-side backup state. See `docs/DECISIONS.md` D6 (actual-outcome)
+and D7.
 
 **Part B — `test/production/deployed-ui.spec.ts` (Playwright, credential-free).** Own
 `playwright.prod.config.ts` at root (`@playwright/test` added as a root devDependency —

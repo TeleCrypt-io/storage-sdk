@@ -1,50 +1,44 @@
 // PRODUCTION functional suite — hits REAL telecrypt.io, no local stack, no
-// mocks. Accounts come from the public `redpill` endpoint (no secrets, no
-// passwords). See docs/PROD_TESTING_SPEC.md.
+// mocks. Uses the dedicated operator-VERIFIED test accounts from secrets
+// (PROD_TEST_USER_1/PASS_1, _2). See docs/PROD_TESTING_SPEC.md.
 //
-// This is deliberately the ONLY file under test/production that calls
-// redpill: all provisioning happens in this one file's single `beforeAll`,
-// serially, capped at 3 accounts. If Part A ever grows a second *.test.ts
-// file, its own beforeAll would run concurrently with this one under
-// vitest's default cross-file parallelism, which could blow the 5/min
-// per-IP rate limit — so it must not, without deliberately revisiting this
-// file's fileParallelism:false guard in vitest.prod.config.ts too.
+// Why verified accounts (not redpill): redpill provisions UNVERIFIED accounts,
+// which telecrypt.io blocks from uploading media (the product's verification
+// boundary) and rate-limits at the free-tier default. So they're useless for
+// functional storage tests. Verified accounts get uploads + a raised rate
+// limit (both granted by scripts/tc-verify.sh), so the full upload/share
+// round-trip runs for real. The suite fails loudly if the secrets are absent.
 //
-// Node has no native IndexedDB — same fake-indexeddb polyfill the local
-// suite uses (test/functional/core.test.ts, keys.test.ts). TeleCryptIOStorage
-// already scopes the crypto store per (userId, deviceId), so two different
-// redpill accounts never collide even though fake-indexeddb is
-// process-global.
+// Node has no native IndexedDB — same fake-indexeddb polyfill the local suite
+// uses (test/functional/core.test.ts, keys.test.ts). TeleCryptIOStorage scopes
+// the crypto store per (userId, deviceId), so the two accounts don't collide
+// even though fake-indexeddb is process-global.
 //
-// P.1-P.3 runtime-skip (not fake, not fail) when a beforeAll preflight
-// (probeUploadsRestricted) detects that this account is currently denied
-// media uploads by telecrypt.io's verification policy — a verified,
-// structural fact about unverified/redpill accounts, not a transient prod
-// outage. See BLOCKERS.md and docs/DECISIONS.md D7 for the full story. This
-// keeps the suite green-when-healthy (so a real regression is still
-// distinguishable from this known, permanent condition) while never
-// asserting a success that didn't happen.
+// Each test cleans up its own folders; beforeAll/afterAll additionally sweep
+// EVERY folder on both accounts, so these dedicated accounts never accumulate
+// rooms across runs.
 import "fake-indexeddb/auto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 import * as core from "../../src/core/operations";
 import { waitFor } from "../harness/waitFor";
-import { provisionRedpillAccounts, type RedpillAccount } from "./redpillClient";
+import { type RedpillAccount } from "./redpillClient";
 import { loginVerifiedAccounts } from "./verifiedAccounts";
 
-let accountA: RedpillAccount;
-let accountB: RedpillAccount;
+// NOTE: the "account" shape is shared with redpillClient's RedpillAccount
+// (mxid/accessToken/deviceId/homeserver), but this suite uses ONLY the
+// dedicated operator-VERIFIED test accounts (from secrets) — redpill accounts
+// are unverified and can't upload, so they're useless for functional storage
+// tests. If the secrets are missing, the suite fails loudly rather than
+// running against a useless account.
+type TestAccount = RedpillAccount;
+
+let accountA: TestAccount;
+let accountB: TestAccount;
 let storageA: TeleCryptIOStorage;
 let storageB: TeleCryptIOStorage;
 
-// Set by the beforeAll preflight (see probeUploadsRestricted below). true if
-// THIS account is currently denied media uploads by telecrypt.io's
-// verification policy (see BLOCKERS.md / docs/DECISIONS.md D7) — a
-// verified, structural fact about redpill-provisioned ("unverified")
-// accounts, not a guess.
-let uploadsRestricted = false;
-
-async function buildStorage(account: RedpillAccount): Promise<TeleCryptIOStorage> {
+async function buildStorage(account: TestAccount): Promise<TeleCryptIOStorage> {
   return TeleCryptIOStorage.create({
     baseUrl: account.homeserver,
     userId: account.mxid,
@@ -69,75 +63,59 @@ async function cleanupFolder(storage: TeleCryptIOStorage, folderId: string): Pro
 }
 
 /**
- * Runtime capability probe, NOT a guess: attempts a genuine 1-byte upload
- * and checks whether the server denies it as "too large" — the exact,
- * verified signature of telecrypt.io restricting uploads for
- * unverified accounts (see BLOCKERS.md). Any OTHER
- * failure here (network error, auth error, a real size-limit response with
- * a different shape, etc.) is NOT swallowed — it propagates and fails the
- * suite loudly, exactly as it should for a genuinely unexpected problem.
- *
- * This makes the suite self-correcting: if telecrypt.io's policy ever
- * changes (redpill accounts get some upload allowance, or the account gets
- * auto-verified), this probe stops seeing the denial and P.1-P.3 run for
- * real again automatically — no code change needed here.
+ * Sweeps EVERY top-level folder visible to an account and deletes it — a
+ * thorough teardown so these dedicated test accounts never accumulate rooms
+ * across runs (each MSC3089 folder is a real room on prod). Safe because
+ * these accounts exist only for this suite. Best-effort per folder: one
+ * failed delete doesn't stop the sweep.
  */
-async function probeUploadsRestricted(storage: TeleCryptIOStorage): Promise<boolean> {
-  const folder = await core.createFolder(storage, `prod-preflight-${Date.now()}`);
+async function sweepAllFolders(storage: TeleCryptIOStorage): Promise<void> {
   try {
-    await core.uploadFile(
-      storage,
-      folder.id,
-      "preflight.bin",
-      new Uint8Array([0]),
-      "application/octet-stream",
-    );
-    return false;
-  } catch (err) {
-    const message = (err as Error).message ?? "";
-    if (/413|too large|M_TOO_LARGE/i.test(message)) {
-      return true;
+    const folders = await core.listFolders(storage);
+    for (const f of folders) {
+      await cleanupFolder(storage, f.id);
     }
-    throw err;
-  } finally {
-    await cleanupFolder(storage, folder.id);
+  } catch {
+    // best-effort sweep — never throw from teardown.
   }
 }
 
 beforeAll(async () => {
-  // Prefer the dedicated operator-VERIFIED test accounts (from env/secrets)
-  // when available — those can actually upload media, so P.1-P.3 run for
-  // real. Fall back to redpill (unverified → uploads blocked, P.1-P.3
-  // runtime-skip) when the secrets aren't present, so a local run with no
-  // secrets still works. Either source yields the same account shape; both
-  // provision serially (well under redpill's 5/min budget).
+  // Uses ONLY the dedicated operator-VERIFIED test accounts (from secrets).
+  // Verified accounts can upload media AND have a raised rate limit (both are
+  // verification perks — see scripts/tc-verify.sh), so the full upload/share
+  // round-trip runs for real. No redpill fallback: redpill accounts are
+  // unverified and can't upload, so running against one would be pointless.
   const verified = await loginVerifiedAccounts();
-  const [a, b] = verified ?? (await provisionRedpillAccounts(2));
+  if (!verified) {
+    throw new Error(
+      "production suite requires verified test accounts — set PROD_TEST_USER_1/PROD_TEST_PASS_1 " +
+        "and PROD_TEST_USER_2/PROD_TEST_PASS_2 (GitHub Secrets in CI; a local .env for manual runs). " +
+        "These must be operator-verified accounts (see scripts/tc-verify.sh).",
+    );
+  }
+  const [a, b] = verified;
   accountA = a;
   accountB = b;
   storageA = await buildStorage(accountA);
   storageB = await buildStorage(accountB);
 
-  uploadsRestricted = await probeUploadsRestricted(storageA);
-  if (uploadsRestricted) {
-    console.warn(
-      "[production suite] uploads are currently denied for this (unverified, redpill-provisioned) " +
-        "account by telecrypt.io's verification policy — P.1-P.3 will be SKIPPED, not faked. " +
-        "See BLOCKERS.md for the verified root cause. P.4 (recovery setup, no upload) still runs.",
-    );
-  }
+  // Start from a clean slate — remove any folders left by a previous run
+  // (e.g. one interrupted before its own cleanup).
+  await sweepAllFolders(storageA);
+  await sweepAllFolders(storageB);
 }, 60000);
 
-afterAll(() => {
+afterAll(async () => {
+  // Thorough teardown: delete every folder these accounts can see, then stop.
+  await sweepAllFolders(storageA);
+  await sweepAllFolders(storageB);
   storageA?.getClient().stopClient();
   storageB?.getClient().stopClient();
 });
 
-describe("production: real telecrypt.io via redpill accounts", () => {
-  it("P.1 encrypted round-trip on real infra: create, upload, download, byte-identical", async (ctx) => {
-    // See probeUploadsRestricted / BLOCKERS.md — skipped with a loud reason
-    // when the account is genuinely denied uploads by policy, never faked.
-    if (uploadsRestricted) ctx.skip();
+describe("production: real telecrypt.io via verified test accounts", () => {
+  it("P.1 encrypted round-trip on real infra: create, upload, download, byte-identical", async () => {
     const folder = await core.createFolder(storageA, `prod-roundtrip-${Date.now()}`);
     try {
       const bytes = new TextEncoder().encode(`prod round-trip ${Math.random()}`);
@@ -165,8 +143,7 @@ describe("production: real telecrypt.io via redpill accounts", () => {
     }
   });
 
-  it("P.2 multi-participant share on real infra: A shares with B, B uploads, A downloads B's bytes", async (ctx) => {
-    if (uploadsRestricted) ctx.skip();
+  it("P.2 multi-participant share on real infra: A shares with B, B uploads, A downloads B's bytes", async () => {
     const folder = await core.createFolder(storageA, `prod-shared-${Date.now()}`);
     try {
       const share = await core.shareFolder(storageA, folder.id, accountB.mxid, "editor");
@@ -205,8 +182,7 @@ describe("production: real telecrypt.io via redpill accounts", () => {
     }
   });
 
-  it("P.3 server never sees plaintext (prod): raw media bytes differ from plaintext", async (ctx) => {
-    if (uploadsRestricted) ctx.skip();
+  it("P.3 server never sees plaintext (prod): raw media bytes differ from plaintext", async () => {
     const folder = await core.createFolder(storageA, `prod-plaintext-${Date.now()}`);
     try {
       const plaintext = new TextEncoder().encode(
@@ -266,27 +242,35 @@ describe("production: real telecrypt.io via redpill accounts", () => {
   // device and a negative control). This test covers setup/backup-active
   // only, exactly as scoped in docs/PROD_TESTING_SPEC.md Part A #4.
   it("P.4 recovery setup on real MAS: setupRecovery() + backup becomes active (restore is local-only, see comment)", async () => {
-    const setup = await core.setupRecovery(storageA);
-    expect(typeof setup.recoveryKey).toBe("string");
-    expect(setup.recoveryKey).toBeTruthy();
+    // Idempotent on a persistent account, guarded by SERVER-SIDE ground truth
+    // (does real MAS actually hold a key backup version for this account?) —
+    // NOT by the local `isRecoverySetup()`, which reflects this run's fresh
+    // ephemeral device's trust state, not what's on the server. setupRecovery
+    // bootstraps brand-new secret storage + key backup, a one-shot per account;
+    // if the server already has a backup (a prior run — these accounts persist,
+    // unlike the earlier redpill flow), re-running it would need the EXISTING
+    // secret-storage key we don't carry between runs. So: set up only if the
+    // server has no backup yet, then assert real MAS holds a backup version
+    // either way. Never fakes — the assertion is real server-side state.
+    const serverBackupVersion = async (): Promise<string | null> => {
+      const res = await fetch(`${accountA.homeserver}/_matrix/client/v3/room_keys/version`, {
+        headers: { Authorization: `Bearer ${accountA.accessToken}` },
+      });
+      if (!res.ok) return null;
+      const info = (await res.json()) as { version?: string };
+      return info.version ?? null;
+    };
 
-    await waitFor(() => storageA.keys.isRecoverySetup(), {
-      label: "backup active on real MAS",
+    if (!(await serverBackupVersion())) {
+      const setup = await core.setupRecovery(storageA);
+      expect(typeof setup.recoveryKey).toBe("string");
+      expect(setup.recoveryKey).toBeTruthy();
+    }
+
+    // Confirm the server side (real MAS/SSSS) actually has a backup version.
+    await waitFor(async () => (await serverBackupVersion()) ?? null, {
+      label: "real MAS backup version exists",
       timeoutMs: 20000,
     });
-
-    // Not just "the engine believes it's active" — confirm the server side
-    // (real MAS/SSSS) actually has a backup version with keys landing.
-    await waitFor(
-      async () => {
-        const res = await fetch(`${accountA.homeserver}/_matrix/client/v3/room_keys/version`, {
-          headers: { Authorization: `Bearer ${accountA.accessToken}` },
-        });
-        if (!res.ok) return null;
-        const info = (await res.json()) as { version?: string };
-        return info.version ? true : null;
-      },
-      { label: "real MAS backup version exists", timeoutMs: 20000 },
-    );
   });
 });

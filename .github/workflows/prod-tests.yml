@@ -11,9 +11,10 @@ name: Production tests (post-deploy)
 #
 # Part A (functional) uses dedicated operator-VERIFIED test accounts from
 # repo secrets (PROD_TEST_USER_1/PASS_1, PROD_TEST_USER_2/PASS_2) so the full
-# upload/share round-trip runs for real. If those secrets are absent it falls
-# back to redpill (unverified → uploads runtime-skip). Part B (deployed-UI
-# smoke) needs no secrets and stops before any login input.
+# upload/share/plaintext/recovery flow runs for real (all pass). The secrets
+# are REQUIRED — Part A fails loudly without them (no redpill fallback:
+# unverified accounts can't upload, so testing against one is pointless).
+# Part B (deployed-UI smoke) needs no secrets and stops before any login input.
 #
 # NOTE: the verified test accounts must have a Synapse per-user rate-limit
 # override (the MSC3089 file-tree ops are state-event-heavy; without it the
