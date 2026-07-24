@@ -14,8 +14,10 @@ scan your diff for cross-repo internals. (This happened once — see the private
 
 ## Testing — two separate suites
 
-- **Local suite** (`npm test`): runs against a disposable **podman** MAS+Synapse stack
+- **Local suite** (`npm test`): runs against a disposable MAS+Synapse stack
   (`throwaway_synapse/`, `up.sh`/`down.sh`, **off by default** — bring it up first, down after).
+  Uses **podman** locally (rootless, no daemon); the production stack uses Docker — test
+  harness choice, not a compatibility constraint.
   No mocks. This is where storage/E2EE/recovery logic is fully exercised.
 - **Prod suite** (`npm run test:prod` / `test:prod:smoke`): hits **real telecrypt.io**. Requires
   operator-provided **verified** test-account secrets (`PROD_TEST_USER_1/PASS_1`, `_2`) — it

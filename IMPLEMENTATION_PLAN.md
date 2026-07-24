@@ -1,6 +1,9 @@
 # Implementation Plan — TeleCrypt Secure Storage
 
-**Read this whole file before writing any code.**
+> **⚠️ Historical only.** This plan was written before Phases 0–5 were built. The project
+> has since shipped all phases (0–10, see [`STATUS.md`](./STATUS.md)). Phase numbering here
+> does not match what was actually built — refer to [`STATUS.md`](./STATUS.md) for the live
+> picture. This file is kept for reference but should not be used to plan new work.
 
 You are implementing a TypeScript client library for end-to-end-encrypted file storage on
 Matrix. This document is self-contained: it assumes you have no prior context about this
