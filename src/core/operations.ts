@@ -18,10 +18,12 @@ import type {
   DownloadedFile,
   FileInfo,
   FolderInfo,
+  DeleteResult,
   JoinResult,
   Member,
   RecoveryRestore,
   RecoverySetup,
+  RenameResult,
   ShareResult,
   UnshareResult,
 } from "./types.js";
@@ -129,6 +131,66 @@ export async function listMembers(storage: TeleCryptIOStorage, folderId: string)
 export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
   const tree = await resolveTree(storage, folderId);
   return tree.listFiles().map((f) => ({ id: f.id, name: f.getName() }));
+}
+
+export async function listSubfolders(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<FolderInfo[]> {
+  const tree = await resolveTree(storage, folderId);
+  return tree.getDirectories().map((d) => ({ id: d.id, name: d.room.name }));
+}
+
+export async function createSubfolder(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+  name: string,
+): Promise<FolderInfo> {
+  const tree = await resolveTree(storage, folderId);
+  const sub = await tree.createDirectory(name);
+  return { id: sub.id, name };
+}
+
+export async function renameFolder(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+  name: string,
+): Promise<RenameResult> {
+  const tree = await resolveTree(storage, folderId);
+  await tree.setName(name);
+  return { id: folderId, name };
+}
+
+export async function deleteFolder(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<DeleteResult> {
+  const tree = await resolveTree(storage, folderId);
+  await tree.delete();
+  return { id: folderId, deleted: true };
+}
+
+export async function renameFile(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+  fileId: string,
+  name: string,
+): Promise<RenameResult> {
+  const tree = await resolveTree(storage, folderId);
+  const branch = await resolveFile(tree, fileId);
+  await branch.setName(name);
+  return { id: fileId, name };
+}
+
+export async function deleteFile(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+  fileId: string,
+): Promise<DeleteResult> {
+  const tree = await resolveTree(storage, folderId);
+  const branch = await resolveFile(tree, fileId);
+  await branch.delete();
+  return { id: fileId, deleted: true };
 }
 
 export async function uploadFile(

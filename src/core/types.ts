@@ -42,6 +42,16 @@ export interface JoinResult {
   joined: boolean;
 }
 
+export interface DeleteResult {
+  id: string;
+  deleted: boolean;
+}
+
+export interface RenameResult {
+  id: string;
+  name: string;
+}
+
 /** Bytes in/out are always `Uint8Array` — never a file path. */
 export interface DownloadedFile {
   bytes: Uint8Array;
