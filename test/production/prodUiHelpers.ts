@@ -76,8 +76,11 @@ export async function expectLoggedInFileManager(page: Page, userId: string): Pro
 }
 
 export async function createFolder(page: Page, name: string): Promise<string> {
-  await page.getByTestId("new-folder-name").fill(name);
   await page.getByTestId("create-folder").click();
+  const renameInput = page.getByTestId("rename-folder-input");
+  await expect(renameInput).toBeVisible({ timeout: 30_000 });
+  await renameInput.fill(name);
+  await renameInput.press("Enter");
   const item = page.locator('[data-testid="folder-item"]', { hasText: name });
   await expect(item).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("folder-detail")).toBeVisible({ timeout: 15_000 });

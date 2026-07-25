@@ -16,7 +16,9 @@ import { CliError } from "./errors.js";
 import { waitForCondition } from "./poll.js";
 import type {
   DownloadedFile,
+  FileDetails,
   FileInfo,
+  FolderDetails,
   FolderInfo,
   DeleteResult,
   JoinResult,
@@ -78,6 +80,66 @@ export async function joinFolder(storage: TeleCryptIOStorage, folderId: string):
     throw new CliError(`join failed: ${(err as Error).message}`);
   }
   return { folderId, joined: true };
+}
+
+function roomDisplayName(
+  storage: TeleCryptIOStorage,
+  roomId: string,
+  fallbackName?: string,
+): string {
+  const client = storage.getClient();
+  const room = client.getRoom(roomId);
+  if (fallbackName?.trim()) return fallbackName.trim();
+  if (room?.name) return room.name;
+  const userId = client.getUserId();
+  if (room && userId) return room.getDefaultRoomName(userId);
+  return roomId;
+}
+
+/** Rooms where this account is invited and the room looks like a file tree. */
+export async function listPendingInvites(storage: TeleCryptIOStorage): Promise<FolderInfo[]> {
+  const client = storage.getClient();
+  const invites: FolderInfo[] = [];
+
+  for (const room of client.getRooms()) {
+    if (room.getMyMembership() !== "invite") continue;
+
+    const tree = storage.getTree(room.roomId);
+    if (tree) {
+      invites.push({
+        id: tree.id,
+        name: roomDisplayName(storage, room.roomId, tree.room.name),
+      });
+      continue;
+    }
+
+    // Invite state may not have MSC3089 tree metadata yet — accept rooms whose
+    // create event marks them as a file tree space.
+    const createEvent = room.currentState?.getStateEvents("m.room.create", "");
+    const createContent = createEvent?.getContent() as Record<string, unknown> | undefined;
+    const roomType = createContent?.["type"];
+    if (roomType === "org.matrix.msc3088.file" || roomType === "m.space") {
+      invites.push({
+        id: room.roomId,
+        name: roomDisplayName(storage, room.roomId),
+      });
+    }
+  }
+
+  return invites;
+}
+
+/** Decline a folder invite (same as leaving before join). */
+export async function declineInvite(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<{ folderId: string; declined: boolean }> {
+  try {
+    await storage.getClient().leave(folderId);
+  } catch (err) {
+    throw new CliError(`decline failed: ${(err as Error).message}`);
+  }
+  return { folderId, declined: true };
 }
 
 /**
@@ -234,4 +296,81 @@ export async function restoreRecovery(
   recoveryKey: string,
 ): Promise<RecoveryRestore> {
   return storage.keys.restoreFromRecoveryKey(recoveryKey);
+}
+
+function tsToIso(ts: number | undefined | null): string | null {
+  if (ts == null || !Number.isFinite(ts)) return null;
+  return new Date(ts).toISOString();
+}
+
+export async function getFileDetails(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+  fileId: string,
+): Promise<FileDetails> {
+  const tree = await resolveTree(storage, folderId);
+  const branch = await resolveFile(tree, fileId);
+  const name = branch.getName();
+  let mimetype: string | null = null;
+  let size: number | null = null;
+  let createdAt: string | null = null;
+  let updatedAt: string | null = null;
+
+  try {
+    const { info } = await branch.getFileInfo();
+    if (info) {
+      if (typeof info["mimetype"] === "string") mimetype = info["mimetype"];
+      if (typeof info["size"] === "number") size = info["size"];
+    }
+  } catch {
+    // Partial metadata is fine — UI shows "—" for unknown fields.
+  }
+
+  try {
+    const event = await branch.getFileEvent();
+    const content = event.getContent();
+    const infoBlock = content["info"] as Record<string, unknown> | undefined;
+    if (!mimetype && typeof infoBlock?.["mimetype"] === "string") {
+      mimetype = infoBlock["mimetype"];
+    }
+    if (size == null && typeof infoBlock?.["size"] === "number") {
+      size = infoBlock["size"];
+    }
+    const eventAny = event as { getTs?: () => number; origin_server_ts?: number };
+    const ts = eventAny.getTs?.() ?? eventAny.origin_server_ts;
+    createdAt = tsToIso(ts);
+    updatedAt = createdAt;
+  } catch {
+    // Same as above.
+  }
+
+  return { name, mimetype, size, createdAt, updatedAt };
+}
+
+export async function getFolderDetails(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<FolderDetails> {
+  const tree = await resolveTree(storage, folderId);
+  const client = storage.getClient();
+  const room = client.getRoom(folderId);
+  let createdAt: string | null = null;
+  let memberCount: number | null = null;
+
+  if (room) {
+    const createEvent = room.currentState?.getStateEvents("m.room.create", "");
+    createdAt = tsToIso(createEvent?.getTs());
+    try {
+      memberCount = room.getJoinedMemberCount();
+    } catch {
+      memberCount = null;
+    }
+  }
+
+  return {
+    name: tree.room.name || roomDisplayName(storage, folderId),
+    id: folderId,
+    createdAt,
+    memberCount,
+  };
 }

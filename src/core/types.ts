@@ -67,3 +67,18 @@ export interface RecoveryRestore {
   imported: number;
   total: number;
 }
+
+export interface FileDetails {
+  name: string;
+  mimetype: string | null;
+  size: number | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface FolderDetails {
+  name: string;
+  id: string;
+  createdAt: string | null;
+  memberCount: number | null;
+}
