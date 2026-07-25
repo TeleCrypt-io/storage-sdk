@@ -78,6 +78,8 @@ export interface CreateTeleCryptIOStorageOptions {
   syncTimeoutMs?: number;
   /** How long to wait for rust-crypto WASM + IndexedDB init; default 60000ms. */
   initTimeoutMs?: number;
+  /** Optional progress reporter for UI/CLI status lines during bootstrap. */
+  onProgress?: (message: string) => void;
   /**
    * Optional platform-supplied crypto callbacks (e.g. to source the secret
    * storage key from an OS keychain instead of prompting). `keys.setupRecovery`
@@ -115,6 +117,7 @@ export interface CreateFromOidcOptions {
   initialSyncLimit?: number;
   syncTimeoutMs?: number;
   initTimeoutMs?: number;
+  onProgress?: (message: string) => void;
   cryptoCallbacks?: CryptoCallbacks;
 }
 
@@ -186,9 +189,13 @@ export class TeleCryptIOStorage {
       | "initialSyncLimit"
       | "syncTimeoutMs"
       | "initTimeoutMs"
+      | "onProgress"
     >,
   ): Promise<TeleCryptIOStorage> {
+    const progress = opts.onProgress ?? (() => {});
     const persistent = opts.persistentCryptoStore ?? true;
+
+    progress("Loading encryption engine (WASM)…");
     await TeleCryptIOStorage.withTimeout(
       client.initRustCrypto({
         useIndexedDB: persistent,
@@ -198,10 +205,14 @@ export class TeleCryptIOStorage {
       opts.initTimeoutMs ?? 60000,
       "crypto init",
     );
+    progress("Encryption ready — opening secure store…");
 
+    progress("Starting Matrix client…");
     await client.startClient({ initialSyncLimit: opts.initialSyncLimit ?? 10 });
 
+    progress("Waiting for first sync with homeserver…");
     await TeleCryptIOStorage.waitForFirstSync(client, opts.syncTimeoutMs ?? 15000);
+    progress("Sync complete.");
 
     return new TeleCryptIOStorage(client);
   }
