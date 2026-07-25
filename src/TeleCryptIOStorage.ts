@@ -503,19 +503,22 @@ export class TeleCryptIOStorage {
     const powerLevelsPath = `/rooms/${roomId}/state/m.room.power_levels/`;
     const reqOpts = { prefix: ClientPrefix.V3 };
 
-    const [membersBody, pls] = await Promise.all([
+    type PowerLevels = {
+      users_default?: number;
+      events_default?: number;
+      events?: Record<string, number>;
+      users?: Record<string, number>;
+    };
+
+    const [membersBody, plsRaw] = await Promise.all([
       this.client.http.authedRequest<{
         chunk: { state_key: string; content: { membership?: string } }[];
       }>(Method.Get, membersPath, undefined, undefined, reqOpts),
       this.client.http
-        .authedRequest<{
-          users_default?: number;
-          events_default?: number;
-          events?: Record<string, number>;
-          users?: Record<string, number>;
-        }>(Method.Get, powerLevelsPath, undefined, undefined, reqOpts)
-        .catch(() => ({})),
+        .authedRequest<PowerLevels>(Method.Get, powerLevelsPath, undefined, undefined, reqOpts)
+        .catch((): PowerLevels => ({})),
     ]);
+    const pls: PowerLevels = plsRaw;
 
     const viewLevel = pls.users_default ?? 0;
     const editLevel = pls.events_default ?? 50;
