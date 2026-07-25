@@ -76,6 +76,8 @@ export interface CreateTeleCryptIOStorageOptions {
   initialSyncLimit?: number;
   /** How long to wait for the first sync before giving up; default 15000ms. */
   syncTimeoutMs?: number;
+  /** How long to wait for rust-crypto WASM + IndexedDB init; default 60000ms. */
+  initTimeoutMs?: number;
   /**
    * Optional platform-supplied crypto callbacks (e.g. to source the secret
    * storage key from an OS keychain instead of prompting). `keys.setupRecovery`
@@ -112,6 +114,7 @@ export interface CreateFromOidcOptions {
   cryptoDatabasePrefix?: string;
   initialSyncLimit?: number;
   syncTimeoutMs?: number;
+  initTimeoutMs?: number;
   cryptoCallbacks?: CryptoCallbacks;
 }
 
@@ -176,35 +179,71 @@ export class TeleCryptIOStorage {
     client: MatrixClient,
     opts: Pick<
       CreateTeleCryptIOStorageOptions,
-      "userId" | "deviceId" | "persistentCryptoStore" | "cryptoDatabasePrefix" | "initialSyncLimit" | "syncTimeoutMs"
+      | "userId"
+      | "deviceId"
+      | "persistentCryptoStore"
+      | "cryptoDatabasePrefix"
+      | "initialSyncLimit"
+      | "syncTimeoutMs"
+      | "initTimeoutMs"
     >,
   ): Promise<TeleCryptIOStorage> {
     const persistent = opts.persistentCryptoStore ?? true;
-    await client.initRustCrypto({
-      useIndexedDB: persistent,
-      cryptoDatabasePrefix:
-        opts.cryptoDatabasePrefix ?? `telecrypt-io-storage::${opts.userId}::${opts.deviceId}`,
-    });
+    await TeleCryptIOStorage.withTimeout(
+      client.initRustCrypto({
+        useIndexedDB: persistent,
+        cryptoDatabasePrefix:
+          opts.cryptoDatabasePrefix ?? `telecrypt-io-storage::${opts.userId}::${opts.deviceId}`,
+      }),
+      opts.initTimeoutMs ?? 60000,
+      "crypto init",
+    );
 
     await client.startClient({ initialSyncLimit: opts.initialSyncLimit ?? 10 });
 
-    await new Promise<void>((resolve, reject) => {
-      const timeoutMs = opts.syncTimeoutMs ?? 15000;
-      const timeout = setTimeout(
-        () => reject(new Error("sync timeout")),
-        timeoutMs,
-      );
-      client.once(ClientEvent.Sync, (state: SyncState) => {
-        clearTimeout(timeout);
-        if (state === SyncState.Prepared || state === SyncState.Syncing) {
-          resolve();
-        } else {
-          reject(new Error(`unexpected sync state: ${state}`));
-        }
-      });
-    });
+    await TeleCryptIOStorage.waitForFirstSync(client, opts.syncTimeoutMs ?? 15000);
 
     return new TeleCryptIOStorage(client);
+  }
+
+  private static withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+      }),
+    ]);
+  }
+
+  /** Wait until the client reaches Prepared/Syncing. Ignores transient
+   * pre-sync states instead of rejecting on the first Sync event (which can
+   * race `startClient`), and handles the case where sync already completed
+   * before the listener was attached. */
+  private static waitForFirstSync(client: MatrixClient, timeoutMs: number): Promise<void> {
+    const ready = (state: SyncState | null) =>
+      state === SyncState.Prepared || state === SyncState.Syncing;
+
+    if (ready(client.getSyncState())) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const onSync = (state: SyncState) => {
+        if (ready(state)) {
+          cleanup();
+          resolve();
+        }
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        client.removeListener(ClientEvent.Sync, onSync);
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("sync timeout"));
+      }, timeoutMs);
+      client.on(ClientEvent.Sync, onSync);
+    });
   }
 
   private requireCrypto() {

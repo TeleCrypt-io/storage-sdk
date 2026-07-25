@@ -30,6 +30,7 @@
     "test:watch": "vitest",
     "test:prod": "vitest run --config vitest.prod.config.ts",
     "test:prod:smoke": "playwright test --config playwright.prod.config.ts",
+    "test:prod:ui": "playwright test --config playwright.prod.functional.config.ts",
     "synapse:up": "./throwaway_synapse/up.sh",
     "synapse:fresh": "./throwaway_synapse/up.sh --fresh",
     "synapse:down": "./throwaway_synapse/down.sh"

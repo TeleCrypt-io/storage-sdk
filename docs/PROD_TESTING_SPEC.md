@@ -68,7 +68,30 @@ until it serves (and ideally until the freshly-built asset hash is live) before 
 accept a short settle. Handle the browser cache (use a fresh context / bypass cache) so it tests
 the new bundle, not a cached one.
 
-## Part C — Run after every deployment
+## Part C — Deployed-UI functional (`test/production/deployed-ui-functional.spec.ts`, Playwright)
+
+**Mandatory after every UI deploy to storage.telecrypt.io** — not optional, and not replaceable
+by Part B smoke alone. Part B never completes login; it cannot catch post-login regressions such
+as the UI stuck on "Connecting…" after OIDC or session restore.
+
+Script: `npm run test:prod:ui` (config: `playwright.prod.functional.config.ts`). CI job:
+`deployed-ui-functional` in `.github/workflows/prod-tests.yml` (third independent job; runs even
+if Part A fails; **requires** `PROD_TEST_USER_1` / `PROD_TEST_PASS_1` secrets — fails loudly
+without them).
+
+Flow against live `https://storage.telecrypt.io`:
+1. Clear `localStorage` / `sessionStorage` (no inherited stuck session).
+2. Click OIDC login → complete production MAS login at `https://telecrypt.io/auth/` with
+   `PROD_TEST_USER_1` / `PROD_TEST_PASS_1`.
+3. Wait for `data-testid="current-user"` and `data-testid="file-manager"` within a generous
+   timeout (first connect can take up to ~90s while WASM + IndexedDB initialize on GitHub Pages).
+   **Must NOT remain on `data-testid="connecting"`.**
+4. Create a folder, upload a file, download it, assert byte-identical.
+5. Best-effort delete the test folder.
+
+Local run without secrets: fails immediately with a clear message (no silent skip).
+
+## Part D — Run after every deployment
 
 Wire these to run automatically post-deploy. Preferred: a **separate workflow**
 `.github/workflows/prod-tests.yml` triggered `on: workflow_run` (when "Deploy UI to GitHub
@@ -77,7 +100,9 @@ Pages" completes successfully) **plus `workflow_dispatch`** for manual runs. It:
   Playwright), builds nothing that needs the local stack,
 - runs `npm run test:prod` (Part A) and the Playwright deployed-UI smoke (Part B) against live
   prod,
-- **needs no secrets** (redpill is public).
+- runs `npm run test:prod:ui` (Part C — deployed-UI functional, OIDC login + file manager),
+- **needs no secrets** for Part A/B smoke only; Part A library suite and Part C UI functional
+  require the verified test-account secrets,
 
 A failing prod-test does not roll back the (already-published) deploy — it's a post-deploy
 alert. That's the intended behavior for a smoke; make failures loud.

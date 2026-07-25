@@ -15,6 +15,9 @@ name: Production tests (post-deploy)
 # are REQUIRED — Part A fails loudly without them (no redpill fallback:
 # unverified accounts can't upload, so testing against one is pointless).
 # Part B (deployed-UI smoke) needs no secrets and stops before any login input.
+# Part C (deployed-UI functional) requires PROD_TEST_USER_1/PASS_1 and proves
+# real OIDC login + connect + file-manager ops — catches the "Connecting…"
+# hang class that Part B cannot see.
 #
 # NOTE: the verified test accounts must have a Synapse per-user rate-limit
 # override (the MSC3089 file-tree ops are state-event-heavy; without it the
@@ -91,5 +94,50 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: prod-smoke-trace
+          path: test-results/
+          retention-days: 7
+
+  deployed-ui-functional:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require prod UI test secrets
+        env:
+          PROD_TEST_USER_1: ${{ secrets.PROD_TEST_USER_1 }}
+          PROD_TEST_PASS_1: ${{ secrets.PROD_TEST_PASS_1 }}
+        run: |
+          if [ -z "$PROD_TEST_USER_1" ] || [ -z "$PROD_TEST_PASS_1" ]; then
+            echo "PROD_TEST_USER_1 and PROD_TEST_PASS_1 secrets are required for deployed-UI functional tests"
+            exit 1
+          fi
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run deployed-UI functional (Part C — OIDC login + file manager)
+        run: npm run test:prod:ui
+        env:
+          PROD_TEST_USER_1: ${{ secrets.PROD_TEST_USER_1 }}
+          PROD_TEST_PASS_1: ${{ secrets.PROD_TEST_PASS_1 }}
+
+      - name: Upload Playwright trace on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-ui-functional-trace
           path: test-results/
           retention-days: 7

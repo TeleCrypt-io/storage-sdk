@@ -19,10 +19,18 @@ scan your diff for cross-repo internals. (This happened once — see the private
   Uses **podman** locally (rootless, no daemon); the production stack uses Docker — test
   harness choice, not a compatibility constraint.
   No mocks. This is where storage/E2EE/recovery logic is fully exercised.
-- **Prod suite** (`npm run test:prod` / `test:prod:smoke`): hits **real telecrypt.io**. Requires
+- **Prod suite** (`npm run test:prod` / `test:prod:smoke` / `test:prod:ui`): hits **real telecrypt.io**. Requires
   operator-provided **verified** test-account secrets (`PROD_TEST_USER_1/PASS_1`, `_2`) — it
   fails loudly without them. Runs post-deploy via `.github/workflows/prod-tests.yml`. Don't run
   it repeatedly in quick succession (prod is rate-limited).
+
+## After any UI deploy — mandatory functional UI test
+
+Pushing changes under `ui/**` to `main` auto-deploys to `https://storage.telecrypt.io`. **After
+every such deploy you MUST run the production functional UI suite** (`npm run test:prod:ui`, or
+the `deployed-ui-functional` job in `.github/workflows/prod-tests.yml`) — not only the credential-free
+smoke (`test:prod:smoke`). The smoke proves mount + OIDC redirect; only the functional suite
+completes login, waits for connect (not stuck on "Connecting…"), and exercises the file manager.
 
 ## Known gap worth remembering
 
