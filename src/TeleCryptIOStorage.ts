@@ -1,4 +1,6 @@
 import { ClientEvent, createClient, MatrixClient, SyncState } from "matrix-js-sdk";
+import { Method } from "matrix-js-sdk/lib/http-api/method.js";
+import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
 import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
@@ -496,33 +498,24 @@ export class TeleCryptIOStorage {
   async listMembers(
     tree: TreeSpace,
   ): Promise<{ userId: string; role: string; membership: string }[]> {
-    const clientAny = this.client as unknown as {
-      getHomeserverUrl: () => string;
-      getAccessToken: () => string | null;
-    };
-    const baseUrl = clientAny.getHomeserverUrl();
-    const token = clientAny.getAccessToken();
-    const authHeaders = { Authorization: `Bearer ${token}` };
-    const roomPath = `${baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(tree.id)}`;
+    const roomId = encodeURIComponent(tree.id);
+    const membersPath = `/rooms/${roomId}/members`;
+    const powerLevelsPath = `/rooms/${roomId}/state/m.room.power_levels/`;
+    const reqOpts = { prefix: ClientPrefix.V3 };
 
-    const [membersRes, powerLevelsRes] = await Promise.all([
-      fetch(`${roomPath}/members`, { headers: authHeaders }),
-      fetch(`${roomPath}/state/m.room.power_levels/`, { headers: authHeaders }),
-    ]);
-    if (!membersRes.ok) {
-      throw new Error(`listMembers: failed to fetch room members (${membersRes.status})`);
-    }
-    const membersBody = (await membersRes.json()) as {
-      chunk: { state_key: string; content: { membership?: string } }[];
-    };
-    const pls = powerLevelsRes.ok
-      ? ((await powerLevelsRes.json()) as {
+    const [membersBody, pls] = await Promise.all([
+      this.client.http.authedRequest<{
+        chunk: { state_key: string; content: { membership?: string } }[];
+      }>(Method.Get, membersPath, undefined, undefined, reqOpts),
+      this.client.http
+        .authedRequest<{
           users_default?: number;
           events_default?: number;
           events?: Record<string, number>;
           users?: Record<string, number>;
-        })
-      : {};
+        }>(Method.Get, powerLevelsPath, undefined, undefined, reqOpts)
+        .catch(() => ({})),
+    ]);
 
     const viewLevel = pls.users_default ?? 0;
     const editLevel = pls.events_default ?? 50;

@@ -75,19 +75,22 @@ export async function expectLoggedInFileManager(page: Page, userId: string): Pro
   await expect(page.getByTestId("connecting")).not.toBeVisible();
 }
 
-export async function createFolder(page: Page, name: string): Promise<string> {
-  await page.getByTestId("create-folder").click();
-  const renameInput = page.getByTestId("rename-folder-input");
+export async function createVault(page: Page, name: string): Promise<string> {
+  await page.getByTestId("create-vault").click();
+  const renameInput = page.getByTestId("rename-vault-input");
   await expect(renameInput).toBeVisible({ timeout: 30_000 });
   await renameInput.fill(name);
   await renameInput.press("Enter");
-  const item = page.locator('[data-testid="folder-item"]', { hasText: name });
+  const item = page.locator('[data-testid="vault-item"]', { hasText: name });
   await expect(item).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("folder-detail")).toBeVisible({ timeout: 15_000 });
   const folderId = await item.getAttribute("data-folder-id");
-  if (!folderId) throw new Error(`folder item for "${name}" has no data-folder-id`);
+  if (!folderId) throw new Error(`vault item for "${name}" has no data-folder-id`);
   return folderId;
 }
+
+/** @deprecated use createVault */
+export const createFolder = createVault;
 
 export async function uploadFile(
   page: Page,
@@ -124,18 +127,7 @@ export async function downloadFileBytes(page: Page, name: string): Promise<Buffe
   }
 }
 
-/** Best-effort delete of a folder created during the test. */
-export async function deleteFolderViaUI(page: Page, folderName: string): Promise<void> {
-  try {
-    const btn = page.locator(".folder-list-btn", { hasText: folderName });
-    if (!(await btn.isVisible({ timeout: 3000 }).catch(() => false))) return;
-    await btn.click();
-    page.once("dialog", (d) => d.accept());
-    await page.getByTestId("delete-folder").click();
-    await expect(page.locator('[data-testid="folder-item"]', { hasText: folderName })).not.toBeVisible({
-      timeout: 30_000,
-    });
-  } catch {
-    // best-effort cleanup
-  }
+/** Best-effort cleanup — vault delete UI is not exposed in the toolbar. */
+export async function deleteFolderViaUI(_page: Page, _folderName: string): Promise<void> {
+  // Vault deletion is not available from the browse toolbar; leave test folders for manual cleanup.
 }
