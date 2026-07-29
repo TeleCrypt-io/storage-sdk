@@ -31,8 +31,8 @@ async function registerOidcTestUser(prefix: string): Promise<{ localpart: string
 }
 
 /**
- * Runs the full device-code grant end to end against the local MAS
- * (throwaway_synapse/up.sh, docs/DECISIONS.md D6): discovery, dynamic client
+ * Runs the full device-code grant end to end against the local MAS:
+ * discovery, dynamic client
  * registration, start device authorization, approve it exactly as a human
  * would (login + enter code + consent — driven headlessly over HTTP by
  * `approveDeviceCodeViaHttp`, since this test controls the dev MAS and the

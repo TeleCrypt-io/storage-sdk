@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "BUSL-1.1",
   "type": "module",
   "main": "dist/index.js",
@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
     }
   },
   "bin": {
@@ -28,28 +32,25 @@
     "lint": "eslint src test --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:prod": "vitest run --config vitest.prod.config.ts",
-    "test:prod:smoke": "playwright test --config playwright.prod.config.ts",
-    "test:prod:ui": "playwright test --config playwright.prod.functional.config.ts",
     "synapse:up": "./throwaway_synapse/up.sh",
     "synapse:fresh": "./throwaway_synapse/up.sh --fresh",
     "synapse:down": "./throwaway_synapse/down.sh"
   },
   "dependencies": {
-    "commander": "^15.0.0",
-    "fake-indexeddb": "^6.2.5",
+    "commander": "15.0.0",
+    "fake-indexeddb": "6.2.5",
     "matrix-encrypt-attachment": "1.0.3",
     "matrix-js-sdk": "41.9.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
-    "@types/node": "^22.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
-    "eslint": "^9.0.0",
-    "tsx": "^4.23.1",
-    "typescript": "^5.6.0",
-    "vitest": "^2.0.0"
+    "@playwright/test": "1.61.1",
+    "@types/node": "22.20.1",
+    "@typescript-eslint/eslint-plugin": "8.64.0",
+    "@typescript-eslint/parser": "8.64.0",
+    "eslint": "9.39.5",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "vitest": "2.1.9"
   },
   "repository": {
     "type": "git",

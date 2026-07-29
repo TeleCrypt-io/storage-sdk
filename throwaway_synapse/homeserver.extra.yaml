@@ -2,8 +2,7 @@
 # THROWAWAY TEST CONFIG ONLY — never use these settings on a real server.
 #
 # Purpose: effectively disable every rate limiter, so a functional test suite
-# can create users and hammer the server without hitting M_LIMIT_EXCEEDED (see
-# TRAP 2 in IMPLEMENTATION_PLAN.md).
+# can create users and exercise it without hitting M_LIMIT_EXCEEDED.
 #
 # NOTE: enable_registration/enable_registration_without_verification are
 # deliberately NOT set here — Synapse refuses to start with

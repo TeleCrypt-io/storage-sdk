@@ -4,7 +4,7 @@
 # MSC3861, compatibility mode so m.login.password still works) + a Caddy
 # front door on :8008 (MAS's docs require the three compat auth endpoints —
 # login/logout/refresh — to be proxied to MAS directly; Synapse no longer
-# serves them once delegated). See docs/OAUTH_SPEC.md and docs/DECISIONS.md D6.
+# serves them once delegated).
 #
 # Idempotent: safe to run repeatedly. Generates config on first run, reuses it
 # after. New accounts are provisioned via `mas-cli manage register-user`

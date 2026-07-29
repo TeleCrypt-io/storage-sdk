@@ -3,11 +3,8 @@
  * human would in a browser (login form -> device-link form -> consent form)
  * but driven headlessly over plain HTTP with a hand-rolled cookie jar — MAS's
  * pages are plain server-rendered forms with CSRF tokens, no JS challenge,
- * so this needs no browser. Verified against throwaway_synapse's MAS during
- * development (see docs/DECISIONS.md D6) before writing test/functional/oidc.test.ts
- * against it. Test-only: the test acts as "the approving party" because it
- * controls the dev MAS and the test user's real password — see
- * docs/OAUTH_SPEC.md's testing note on this.
+ * so this needs no browser. Test-only: the test acts as "the approving party"
+ * because it controls the dev MAS and the test user's password.
  */
 const MAS_BASE = "http://localhost:8082";
 

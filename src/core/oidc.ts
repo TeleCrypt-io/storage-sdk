@@ -7,8 +7,6 @@
  * under Node is safe (nothing here touches `window` at import time), calling
  * the PKCE-only functions from Node is not (by design: the CLI never calls
  * them, only the device-code functions, which are plain `fetch` calls).
- *
- * See docs/OAUTH_SPEC.md Part B and docs/DECISIONS.md D6.
  */
 import { createClient } from "matrix-js-sdk";
 import {
@@ -84,7 +82,7 @@ export async function discoverOidcIssuer(homeserverBaseUrl: string): Promise<Oid
 /**
  * Dynamic client registration (DCR). `clientUri`/`redirectUris` must share a
  * host unless the issuer's policy allows a mismatch (our local dev/test MAS
- * does; production MAS may not — see docs/DECISIONS.md D6).
+ * does; a production issuer may not).
  */
 export async function registerClient(
   authMetadata: OidcClientConfig,
@@ -213,8 +211,7 @@ export async function whoAmI(
  * internal `OidcClient` requiring `window.sessionStorage`/`window.
  * localStorage` even though a plain refresh never actually reads or writes
  * them (confirmed by direct testing: `ReferenceError: window is not
- * defined` under plain Node — see docs/DECISIONS.md D6 and
- * test/functional/oidc.test.ts O.2). A public client (`token_endpoint_auth_method:
+ * defined` under plain Node; see test/functional/oidc.test.ts O.2). A public client (`token_endpoint_auth_method:
  * "none"`, what `registerClient` above registers) authenticates a refresh
  * with just `client_id` in the body, no secret — this is the whole request.
  * Works identically in Node and the browser (plain `fetch`), so both

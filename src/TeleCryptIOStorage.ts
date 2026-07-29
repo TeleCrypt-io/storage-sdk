@@ -486,8 +486,7 @@ export class TeleCryptIOStorage {
    * Deliberately reads directly from the server's authoritative REST state
    * endpoints (`GET .../members`, `GET .../state/m.room.power_levels/`)
    * rather than from the client's locally synced `tree.room`/`currentState`.
-   * On a freshly-started client (as every CLI command is — see
-   * docs/CLI_SPEC.md and src/cli/cryptoSnapshot.ts), room membership and
+   * On a freshly-started client (as every CLI command is), room membership and
    * power-level state can take several more `/sync` round trips to fully
    * converge locally after a change, even though the room itself is already
    * visible — reading the same data straight from the server sidesteps that

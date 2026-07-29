@@ -74,9 +74,8 @@ npm run synapse:down
 
 Tests run against a real local Synapse in podman, never against a production server.
 
-See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the phased build plan,
-[RELEASING.md](./RELEASING.md) for how releases publish, and [docs/DECISIONS.md](./docs/DECISIONS.md)
-for the key design decisions.
+See [CLI.md](./CLI.md) for command reference and [RELEASING.md](./RELEASING.md) for release
+instructions.
 
 ## Licence
 

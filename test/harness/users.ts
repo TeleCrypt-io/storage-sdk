@@ -16,7 +16,7 @@ function randomSuffix(): string {
 
 /**
  * The throwaway stack's Synapse delegates auth to a local MAS (MSC3861,
- * compatibility mode — see throwaway_synapse/up.sh and docs/DECISIONS.md D6).
+ * compatibility mode).
  * Under delegation Synapse refuses plain `POST /_matrix/client/v3/register`
  * (confirmed: 403 "Registration has been disabled") — MAS owns account
  * creation now. `mas-cli manage register-user` is the scriptable way to

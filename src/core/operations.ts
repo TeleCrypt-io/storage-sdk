@@ -73,6 +73,14 @@ export async function listFolders(storage: TeleCryptIOStorage): Promise<FolderIn
   return trees.filter((t) => t.isTopLevel).map((t) => ({ id: t.id, name: t.room.name }));
 }
 
+/** Current account's effective role for a folder, or null while it is unavailable. */
+export function getMyFolderRole(storage: TeleCryptIOStorage, folderId: string): string | null {
+  const userId = storage.getClient().getUserId();
+  const tree = storage.getTree(folderId);
+  if (!userId || !tree) return null;
+  return tree.getPermissions(userId);
+}
+
 export async function joinFolder(storage: TeleCryptIOStorage, folderId: string): Promise<JoinResult> {
   try {
     await storage.getClient().joinRoom(folderId);

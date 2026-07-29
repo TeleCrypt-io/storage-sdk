@@ -19,8 +19,8 @@ All commands use the format `telecrypt-io --json storage <command>`. The `--json
 ### Session management
 
 **`login`** — Log in and persist the session to the local profile
-- `telecrypt-io --json storage login --homeserver https://telecrypt.io --user alice --password secret` (password login)
-- `telecrypt-io --json storage login --homeserver https://telecrypt.io --oidc` (OIDC/MAS device-code grant; opens browser for approval)
+- `telecrypt-io --json storage login --homeserver https://backend.telecrypt.io --user alice --password secret` (password login)
+- `telecrypt-io --json storage login --homeserver https://backend.telecrypt.io --oidc` (OIDC/MAS device-code grant; opens browser for approval)
 
 **`register`** — Create a new account and log in (**dev/test only**; will not work against the public telecrypt.io server)
 - `telecrypt-io --json storage register --homeserver http://localhost:8008 --user bob --password secret`
@@ -78,7 +78,7 @@ All commands use the format `telecrypt-io --json storage <command>`. The `--json
 All commands with `--json` return structured JSON on success:
 
 ```json
-{"userId": "@alice:telecrypt.io", "deviceId": "ABCD1234", "homeserver": "https://telecrypt.io"}
+{"userId": "@alice:telecrypt.io", "deviceId": "ABCD1234", "homeserver": "https://backend.telecrypt.io"}
 ```
 
 On error (command exits with code 1):
@@ -99,4 +99,4 @@ Agents should check exit code (0 = success, 1 = failure) and parse stderr for er
 
 4. **Session/profile is local.** The session and crypto store live in `~/.config/telecrypt-io/` (Linux/macOS) or `%APPDATA%\TeleCrypt.io` (Windows). Logging out deletes the local profile. A new device means a new profile and the need to restore keys via `recovery restore`.
 
-5. **Homeserver is required for login.** Always specify `--homeserver` with the full URL (e.g., `https://telecrypt.io`). The CLI does not default to any public server; you must pass it explicitly.
+5. **Homeserver is required for login.** Always specify `--homeserver` with the full URL (e.g., `https://backend.telecrypt.io`). The CLI does not default to any public server; you must pass it explicitly.
