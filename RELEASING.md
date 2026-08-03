@@ -17,7 +17,7 @@ Before the first automated publish can succeed, someone with publish rights on t
    publish` from a machine logged in as an org member with an authenticator — after which
    Trusted Publishing can be configured for all subsequent releases).
 3. Add a **GitHub Actions** trusted publisher pointing at:
-   - **Repository:** `TeleCrypt-io/secure-storage`
+   - **Repository:** `TeleCrypt-io/telecrypt-io-storage-lib`
    - **Workflow filename:** `publish.yml`
    - **Environment:** none required unless you choose to gate the job behind a GitHub
      Environment (not currently configured in the workflow)
@@ -47,6 +47,18 @@ Nothing else is required from a human for a routine release — steps 1–3 abov
 | First publish of the package, if `@telecrypt-io/storage` doesn't exist on npm yet | **Human — manual `npm publish`** |
 | Every release after that: build + publish on tag push | Automated (`.github/workflows/publish.yml`) |
 | Version bump + creating/pushing the git tag | **Human** (or a future release-automation step — not built yet) |
+
+## Repository-split migration guard
+
+`@telecrypt-io/storage@0.1.3` was published from the former combined repository and includes the
+legacy `telecrypt-io` executable. It remains available and must not be replaced or republished by
+this repository. The first library-only release from this repository is a breaking package change
+and must wait until the independent `@telecrypt-io/storage-cli` package has completed its own
+release and migration review.
+
+Before any tag is created here, update npm's Trusted Publisher from the former repository to
+`TeleCrypt-io/telecrypt-io-storage-lib` and confirm that the exact `publish.yml` filename is
+trusted. This npm configuration change is intentionally owner-operated.
 
 ## Status of this workflow
 

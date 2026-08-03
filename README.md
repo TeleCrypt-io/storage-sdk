@@ -8,7 +8,9 @@ Files are encrypted on the client before upload. The server stores only opaque c
 never holds the decryption keys. Shared folders let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
-**Status:** published and usable — library, CLI, and a React web UI.
+**Status:** library source only. The current public npm release is
+`@telecrypt-io/storage@0.1.3`; no version has been released from this
+repository yet.
 
 ## Install
 
@@ -16,7 +18,7 @@ Recovery Key restores your files on a new device — even if you lose the origin
 npm install @telecrypt-io/storage
 ```
 
-This gives you both the `TeleCryptIOStorage` library and the `telecrypt-io` CLI.
+This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
 
 ## Quick start
 
@@ -33,17 +35,10 @@ const folder = await core.createFolder(storage, "Photos");
 await core.uploadFile(storage, folder.id, "cat.jpg", bytes, "image/jpeg");
 ```
 
-**CLI:**
-
-```bash
-telecrypt-io storage login --homeserver https://your.server --user alice --password ...
-telecrypt-io storage folder create Photos
-telecrypt-io storage file upload <folderId> ./cat.jpg
-telecrypt-io storage folder share <folderId> @bob:your.server --role editor
-telecrypt-io storage recovery setup     # prints your Recovery Key — save it
-```
-
-**Web UI:** a React app lives in [`ui/`](./ui) (`cd ui && npm install && npm run dev`).
+The command-line client is sourced by
+[`TeleCrypt-io/storage-cli`](https://github.com/TeleCrypt-io/storage-cli). The static web
+application is sourced by
+[`TeleCrypt-io/storage.telecrypt.io`](https://github.com/TeleCrypt-io/storage.telecrypt.io).
 
 ## How it works
 
@@ -74,8 +69,7 @@ npm run synapse:down
 
 Tests run against a real local Synapse in podman, never against a production server.
 
-See [CLI.md](./CLI.md) for command reference and [RELEASING.md](./RELEASING.md) for release
-instructions.
+See [RELEASING.md](./RELEASING.md) for the guarded npm release procedure.
 
 ## Licence
 
