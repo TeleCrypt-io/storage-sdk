@@ -12,7 +12,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -33,6 +32,12 @@ jobs:
           node-version: "22.14.0"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Require a tag matching the package version
+        run: |
+          expected_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -e 'console.log(require("./package.json").version)')"
+          test "$expected_version" = "$package_version"
+
       # Trusted Publishing support landed in npm CLI 11.5.1; pin to a recent
       # npm explicitly rather than relying on whatever ships with the Node
       # version above.
@@ -42,8 +47,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Verify and build
+        run: |
+          npm run lint
+          npm run build
 
       - name: Publish (OIDC trusted publishing + provenance)
         run: npm publish --access public --provenance

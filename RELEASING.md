@@ -52,9 +52,10 @@ Nothing else is required from a human for a routine release — steps 1–3 abov
 
 `@telecrypt-io/storage@0.1.3` was published from the former combined repository and includes the
 legacy `telecrypt-io` executable. It remains available and must not be replaced or republished by
-this repository. The first library-only release from this repository is a breaking package change
-and must wait until the independent `@telecrypt-io/storage-cli` package has completed its own
-release and migration review.
+this repository. The first library-only release from this repository is a breaking package change.
+Its independent CLI replacement is now available as the GitHub-only
+[`storage-cli-v0.1.1`](https://github.com/TeleCrypt-io/storage-cli/releases/tag/storage-cli-v0.1.1)
+release, so that migration prerequisite is satisfied.
 
 Before any tag is created here, update npm's Trusted Publisher from the former repository to
 `TeleCrypt-io/storage-sdk` and confirm that the exact `publish.yml` filename is
