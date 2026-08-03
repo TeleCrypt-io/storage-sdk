@@ -6,16 +6,17 @@ rotate. The workflow (`.github/workflows/publish.yml`) authenticates to npm by p
 specific GitHub Actions run's OIDC identity, and npm only accepts that identity because a human
 has explicitly told npmjs.com to trust it (the one-time setup below).
 
-## One-time human setup (cannot be done from CI)
+## One-time Trusted Publisher setup (completed)
 
-Before the first automated publish can succeed, someone with publish rights on the
-`@telecrypt-io` npm org must configure this package as npm expects for Trusted Publishing:
+The owner configured NPM Trusted Publishing for `TeleCrypt-io/storage-sdk` and `publish.yml`.
+The first library-only release, `v0.2.0`, published successfully with provenance in GitHub Actions
+run [30852528505](https://github.com/TeleCrypt-io/storage-sdk/actions/runs/30852528505).
+
+For a future package/repository migration, someone with publish rights on the `@telecrypt-io` npm
+org must configure the replacement package as npm expects for Trusted Publishing:
 
 1. The `telecrypt-io` npm org already exists.
-2. On npmjs.com, go to the `@telecrypt-io/storage` package's **Settings → Trusted Publisher**
-   (if the package doesn't exist on npm yet, the first publish must be done manually — `npm
-   publish` from a machine logged in as an org member with an authenticator — after which
-   Trusted Publishing can be configured for all subsequent releases).
+2. On npmjs.com, go to the replacement package's **Settings → Trusted Publisher**.
 3. Add a **GitHub Actions** trusted publisher pointing at:
 - **Repository:** `TeleCrypt-io/storage-sdk`
    - **Workflow filename:** `publish.yml`
@@ -44,7 +45,7 @@ Nothing else is required from a human for a routine release — steps 1–3 abov
 | Step | Automated? |
 |---|---|
 | Configuring npm to trust this repo's `publish.yml` (one-time) | **Human — npmjs.com UI** |
-| First publish of the package, if `@telecrypt-io/storage` doesn't exist on npm yet | **Human — manual `npm publish`** |
+| First library-only `@telecrypt-io/storage` release | Automated — `v0.2.0` succeeded via OIDC |
 | Every release after that: build + publish on tag push | Automated (`.github/workflows/publish.yml`) |
 | Version bump + creating/pushing the git tag | **Human** (or a future release-automation step — not built yet) |
 
@@ -52,23 +53,19 @@ Nothing else is required from a human for a routine release — steps 1–3 abov
 
 `@telecrypt-io/storage@0.1.3` was published from the former combined repository and includes the
 legacy `telecrypt-io` executable. It remains available and must not be replaced or republished by
-this repository. The first library-only release from this repository is a breaking package change.
+this repository. The first library-only release from this repository was a breaking package change.
 Its independent CLI replacement is now available as the GitHub-only
-[`storage-cli-v0.1.1`](https://github.com/TeleCrypt-io/storage-cli/releases/tag/storage-cli-v0.1.1)
+[`storage-cli-v0.1.2`](https://github.com/TeleCrypt-io/storage-cli/releases/tag/storage-cli-v0.1.2)
 release, so that migration prerequisite is satisfied.
 
-Before any tag is created here, update npm's Trusted Publisher from the former repository to
-`TeleCrypt-io/storage-sdk` and confirm that the exact `publish.yml` filename is
-trusted. This npm configuration change is intentionally owner-operated.
+This migration was completed before `v0.2.0`: NPM now trusts `TeleCrypt-io/storage-sdk` and the
+exact `publish.yml` workflow. Keep that binding tag-only; do not add a token, branch publication,
+or manual publish path.
 
 ## Status of this workflow
 
-`.github/workflows/publish.yml` is written to match npm's current Trusted Publishing / OIDC
-documentation (`permissions: id-token: write`, `registry-url` set via `actions/setup-node`, `npm
-publish --provenance`, no token secret). It has **not** been exercised end-to-end — that requires
-the human npmjs.com Trusted Publisher configuration above plus a real `vX.Y.Z` tag push, neither
-of which this session could do. The first real release is what validates it; if it fails, the
-likely culprits are (a) the Trusted Publisher config on npmjs.com not matching the repo/workflow
-filename exactly, or (b) the npm CLI version in the runner being older than the 11.5.1 minimum
-Trusted Publishing requires (the workflow pins `npm install -g npm@latest` specifically to avoid
-this).
+`.github/workflows/publish.yml` matches NPM Trusted Publishing/OIDC requirements
+(`permissions: id-token: write`, `registry-url` set via `actions/setup-node`, `npm publish
+--provenance`, and no token secret). It was exercised end-to-end by `v0.2.0`: tag/version guard,
+`npm ci`, lint, build, and provenance publication all succeeded. The workflow pins npm 11.5.1,
+the minimum version supporting Trusted Publishing.
