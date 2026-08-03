@@ -17,7 +17,7 @@ Before the first automated publish can succeed, someone with publish rights on t
    publish` from a machine logged in as an org member with an authenticator — after which
    Trusted Publishing can be configured for all subsequent releases).
 3. Add a **GitHub Actions** trusted publisher pointing at:
-   - **Repository:** `TeleCrypt-io/telecrypt-io-storage-lib`
+- **Repository:** `TeleCrypt-io/storage-sdk`
    - **Workflow filename:** `publish.yml`
    - **Environment:** none required unless you choose to gate the job behind a GitHub
      Environment (not currently configured in the workflow)
@@ -57,7 +57,7 @@ and must wait until the independent `@telecrypt-io/storage-cli` package has comp
 release and migration review.
 
 Before any tag is created here, update npm's Trusted Publisher from the former repository to
-`TeleCrypt-io/telecrypt-io-storage-lib` and confirm that the exact `publish.yml` filename is
+`TeleCrypt-io/storage-sdk` and confirm that the exact `publish.yml` filename is
 trusted. This npm configuration change is intentionally owner-operated.
 
 ## Status of this workflow
