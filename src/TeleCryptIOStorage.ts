@@ -95,8 +95,9 @@ export interface CreateTeleCryptIOStorageOptions {
 /**
  * Options for `TeleCryptIOStorage.createFromOidc` — mirrors
  * `CreateTeleCryptIOStorageOptions` but sourced from an OIDC/MAS login
- * (device-code or authorization-code+PKCE, see `src/core/oidc.ts`) instead
- * of a password login. Same resulting shape either way: a ready
+ * (device-code or authorization-code+PKCE, see `src/core/oidc.ts`). The SDK
+ * accepts OAuth/OIDC tokens; it neither implements nor invokes password
+ * authentication. Same resulting shape either way: a ready
  * `TeleCryptIOStorage` with a persistent crypto store.
  */
 export interface CreateFromOidcOptions {
@@ -158,7 +159,7 @@ export class TeleCryptIOStorage {
   /**
    * As `create()`, but the resulting `MatrixClient` was authenticated via
    * OIDC/MAS (device-code or authorization-code+PKCE — see
-   * `src/core/oidc.ts`) rather than `m.login.password`. If `refreshToken` +
+   * `src/core/oidc.ts`). The SDK does not perform `m.login.password`. If `refreshToken` +
    * `tokenRefresher` are both given, the client's `tokenRefreshFunction` is
    * wired so an expired access token is transparently refreshed mid-request
    * — same mechanism matrix-js-sdk uses for any refresh-token-capable login.
