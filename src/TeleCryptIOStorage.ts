@@ -1,4 +1,4 @@
-import { ClientEvent, createClient, MatrixClient, SyncState } from "matrix-js-sdk";
+import { ClientEvent, createClient, MatrixClient, MatrixEvent, SyncState } from "matrix-js-sdk";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
@@ -129,6 +129,19 @@ export class TeleCryptIOStorage {
   /** The underlying matrix-js-sdk client (e.g. to stop it, or for advanced/interop use). */
   getClient(): MatrixClient {
     return this.client;
+  }
+
+  /**
+   * Refreshes a room's current state from the homeserver. The background sync
+   * loop is intentionally asynchronous, so a short-lived CLI process can
+   * otherwise list a stale state snapshot immediately after another process
+   * changed a file name or branch.
+   */
+  async refreshRoomState(roomId: string): Promise<void> {
+    const room = this.client.getRoom(roomId);
+    if (!room) throw new Error(`Unknown room: ${roomId}`);
+    const stateEvents = await this.client.roomState(roomId);
+    room.currentState.setStateEvents(stateEvents.map((event) => new MatrixEvent(event)));
   }
 
   /**

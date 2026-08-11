@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "BUSL-1.1",
   "type": "module",
   "main": "dist/index.js",
@@ -44,6 +44,7 @@
     "@typescript-eslint/eslint-plugin": "8.64.0",
     "@typescript-eslint/parser": "8.64.0",
     "eslint": "10.8.0",
+    "fake-indexeddb": "6.2.5",
     "tsx": "4.23.1",
     "typescript": "5.9.3",
     "vitest": "4.1.10"

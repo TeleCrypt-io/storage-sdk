@@ -20,10 +20,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-SYN_IMG="ghcr.io/element-hq/synapse:latest"
-MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:latest"
-PROXY_IMG="docker.io/library/caddy:latest"
-PG_IMG="docker.io/library/postgres:16-alpine"
+SYN_IMG="ghcr.io/element-hq/synapse:v1.155.0"
+MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.16.0"
+PROXY_IMG="docker.io/library/caddy:2.11.4-alpine"
+PG_IMG="docker.io/library/postgres:16.4-alpine"
 
 NET="throwaway-net"
 DB="throwaway-mas-db"

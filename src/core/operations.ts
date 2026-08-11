@@ -200,6 +200,7 @@ export async function listMembers(storage: TeleCryptIOStorage, folderId: string)
 
 export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
   const tree = await resolveTree(storage, folderId);
+  await storage.refreshRoomState(folderId);
   return tree.listFiles().map((f) => ({ id: f.id, name: f.getName() }));
 }
 
@@ -249,6 +250,17 @@ export async function renameFile(
   const tree = await resolveTree(storage, folderId);
   const branch = await resolveFile(tree, fileId);
   await branch.setName(name);
+  // `setName` resolves when the homeserver accepts the state event, but a
+  // fresh CLI/UI process can still read the previous local room state for a
+  // short time. Do not report success until this client has observed the new
+  // name through its normal sync loop.
+  await waitForCondition(
+    () => {
+      const current = tree.getFile(fileId);
+      return current?.getName() === name ? current : null;
+    },
+    { timeoutMs: 15000 },
+  );
   return { id: fileId, name };
 }
 

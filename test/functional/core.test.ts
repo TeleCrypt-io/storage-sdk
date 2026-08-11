@@ -138,7 +138,46 @@ describe("core operations", () => {
     }
   });
 
-  it("C.4 setupRecovery + restoreRecovery on a fresh device", async () => {
+  it("C.4 renameFile waits until the new name is visible locally", async () => {
+    const user = await registerTestUser("core_rename");
+    const storage = await createStorage(user);
+    try {
+      const folder = await core.createFolder(storage, "RenameTest");
+      const uploaded = await core.uploadFile(
+        storage,
+        folder.id,
+        "before.txt",
+        new TextEncoder().encode("rename me"),
+        "text/plain",
+      );
+
+      await waitFor(
+        async () => {
+          const listed = await core.listFiles(storage, folder.id);
+          return listed.some((file) => file.id === uploaded.id) ? listed : null;
+        },
+        { label: "file visible before rename" },
+      );
+
+      const renamed = await core.renameFile(storage, folder.id, uploaded.id, "after.txt");
+      expect(renamed).toEqual({ id: uploaded.id, name: "after.txt" });
+
+      const filesAfter = await waitFor(
+        async () => {
+          const listed = await core.listFiles(storage, folder.id);
+          return listed.some((file) => file.id === uploaded.id && file.name === "after.txt")
+            ? listed
+            : null;
+        },
+        { label: "renamed file visible locally" },
+      );
+      expect(filesAfter).toContainEqual({ id: uploaded.id, name: "after.txt" });
+    } finally {
+      stopTestClient(storage.getClient());
+    }
+  });
+
+  it("C.5 setupRecovery + restoreRecovery on a fresh device", async () => {
     const userA = await registerTestUser("core_recover");
     const storageA = await createStorage(userA);
     try {
