@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { registerAndWaitForMasProvisioning } from "../harness/users";
 import { approveDeviceCodeViaHttp } from "../harness/oidcApproval";
 import { waitFor } from "../harness/waitFor";
-import { withOidcWindowShim } from "../../src/cli/oidcWindowPolyfill.js";
+import { withOidcWindowShim } from "../harness/oidcWindowShim.js";
 import * as oidc from "../../src/core/oidc.js";
 import * as core from "../../src/core/operations.js";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
