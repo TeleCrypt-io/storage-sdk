@@ -50,6 +50,7 @@ jobs:
       - name: Verify and build
         run: |
           npm run lint
+          npm run test:unit
           npm run build
 
       - name: Publish (OIDC trusted publishing + provenance)
