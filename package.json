@@ -28,6 +28,7 @@
     "build": "tsc",
     "lint": "eslint src test --ext .ts",
     "test": "vitest run",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:watch": "vitest",
     "synapse:up": "./throwaway_synapse/up.sh",
     "synapse:fresh": "./throwaway_synapse/up.sh --fresh",
