@@ -21,10 +21,12 @@ function randomSuffix(): string {
  * (confirmed: 403 "Registration has been disabled") — MAS owns account
  * creation now. `mas-cli manage register-user` is the scriptable way to
  * create one non-interactively; it runs inside the MAS container, so this
- * shells out via `podman exec`. This is the ONE change from the pre-MAS
- * harness: password login (below) is completely unchanged, still a plain
- * `POST /_matrix/client/v3/login`, now transparently proxied by the
- * throwaway front door (Caddy, :8008) to MAS's compat endpoint.
+ * shells out via `podman exec`. Username/password use in this file is
+ * strictly for local disposable-fixture setup (including obtaining test
+ * sessions) and OIDC approval; it is not SDK authentication. The production
+ * SDK is OAuth/OIDC-token-only. The fixture's password login remains a plain
+ * `POST /_matrix/client/v3/login`, proxied by the throwaway front door
+ * (Caddy, :8008) to MAS's compatibility endpoint.
  */
 export async function registerUserInMas(username: string, password: string): Promise<void> {
   const args = [

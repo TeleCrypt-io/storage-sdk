@@ -64,11 +64,10 @@ export interface OidcTokenSet {
  *
  * NODE CALLERS: this internally constructs oidc-client-ts state that
  * requires `window.sessionStorage`/`window.localStorage` to exist (a real
- * browser has both natively). Under plain Node, wrap this ONE call in
- * `src/cli/oidcWindowPolyfill.ts`'s `withOidcWindowShim()` — see that file's
- * doc comment for why it must be scoped narrowly (a permanent global
- * `window` breaks the rust-crypto WASM's own environment detection) and why
- * it's safe here specifically (called once, before any crypto/WASM exists).
+ * browser has both natively). A Node adapter may install those only around
+ * this call: a permanent global `window` breaks rust-crypto WASM's own
+ * environment detection. The functional-test-only adapter is kept in
+ * `test/harness/oidcWindowShim.ts`, rather than in the production SDK.
  */
 export async function discoverOidcIssuer(homeserverBaseUrl: string): Promise<OidcClientConfig> {
   const client = createClient({ baseUrl: homeserverBaseUrl });

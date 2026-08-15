@@ -4,7 +4,8 @@
  * but driven headlessly over plain HTTP with a hand-rolled cookie jar — MAS's
  * pages are plain server-rendered forms with CSRF tokens, no JS challenge,
  * so this needs no browser. Test-only: the test acts as "the approving party"
- * because it controls the dev MAS and the test user's password.
+ * because it controls the disposable MAS fixture and its test user's password.
+ * This is setup/OAuth approval only; the production SDK is OAuth/OIDC-token-only.
  */
 const MAS_BASE = "http://localhost:8082";
 
@@ -67,7 +68,8 @@ class CookieJar {
  * Logs in as `username`/`password` on MAS's real login page, enters
  * `userCode` on the device-link page, and approves the consent screen.
  * Throws if any step doesn't produce the expected redirect (a login/consent
- * failure surfaces as a test failure, not a silent no-op).
+ * failure surfaces as a test failure, not a silent no-op). This fixture-only
+ * password is never passed to or handled by the production SDK.
  */
 export async function approveDeviceCodeViaHttp(
   username: string,

@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { registerAndWaitForMasProvisioning } from "../harness/users";
 import { approveDeviceCodeViaHttp } from "../harness/oidcApproval";
 import { waitFor } from "../harness/waitFor";
-import { withOidcWindowShim } from "../../src/cli/oidcWindowPolyfill.js";
+import { withOidcWindowShim } from "../harness/oidcWindowShim.js";
 import * as oidc from "../../src/core/oidc.js";
 import * as core from "../../src/core/operations.js";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
@@ -36,14 +36,16 @@ async function registerOidcTestUser(prefix: string): Promise<{ localpart: string
  * registration, start device authorization, approve it exactly as a human
  * would (login + enter code + consent — driven headlessly over HTTP by
  * `approveDeviceCodeViaHttp`, since this test controls the dev MAS and the
- * test account's real password), then poll for the resulting token set.
+ * disposable fixture account's real password), then poll for the resulting
+ * token set. That password is only used to set up and approve this local MAS
+ * flow; production SDK authentication is OAuth/OIDC token-only.
  */
 async function runDeviceCodeLogin(
   deviceId: string,
   user: { localpart: string; password: string },
 ): Promise<{ authMetadata: oidc.OidcClientConfig; clientId: string; result: oidc.DeviceAccessTokenResponse }> {
-  // Discovery is the one OIDC call that needs a `window` shim under Node —
-  // see src/cli/oidcWindowPolyfill.ts. Scoped narrowly, same as the CLI.
+  // Discovery is the one OIDC call that needs a `window` shim under Node.
+  // The test-harness shim is scoped narrowly so it cannot affect crypto.
   const authMetadata = await withOidcWindowShim(() => oidc.discoverOidcIssuer(HOMESERVER));
   expect(authMetadata.device_authorization_endpoint).toBeTruthy();
 
@@ -96,7 +98,7 @@ describe("OIDC/MAS login", () => {
       try {
         // The mandatory proof this is a genuinely usable storage instance,
         // not just "a token that whoami accepts" — mirrors what the
-        // password-login smoke test proves for m.login.password. A newly
+        // other token-authenticated functional smoke tests prove. A newly
         // created room can take a beat to settle as "top-level" in this
         // same client's own sync state — same real async-settling window
         // core.test.ts's C.1 already polls for, not a fixed sleep.
@@ -125,10 +127,9 @@ describe("OIDC/MAS login", () => {
       const { authMetadata, clientId, result } = await runDeviceCodeLogin(deviceId, user);
       expect(result.refresh_token).toBeTruthy();
 
-      // Deliberately NOT matrix-js-sdk's OidcTokenRefresher — see
-      // src/cli/oidcWindowPolyfill.ts's doc comment for why
-      // `refreshOidcToken` (plain fetch, no `window` dependency at all) is
-      // used instead. Assert directly on the raw refresh, then again via
+      // Deliberately NOT matrix-js-sdk's OidcTokenRefresher:
+      // `refreshOidcToken` is plain fetch with no `window` dependency. Assert
+      // directly on the raw refresh, then again via
       // `buildTokenRefreshFunction`'s wiring (persistence hook) below.
       const refreshed = await oidc.refreshOidcToken(authMetadata.token_endpoint, clientId, result.refresh_token!);
       expect(refreshed.accessToken).toBeTruthy();
