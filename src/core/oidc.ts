@@ -23,6 +23,7 @@ import {
   type DeviceAccessTokenError,
   type BearerTokenResponse,
 } from "matrix-js-sdk/lib/oidc/index.js";
+import { OidcClient, WebStorageStateStore, type SigninRequestCreateArgs } from "oidc-client-ts";
 import type { AccessTokens, TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
 import type { IdTokenClaims } from "oidc-client-ts";
 import { CliError } from "./errors.js";
@@ -147,14 +148,47 @@ export function isDeviceAccessTokenError(
  * internally by matrix-js-sdk/oidc-client-ts (`mx_oidc_`-prefixed keys) — the
  * caller does not need to manage them; `completeAuthorizationCodeFlow` reads
  * them back after the redirect.
+ *
+ * `deviceId` is optional: when supplied, it is embedded in the requested
+ * scope (MSC2967) so MAS grants THAT device instead of minting a fresh one —
+ * the web UI passes a stable per-browser device id so repeated logins reuse
+ * the same Matrix device instead of accumulating one device per login.
  */
 export async function beginAuthorizationCodeFlow(opts: {
   authMetadata: OidcClientConfig;
   clientId: string;
   homeserverUrl: string;
   redirectUri: string;
+  deviceId?: string;
 }): Promise<string> {
   const nonce = crypto.randomUUID();
+  if (opts.deviceId) {
+    // matrix-js-sdk's generateOidcAuthorizationUrl hardcodes
+    // generateScope() with no device id, so every login would mint a fresh
+    // Matrix device. Build the URL ourselves with the stable device id in
+    // the requested scope (MSC2967) so MAS grants THAT device — mirroring
+    // matrix-js-sdk's construction exactly (same state store, same user
+    // state shape) so completeAuthorizationCodeFlow still works unchanged.
+    const scope = generateScope(opts.deviceId);
+    const oidcClient = new OidcClient({
+      ...opts.authMetadata,
+      signingKeys: opts.authMetadata.signingKeys ?? undefined,
+      metadata: opts.authMetadata,
+      client_id: opts.clientId,
+      redirect_uri: opts.redirectUri,
+      authority: opts.authMetadata.issuer,
+      response_mode: "query" as SigninRequestCreateArgs["response_mode"],
+      response_type: "code",
+      scope,
+      stateStore: new WebStorageStateStore({ prefix: "mx_oidc_", store: window.sessionStorage }),
+    });
+    const userState = { homeserverUrl: opts.homeserverUrl, nonce };
+    const request = await oidcClient.createSigninRequest({
+      state: userState,
+      nonce,
+    });
+    return request.url;
+  }
   return generateOidcAuthorizationUrl({
     metadata: opts.authMetadata,
     clientId: opts.clientId,
