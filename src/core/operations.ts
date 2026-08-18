@@ -247,7 +247,7 @@ export async function unshareFolder(
 
 export async function listMembers(storage: TeleCryptIOStorage, folderId: string): Promise<Member[]> {
   const tree = await resolveTree(storage, folderId);
-  return storage.listMembers(tree);
+  return withRateLimitRetry("listMembers", () => storage.listMembers(tree));
 }
 
 export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
