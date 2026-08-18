@@ -266,4 +266,64 @@ describe("core operations", () => {
       stopTestClient(storageA.getClient());
     }
   });
+
+  it("C.6 deleteFolder forgets the room immediately (no lingering listFolders entry)", async () => {
+    const user = await registerTestUser("core_delete");
+    const storage = await createStorage(user);
+    try {
+      const created = await core.createFolder(storage, "DeleteMe");
+      await waitFor(
+        async () => {
+          const all = await core.listFolders(storage);
+          return all.some((f) => f.id === created.id) ? all : null;
+        },
+        { label: "listFolders sees the new folder", timeoutMs: 15000 },
+      );
+
+      const deleted = await core.deleteFolder(storage, created.id);
+      expect(deleted).toEqual({ id: created.id, deleted: true });
+
+      // The room must be gone from the LOCAL store immediately after
+      // deleteFolder resolves — no waiting for the leave event to
+      // round-trip through the background sync loop. This is the contract
+      // the production browser suite depends on (deleted vaults must
+      // disappear from the UI without 30-60s of sync latency).
+      expect(storage.getClient().getRoom(created.id)).toBeNull();
+      const after = await core.listFolders(storage);
+      expect(after.some((f) => f.id === created.id)).toBe(false);
+    } finally {
+      stopTestClient(storage.getClient());
+    }
+  });
+
+  it("C.7 declineInvite forgets the room immediately (no lingering invite)", async () => {
+    const userA = await registerTestUser("core_decline_a");
+    const userB = await registerTestUser("core_decline_b");
+    const storageA = await createStorage(userA);
+    const storageB = await createStorage(userB);
+    try {
+      const folder = await core.createFolder(storageA, "DeclineMe");
+      await core.shareFolder(storageA, folder.id, userB.userId, "viewer");
+
+      // B sees the invite...
+      await waitFor(
+        async () => {
+          const invites = await core.listPendingInvites(storageB);
+          return invites.some((i) => i.id === folder.id) ? invites : null;
+        },
+        { label: "B sees the pending invite", timeoutMs: 15000 },
+      );
+
+      const declined = await core.declineInvite(storageB, folder.id);
+      expect(declined).toEqual({ folderId: folder.id, declined: true });
+
+      // ...and it must be gone from B's local store immediately.
+      expect(storageB.getClient().getRoom(folder.id)).toBeNull();
+      const invitesAfter = await core.listPendingInvites(storageB);
+      expect(invitesAfter.some((i) => i.id === folder.id)).toBe(false);
+    } finally {
+      stopTestClient(storageA.getClient());
+      stopTestClient(storageB.getClient());
+    }
+  });
 });
