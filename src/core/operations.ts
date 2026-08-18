@@ -124,7 +124,7 @@ export function getMyFolderRole(storage: TeleCryptIOStorage, folderId: string): 
 
 export async function joinFolder(storage: TeleCryptIOStorage, folderId: string): Promise<JoinResult> {
   try {
-    await storage.getClient().joinRoom(folderId);
+    await withRateLimitRetry("joinFolder", () => storage.getClient().joinRoom(folderId));
   } catch (err) {
     throw new CliError(`join failed: ${(err as Error).message}`);
   }
@@ -219,13 +219,13 @@ export async function shareFolder(
   }
   const tree = await resolveTree(storage, folderId);
   try {
-    await tree.invite(userId);
+    await withRateLimitRetry("shareFolder.invite", () => tree.invite(userId));
   } catch (err) {
     if (!/already in the room/i.test((err as Error).message)) {
       throw err;
     }
   }
-  await tree.setPermissions(userId, role);
+  await withRateLimitRetry("shareFolder.setPermissions", () => tree.setPermissions(userId, role));
   return { folderId, userId, role };
 }
 
@@ -236,7 +236,9 @@ export async function unshareFolder(
 ): Promise<UnshareResult> {
   await resolveTree(storage, folderId);
   try {
-    await storage.getClient().kick(folderId, userId, "unshared");
+    await withRateLimitRetry("unshareFolder", () =>
+      storage.getClient().kick(folderId, userId, "unshared"),
+    );
   } catch (err) {
     throw new CliError(`unshare failed: ${(err as Error).message}`);
   }
