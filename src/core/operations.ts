@@ -31,6 +31,47 @@ import type {
 } from "./types.js";
 
 /**
+ * Production Synapse enforces the built-in rc_messages budget (per-account
+ * burst 10, refill 1/5s) on every room/state mutation the tree operations
+ * issue. A delete/decline sequence (kick members + leave + forget) can
+ * exceed the burst within seconds, so each operation retries on 429 with the
+ * server-advised backoff. Mirrors the harness library suite's
+ * `withRateLimitRetry`; must not mask non-rate-limit failures.
+ */
+const RATE_LIMIT_RETRIES = 6;
+
+function isRateLimited(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (!("isRateLimitError" in error)) return false;
+  const isRateLimitError = (error as { isRateLimitError: unknown }).isRateLimitError;
+  return typeof isRateLimitError === "function" && isRateLimitError.call(error) === true;
+}
+
+async function withRateLimitRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isRateLimited(error) || attempt >= RATE_LIMIT_RETRIES) throw error;
+      // The server's retry_after_ms only covers one token; tree operations
+      // need several (kick + leave + forget). Wait at least 15s so the
+      // burst refills.
+      let retryAfter = 15_000;
+      if (error instanceof Error && "getRetryAfterMs" in error) {
+        const getRetryAfterMs = (error as { getRetryAfterMs: unknown }).getRetryAfterMs;
+        if (typeof getRetryAfterMs === "function") {
+          const advised = getRetryAfterMs.call(error);
+          if (typeof advised === "number" && Number.isFinite(advised) && advised > 0) {
+            retryAfter = Math.max(retryAfter, advised);
+          }
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryAfter));
+    }
+  }
+}
+
+/**
  * Resolves a folder by ID, polling briefly: a room this same account just
  * created (or was just invited to, by another process/session) can be
  * momentarily absent from a from-scratch `/sync` before showing up moments
@@ -144,13 +185,15 @@ export async function declineInvite(
 ): Promise<{ folderId: string; declined: boolean }> {
   const client = storage.getClient();
   try {
-    await client.leave(folderId);
-    // The server only allows forgetting a room once this account's
-    // membership is `leave`; forgetting removes the room from the local
-    // store immediately, so a declined invite stops showing up in
-    // listFolders/listPendingInvites without waiting for the leave event to
-    // round-trip through the background sync loop.
-    await client.forget(folderId);
+    await withRateLimitRetry("declineInvite", async () => {
+      await client.leave(folderId);
+      // The server only allows forgetting a room once this account's
+      // membership is `leave`; forgetting removes the room from the local
+      // store immediately, so a declined invite stops showing up in
+      // listFolders/listPendingInvites without waiting for the leave event
+      // to round-trip through the background sync loop.
+      await client.forget(folderId);
+    });
   } catch (err) {
     throw new CliError(`decline failed: ${(err as Error).message}`);
   }
@@ -252,12 +295,14 @@ export async function deleteFolder(
   // store immediately; the server only accepts a forget once membership is
   // `leave`, which `tree.delete()` has just completed for the whole tree.
   const subdirectoryIds = tree.getDirectories().map((d) => d.id);
-  await tree.delete();
   const client = storage.getClient();
-  await client.forget(folderId);
-  for (const subId of subdirectoryIds) {
-    await client.forget(subId);
-  }
+  await withRateLimitRetry("deleteFolder", async () => {
+    await tree.delete();
+    await client.forget(folderId);
+    for (const subId of subdirectoryIds) {
+      await client.forget(subId);
+    }
+  });
   return { id: folderId, deleted: true };
 }
 

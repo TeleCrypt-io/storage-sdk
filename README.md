@@ -8,14 +8,14 @@ Files are encrypted on the client before upload. The server stores only opaque c
 never holds the decryption keys. Shared folders let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
-**Status:** library source only. `@telecrypt-io/storage@0.2.3` is the current public release,
-published from this repository's protected `v0.2.3` tag with NPM Trusted Publishing/OIDC
+**Status:** library source only. `@telecrypt-io/storage@0.2.4` is the current public release,
+published from this repository's protected `v0.2.4` tag with NPM Trusted Publishing/OIDC
 provenance. The older `0.1.3` release is the immutable legacy combined library-and-CLI package.
 
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.2.3
+npm install @telecrypt-io/storage@0.2.4
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
