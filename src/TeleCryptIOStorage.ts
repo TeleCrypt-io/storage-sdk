@@ -317,6 +317,19 @@ export class TeleCryptIOStorage {
   private async keysSetupRecovery(): Promise<{ recoveryKey: string }> {
     const crypto = this.requireCrypto();
 
+    // If this account already has secret storage configured (e.g. from a
+    // previous setup on another device), we cannot unlock it here: the SDK
+    // has no `getSecretStorageKey` callback wired yet and the old recovery
+    // key is not available, so `bootstrapCrossSigning` would try to read the
+    // existing 4S and fail with "No getSecretStorageKey callback supplied".
+    // Reset the account's 4S + key backup so we can bootstrap a fresh,
+    // self-consistent recovery state (new cross-signing keys, new 4S key,
+    // new backup) and hand the user a working recovery key.
+    const status = await crypto.getSecretStorageStatus();
+    if (status.defaultKeyId) {
+      await crypto.disableKeyStorage();
+    }
+
     await crypto.bootstrapCrossSigning({
       // No existing verified device to interactively re-authenticate against
       // for this account, so there is nothing to feed into `makeRequest`;
