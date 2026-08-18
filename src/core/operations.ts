@@ -142,8 +142,15 @@ export async function declineInvite(
   storage: TeleCryptIOStorage,
   folderId: string,
 ): Promise<{ folderId: string; declined: boolean }> {
+  const client = storage.getClient();
   try {
-    await storage.getClient().leave(folderId);
+    await client.leave(folderId);
+    // The server only allows forgetting a room once this account's
+    // membership is `leave`; forgetting removes the room from the local
+    // store immediately, so a declined invite stops showing up in
+    // listFolders/listPendingInvites without waiting for the leave event to
+    // round-trip through the background sync loop.
+    await client.forget(folderId);
   } catch (err) {
     throw new CliError(`decline failed: ${(err as Error).message}`);
   }
@@ -237,7 +244,20 @@ export async function deleteFolder(
   folderId: string,
 ): Promise<DeleteResult> {
   const tree = await resolveTree(storage, folderId);
+  // `tree.delete()` kicks members and leaves this room AND every
+  // subdirectory room, but never forgets any of them, so they all linger in
+  // the local store and listFolders keeps returning the deleted folder until
+  // the leave events round-trip through the background sync loop (30-60s
+  // under full-suite load). Forgetting removes each room from the local
+  // store immediately; the server only accepts a forget once membership is
+  // `leave`, which `tree.delete()` has just completed for the whole tree.
+  const subdirectoryIds = tree.getDirectories().map((d) => d.id);
   await tree.delete();
+  const client = storage.getClient();
+  await client.forget(folderId);
+  for (const subId of subdirectoryIds) {
+    await client.forget(subId);
+  }
   return { id: folderId, deleted: true };
 }
 
