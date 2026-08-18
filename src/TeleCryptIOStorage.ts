@@ -586,7 +586,7 @@ export class TeleCryptIOStorage {
     let info: Record<string, unknown> | undefined;
     try {
       ({ info } = await branch.getFileInfo());
-    } catch (err) {
+    } catch {
       // matrix-js-sdk's MSC3089Branch.getFileInfo() reads `file["url"]` off
       // the raw event content; when the event is undecryptable on this
       // device it hands back a placeholder with no `file` block, so that
