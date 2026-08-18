@@ -1,4 +1,4 @@
-import { ClientEvent, createClient, MatrixClient, MatrixEvent, SyncState } from "matrix-js-sdk";
+import { ClientEvent, createClient, EventType, MatrixClient, MatrixEvent, SyncState } from "matrix-js-sdk";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
@@ -495,6 +495,76 @@ export class TeleCryptIOStorage {
       }
     }
     return trees;
+  }
+
+  /**
+   * Creates a subdirectory (nested tree space) under `parent` and links it
+   * with the parent's space.child / the child's space.parent state events.
+   *
+   * Mirrors `createTree`'s workaround for the same matrix-js-sdk race:
+   * `MSC3089TreeSpace.createDirectory()` calls `unstableCreateFileTree()`,
+   * which creates the room via a plain `createRoom()` HTTP call and then
+   * immediately wraps the result by looking the room up in the *local*
+   * client store — throwing `Error("Unknown room")` when the background
+   * sync loop hasn't surfaced the new room yet. Without the workaround the
+   * subfolder room is created server-side but never linked (no space.child
+   * event), leaving an orphaned room and a spurious failure for a folder
+   * that in fact exists.
+   */
+  async createSubtree(parent: TreeSpace, name: string): Promise<TreeSpace> {
+    const knownRoomIdsBefore = new Set(this.client.getRooms().map((r) => r.roomId));
+    try {
+      // The `await` here is load-bearing: without it, the promise's
+      // eventual rejection would happen after this try/catch has already
+      // returned, bypassing the recovery logic below entirely.
+      return (await parent.createDirectory(name)) as unknown as TreeSpace;
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== "Unknown room") throw err;
+
+      const newRoomId = await new Promise<string>((resolve, reject) => {
+        const deadline = Date.now() + 15000;
+        const poll = () => {
+          const found = this.client.getRooms().find((r) => !knownRoomIdsBefore.has(r.roomId));
+          if (found) {
+            resolve(found.roomId);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            reject(
+              new Error(
+                "createSubtree: room was created server-side but never appeared in this client's local sync state",
+              ),
+            );
+            return;
+          }
+          setTimeout(poll, 200);
+        };
+        poll();
+      });
+
+      const tree = this.client.unstableGetFileTreeSpace(newRoomId) as unknown as TreeSpace | null;
+      if (!tree) {
+        throw new Error(`createSubtree: room ${newRoomId} appeared but is not a valid file tree space`);
+      }
+
+      // The room appeared in sync, but `createDirectory` threw before it
+      // could send the space.child / space.parent link events. Send them
+      // now so the subfolder is actually reachable from its parent.
+      await this.client.sendStateEvent(
+        parent.id,
+        EventType.SpaceChild,
+        { via: [this.client.getDomain()!] },
+        newRoomId,
+      );
+      await this.client.sendStateEvent(
+        newRoomId,
+        EventType.SpaceParent,
+        { via: [this.client.getDomain()!] },
+        parent.id,
+      );
+
+      return tree;
+    }
   }
 
   getTree(roomId: string): TreeSpace | null {

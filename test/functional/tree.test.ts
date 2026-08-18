@@ -51,6 +51,37 @@ describe("tree operations", () => {
     }
   });
 
+  it("1.2b createSubtree links the child even when sync lags (Unknown room workaround)", async () => {
+    const user = await registerTestUser("tree");
+    const client = await createTestClient(user);
+    try {
+      const storage = new TeleCryptIOStorage(client);
+      const root = await storage.createTree("Root");
+      await waitForName(root, "Root");
+
+      // createSubtree must return a usable tree AND the space.child link
+      // must be in place (the workaround re-sends it if createDirectory
+      // threw "Unknown room" before linking).
+      const sub = await storage.createSubtree(root, "Linked");
+      expect(sub.id).toBeTruthy();
+
+      await waitFor(() => sub.isTopLevel === false, {
+        label: "subfolder is not top-level (linked)",
+        timeoutMs: 10000,
+      });
+
+      const dirs = root.getDirectories();
+      expect(dirs.some((d) => d.id === sub.id)).toBe(true);
+
+      // The child must be reachable from the parent via the space.child
+      // state event — the exact thing that was missing when the race hit.
+      const childEvents = root.room.currentState.getStateEvents("m.space.child");
+      expect(childEvents.some((e) => e.getStateKey() === sub.id)).toBe(true);
+    } finally {
+      stopTestClient(client);
+    }
+  });
+
   it("1.3 creates nested subfolders three deep, hierarchy walkable", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
