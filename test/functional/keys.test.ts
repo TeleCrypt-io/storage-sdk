@@ -254,4 +254,37 @@ describe("key management", () => {
       stopTestClient(storageA.getClient());
     }
   });
+
+  it("5.5 setupRecovery succeeds when the account already has secret storage", async () => {
+    // Regression: the production UI hit "No getSecretStorageKey callback
+    // supplied" when setupRecovery ran on an account that already had 4S +
+    // key backup from a previous run. bootstrapCrossSigning reads the
+    // existing 4S, which requires a getSecretStorageKey callback the SDK
+    // does not have — so setupRecovery must reset the account's 4S first.
+    const user = await registerTestUser("recover_existing");
+    const storage = await createStorage(user);
+    try {
+      // First setup on a fresh account: works, and leaves 4S + backup behind.
+      const first = await storage.keys.setupRecovery();
+      expect(first.recoveryKey).toBeTruthy();
+      await waitFor(() => storage.keys.isRecoverySetup(), {
+        label: "recovery active after first setup",
+        timeoutMs: 15000,
+      });
+
+      // Second setup on the SAME account (as the production UI does when the
+      // account already has prior state): must succeed with a fresh key, not
+      // throw "No getSecretStorageKey callback supplied".
+      const second = await storage.keys.setupRecovery();
+      expect(second.recoveryKey).toBeTruthy();
+      expect(second.recoveryKey).not.toBe(first.recoveryKey);
+
+      await waitFor(() => storage.keys.isRecoverySetup(), {
+        label: "recovery active after second setup",
+        timeoutMs: 15000,
+      });
+    } finally {
+      stopTestClient(storage.getClient());
+    }
+  });
 });
