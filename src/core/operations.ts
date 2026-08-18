@@ -104,7 +104,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 export async function createFolder(storage: TeleCryptIOStorage, name: string): Promise<FolderInfo> {
-  const tree = await storage.createTree(name);
+  const tree = await withRateLimitRetry("createFolder", () => storage.createTree(name));
   return { id: tree.id, name };
 }
 
@@ -268,7 +268,7 @@ export async function createSubfolder(
   name: string,
 ): Promise<FolderInfo> {
   const tree = await resolveTree(storage, folderId);
-  const sub = await tree.createDirectory(name);
+  const sub = await withRateLimitRetry("createSubfolder", () => tree.createDirectory(name));
   return { id: sub.id, name };
 }
 
@@ -278,7 +278,7 @@ export async function renameFolder(
   name: string,
 ): Promise<RenameResult> {
   const tree = await resolveTree(storage, folderId);
-  await tree.setName(name);
+  await withRateLimitRetry("renameFolder", () => tree.setName(name));
   return { id: folderId, name };
 }
 
@@ -314,7 +314,7 @@ export async function renameFile(
 ): Promise<RenameResult> {
   const tree = await resolveTree(storage, folderId);
   const branch = await resolveFile(tree, fileId);
-  await branch.setName(name);
+  await withRateLimitRetry("renameFile", () => branch.setName(name));
   // `setName` resolves when the homeserver accepts the state event, but a
   // fresh CLI/UI process can still read the previous local room state for a
   // short time. Do not report success until this client has observed the new
@@ -336,7 +336,7 @@ export async function deleteFile(
 ): Promise<DeleteResult> {
   const tree = await resolveTree(storage, folderId);
   const branch = await resolveFile(tree, fileId);
-  await branch.delete();
+  await withRateLimitRetry("deleteFile", () => branch.delete());
   return { id: fileId, deleted: true };
 }
 
@@ -348,7 +348,9 @@ export async function uploadFile(
   mimetype: string,
 ): Promise<FileInfo> {
   const tree = await resolveTree(storage, folderId);
-  const fileId = await storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype);
+  const fileId = await withRateLimitRetry("uploadFile", () =>
+    storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype),
+  );
   return { id: fileId, name, mimetype };
 }
 

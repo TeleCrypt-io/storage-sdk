@@ -5,11 +5,11 @@
 
 ## Distribution boundary
 
-`@telecrypt-io/storage@0.2.4` is the current library-only release. Install it as a project
+`@telecrypt-io/storage@0.2.5` is the current library-only release. Install it as a project
 dependency:
 
 ```bash
-npm install @telecrypt-io/storage@0.2.4
+npm install @telecrypt-io/storage@0.2.5
 ```
 
 Do not install it globally and do not expect a `telecrypt-io` command. The immutable legacy
