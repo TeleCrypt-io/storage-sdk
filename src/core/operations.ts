@@ -268,7 +268,7 @@ export async function createSubfolder(
   name: string,
 ): Promise<FolderInfo> {
   const tree = await resolveTree(storage, folderId);
-  const sub = await withRateLimitRetry("createSubfolder", () => tree.createDirectory(name));
+  const sub = await withRateLimitRetry("createSubfolder", () => storage.createSubtree(tree, name));
   return { id: sub.id, name };
 }
 
