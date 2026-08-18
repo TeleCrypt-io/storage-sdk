@@ -149,8 +149,12 @@ describe("key management", () => {
         // NEGATIVE CONTROL: device B has no keys yet, so it must NOT be able
         // to decrypt. This proves the empty start — if this assertion fails,
         // device B's crypto store is leaking from device A's, and the later
-        // "success" would be meaningless.
-        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow();
+        // "success" would be meaningless. Also asserts the CLEAR error
+        // message (regression: this used to surface as an opaque
+        // "Cannot read properties of undefined (reading 'url')").
+        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow(
+          /undecryptable on this device/,
+        );
 
         const restoreResult = await storageB.keys.restoreFromRecoveryKey(recoveryKey);
         expect(restoreResult.imported).toBeGreaterThan(0);
@@ -246,7 +250,9 @@ describe("key management", () => {
         ).rejects.toThrow();
 
         // Device B still cannot decrypt the file — no partial/silent success.
-        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow();
+        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow(
+          /undecryptable on this device/,
+        );
       } finally {
         stopTestClient(storageB.getClient());
       }
