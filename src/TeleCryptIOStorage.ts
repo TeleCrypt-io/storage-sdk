@@ -583,13 +583,21 @@ export class TeleCryptIOStorage {
   async downloadFile(
     branch: FileBranch,
   ): Promise<{ data: ArrayBuffer; mimetype: string }> {
-    const { info } = await branch.getFileInfo();
-    // If the underlying room event couldn't be decrypted (e.g. this device
-    // never received/recovered the megolm session for it), matrix-js-sdk
-    // hands back a placeholder with no usable `info` rather than throwing —
-    // so without this check, callers would hit an opaque
-    // "Cannot read properties of undefined" a few lines down instead of a
-    // clear, actionable error.
+    let info: Record<string, unknown> | undefined;
+    try {
+      ({ info } = await branch.getFileInfo());
+    } catch (err) {
+      // matrix-js-sdk's MSC3089Branch.getFileInfo() reads `file["url"]` off
+      // the raw event content; when the event is undecryptable on this
+      // device it hands back a placeholder with no `file` block, so that
+      // read throws an opaque "Cannot read properties of undefined" instead
+      // of a useful error. Surface the real cause.
+      throw new Error(
+        `downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)`,
+      );
+    }
+    // Belt-and-braces: if a future matrix-js-sdk version returns a
+    // placeholder without throwing, still fail with the clear message.
     if (!info || typeof info.url !== "string") {
       throw new Error(
         "downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)",
