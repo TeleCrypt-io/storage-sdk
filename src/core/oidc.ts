@@ -274,14 +274,14 @@ export async function refreshOidcToken(
   }
   const record = data as Record<string, unknown>;
   const accessToken = record.access_token;
-  const refreshToken = record.refresh_token;
+  const nextRefreshToken = record.refresh_token;
   const expiresIn = record.expires_in;
   if (typeof accessToken !== "string" || accessToken.trim() === "") {
     throw new CliError("OIDC token refresh returned no access token");
   }
   if (
-    refreshToken !== undefined &&
-    (typeof refreshToken !== "string" || refreshToken.trim() === "")
+    nextRefreshToken !== undefined &&
+    (typeof nextRefreshToken !== "string" || nextRefreshToken.trim() === "")
   ) {
     throw new CliError("OIDC token refresh returned an invalid refresh token");
   }
@@ -293,7 +293,7 @@ export async function refreshOidcToken(
   }
   return {
     accessToken,
-    refreshToken: refreshToken as string | undefined,
+    refreshToken: nextRefreshToken as string | undefined,
     expiry:
       expiresIn === undefined
         ? undefined
