@@ -123,6 +123,8 @@ export interface CreateFromOidcOptions {
   cryptoCallbacks?: CryptoCallbacks;
 }
 
+const recoveryCallbackQueues = new WeakMap<MatrixClient, Promise<void>>();
+
 export class TeleCryptIOStorage {
   constructor(private client: MatrixClient) {}
 
@@ -293,20 +295,28 @@ export class TeleCryptIOStorage {
     privateKey: Uint8Array<ArrayBuffer>,
     fn: () => Promise<T>,
   ): Promise<T> {
-    const callbacks = this.client.cryptoCallbacks;
-    const prevGetKey = callbacks.getSecretStorageKey;
-    const prevCache = callbacks.cacheSecretStorageKey;
-    callbacks.getSecretStorageKey = async ({ keys }) => {
-      const keyId = Object.keys(keys)[0];
-      return [keyId, privateKey] as [string, Uint8Array<ArrayBuffer>];
-    };
-    callbacks.cacheSecretStorageKey = () => {};
-    try {
-      return await fn();
-    } finally {
-      callbacks.getSecretStorageKey = prevGetKey;
-      callbacks.cacheSecretStorageKey = prevCache;
-    }
+    const previous = recoveryCallbackQueues.get(this.client) ?? Promise.resolve();
+    const run = previous.then(async () => {
+      const callbacks = this.client.cryptoCallbacks;
+      const prevGetKey = callbacks.getSecretStorageKey;
+      const prevCache = callbacks.cacheSecretStorageKey;
+      callbacks.getSecretStorageKey = async ({ keys }) => {
+        const keyId = Object.keys(keys)[0];
+        return [keyId, privateKey] as [string, Uint8Array<ArrayBuffer>];
+      };
+      callbacks.cacheSecretStorageKey = () => {};
+      try {
+        return await fn();
+      } finally {
+        callbacks.getSecretStorageKey = prevGetKey;
+        callbacks.cacheSecretStorageKey = prevCache;
+      }
+    });
+    recoveryCallbackQueues.set(this.client, run.then(
+      () => undefined,
+      () => undefined,
+    ));
+    return run;
   }
 
   /**

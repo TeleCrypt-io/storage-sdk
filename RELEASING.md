@@ -29,13 +29,14 @@ org must configure the replacement package as npm expects for Trusted Publishing
 
 1. Bump `version` in `package.json` (semver).
 2. Commit that change.
-3. Tag it and push the tag:
+3. Create an annotated tag and push it:
    ```sh
-   git tag vX.Y.Z
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
    git push origin vX.Y.Z
    ```
-4. GitHub Actions picks up the `v*` tag push, runs `npm ci && npm run build && npm publish
-   --access public --provenance`, and the new version appears on npm with a provenance
+4. GitHub Actions rejects a non-annotated tag, then runs `npm ci && npm run build && npm publish
+   --access public --provenance`. npm refuses to publish an already-existing package version, and
+   the new version appears on npm with a provenance
    attestation (visible on the npm package page as "Built and signed on GitHub Actions").
 
 Nothing else is required from a human for a routine release — steps 1–3 above are it.
