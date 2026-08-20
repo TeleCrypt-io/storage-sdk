@@ -268,15 +268,36 @@ export async function refreshOidcToken(
     const body = await res.text();
     throw new CliError(`OIDC token refresh failed (${res.status}): ${body}`);
   }
-  const data = (await res.json()) as {
-    access_token: string;
-    refresh_token?: string;
-    expires_in?: number;
-  };
+  const data: unknown = await res.json();
+  if (!data || typeof data !== "object") {
+    throw new CliError("OIDC token refresh returned an invalid response");
+  }
+  const record = data as Record<string, unknown>;
+  const accessToken = record.access_token;
+  const nextRefreshToken = record.refresh_token;
+  const expiresIn = record.expires_in;
+  if (typeof accessToken !== "string" || accessToken.trim() === "") {
+    throw new CliError("OIDC token refresh returned no access token");
+  }
+  if (
+    nextRefreshToken !== undefined &&
+    (typeof nextRefreshToken !== "string" || nextRefreshToken.trim() === "")
+  ) {
+    throw new CliError("OIDC token refresh returned an invalid refresh token");
+  }
+  if (
+    expiresIn !== undefined &&
+    (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn < 0)
+  ) {
+    throw new CliError("OIDC token refresh returned an invalid expiry");
+  }
   return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token,
-    expiry: data.expires_in ? new Date(Date.now() + data.expires_in * 1000) : undefined,
+    accessToken,
+    refreshToken: nextRefreshToken as string | undefined,
+    expiry:
+      expiresIn === undefined
+        ? undefined
+        : new Date(Date.now() + expiresIn * 1000),
   };
 }
 
