@@ -3,16 +3,15 @@
  * taking an already-created `TeleCryptIOStorage` plus plain inputs and returning
  * one of the typed results in `./types.ts`. No I/O beyond the Matrix client
  * itself, no stdout, no `process`, no file paths — bytes in/out are always
- * `Uint8Array`. This is what the CLI's command actions call today and what
- * a future React UI calls directly, so both run the exact same tested logic
- * and share the exact same result shapes.
+ * `Uint8Array`. All callers run the same tested logic and share the same result
+ * shapes.
  *
  * `core/` never creates the `TeleCryptIOStorage`/`MatrixClient` itself — store
  * config (persistent crypto store, session credentials, etc.) is
- * platform-specific and stays with the caller (see `src/cli/storage.ts`).
+ * platform-specific and stays with the caller.
  */
 import { FileBranch, TeleCryptIOStorage, TreeSpace } from "../TeleCryptIOStorage.js";
-import { CliError } from "./errors.js";
+import { StorageError } from "./errors.js";
 import { waitForCondition } from "./poll.js";
 import type {
   DownloadedFile,
@@ -47,7 +46,7 @@ function isRateLimited(error: unknown): boolean {
   return typeof isRateLimitError === "function" && isRateLimitError.call(error) === true;
 }
 
-async function withRateLimitRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+async function withRateLimitRetry<T>(operation: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await operation();
@@ -84,7 +83,7 @@ async function resolveTree(storage: TeleCryptIOStorage, folderId: string): Promi
       timeoutMs: 15000,
     });
   } catch {
-    throw new CliError(`folder not found: ${folderId}`);
+    throw new StorageError(`folder not found: ${folderId}`);
   }
 }
 
@@ -95,7 +94,7 @@ async function resolveFile(tree: TreeSpace, fileId: string): Promise<FileBranch>
   try {
     return await waitForCondition(() => tree.getFile(fileId), { timeoutMs: 15000 });
   } catch {
-    throw new CliError(`file not found: ${fileId}`);
+    throw new StorageError(`file not found: ${fileId}`);
   }
 }
 
@@ -104,7 +103,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 export async function createFolder(storage: TeleCryptIOStorage, name: string): Promise<FolderInfo> {
-  const tree = await withRateLimitRetry("createFolder", () => storage.createTree(name));
+  const tree = await withRateLimitRetry(() => storage.createTree(name));
   return { id: tree.id, name };
 }
 
@@ -124,9 +123,9 @@ export function getMyFolderRole(storage: TeleCryptIOStorage, folderId: string): 
 
 export async function joinFolder(storage: TeleCryptIOStorage, folderId: string): Promise<JoinResult> {
   try {
-    await withRateLimitRetry("joinFolder", () => storage.getClient().joinRoom(folderId));
+    await withRateLimitRetry(() => storage.getClient().joinRoom(folderId));
   } catch (err) {
-    throw new CliError(`join failed: ${(err as Error).message}`);
+    throw new StorageError(`join failed: ${(err as Error).message}`);
   }
   return { folderId, joined: true };
 }
@@ -185,7 +184,7 @@ export async function declineInvite(
 ): Promise<{ folderId: string; declined: boolean }> {
   const client = storage.getClient();
   try {
-    await withRateLimitRetry("declineInvite", async () => {
+    await withRateLimitRetry(async () => {
       await client.leave(folderId);
       // The server only allows forgetting a room once this account's
       // membership is `leave`; forgetting removes the room from the local
@@ -195,7 +194,7 @@ export async function declineInvite(
       await client.forget(folderId);
     });
   } catch (err) {
-    throw new CliError(`decline failed: ${(err as Error).message}`);
+    throw new StorageError(`decline failed: ${(err as Error).message}`);
   }
   return { folderId, declined: true };
 }
@@ -215,17 +214,17 @@ export async function shareFolder(
   role: string,
 ): Promise<ShareResult> {
   if (role !== "viewer" && role !== "editor") {
-    throw new CliError(`invalid --role "${role}" (must be viewer or editor)`);
+    throw new StorageError(`invalid --role "${role}" (must be viewer or editor)`);
   }
   const tree = await resolveTree(storage, folderId);
   try {
-    await withRateLimitRetry("shareFolder.invite", () => tree.invite(userId));
+    await withRateLimitRetry(() => tree.invite(userId));
   } catch (err) {
     if (!/already in the room/i.test((err as Error).message)) {
       throw err;
     }
   }
-  await withRateLimitRetry("shareFolder.setPermissions", () => tree.setPermissions(userId, role));
+  await withRateLimitRetry(() => tree.setPermissions(userId, role));
   return { folderId, userId, role };
 }
 
@@ -236,18 +235,18 @@ export async function unshareFolder(
 ): Promise<UnshareResult> {
   await resolveTree(storage, folderId);
   try {
-    await withRateLimitRetry("unshareFolder", () =>
+    await withRateLimitRetry(() =>
       storage.getClient().kick(folderId, userId, "unshared"),
     );
   } catch (err) {
-    throw new CliError(`unshare failed: ${(err as Error).message}`);
+    throw new StorageError(`unshare failed: ${(err as Error).message}`);
   }
   return { folderId, userId, removed: true };
 }
 
 export async function listMembers(storage: TeleCryptIOStorage, folderId: string): Promise<Member[]> {
   const tree = await resolveTree(storage, folderId);
-  return withRateLimitRetry("listMembers", () => storage.listMembers(tree));
+  return withRateLimitRetry(() => storage.listMembers(tree));
 }
 
 export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
@@ -270,7 +269,7 @@ export async function createSubfolder(
   name: string,
 ): Promise<FolderInfo> {
   const tree = await resolveTree(storage, folderId);
-  const sub = await withRateLimitRetry("createSubfolder", () => storage.createSubtree(tree, name));
+  const sub = await withRateLimitRetry(() => storage.createSubtree(tree, name));
   return { id: sub.id, name };
 }
 
@@ -280,7 +279,7 @@ export async function renameFolder(
   name: string,
 ): Promise<RenameResult> {
   const tree = await resolveTree(storage, folderId);
-  await withRateLimitRetry("renameFolder", () => tree.setName(name));
+  await withRateLimitRetry(() => tree.setName(name));
   return { id: folderId, name };
 }
 
@@ -298,7 +297,7 @@ export async function deleteFolder(
   // `leave`, which `tree.delete()` has just completed for the whole tree.
   const subdirectoryIds = tree.getDirectories().map((d) => d.id);
   const client = storage.getClient();
-  await withRateLimitRetry("deleteFolder", async () => {
+  await withRateLimitRetry(async () => {
     await tree.delete();
     await client.forget(folderId);
     for (const subId of subdirectoryIds) {
@@ -316,7 +315,7 @@ export async function renameFile(
 ): Promise<RenameResult> {
   const tree = await resolveTree(storage, folderId);
   const branch = await resolveFile(tree, fileId);
-  await withRateLimitRetry("renameFile", () => branch.setName(name));
+  await withRateLimitRetry(() => branch.setName(name));
   // `setName` resolves when the homeserver accepts the state event, but a
   // fresh CLI/UI process can still read the previous local room state for a
   // short time. Do not report success until this client has observed the new
@@ -338,7 +337,7 @@ export async function deleteFile(
 ): Promise<DeleteResult> {
   const tree = await resolveTree(storage, folderId);
   const branch = await resolveFile(tree, fileId);
-  await withRateLimitRetry("deleteFile", () => branch.delete());
+  await withRateLimitRetry(() => branch.delete());
   return { id: fileId, deleted: true };
 }
 
@@ -350,7 +349,7 @@ export async function uploadFile(
   mimetype: string,
 ): Promise<FileInfo> {
   const tree = await resolveTree(storage, folderId);
-  const fileId = await withRateLimitRetry("uploadFile", () =>
+  const fileId = await withRateLimitRetry(() =>
     storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype),
   );
   return { id: fileId, name, mimetype };
@@ -367,7 +366,7 @@ export async function downloadFile(
   try {
     result = await storage.downloadFile(branch);
   } catch (err) {
-    throw new CliError(`download failed: ${(err as Error).message}`);
+    throw new StorageError(`download failed: ${(err as Error).message}`);
   }
   return {
     bytes: new Uint8Array(result.data),

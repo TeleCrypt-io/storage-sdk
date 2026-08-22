@@ -1,12 +1,8 @@
 name: Publish to npm
 
 # Publishes @telecrypt-io/storage to the npm registry using npm Trusted
-# Publishing (OIDC) with provenance. There is no NODE_AUTH_TOKEN / npm token
-# secret anywhere in this workflow — npm exchanges this workflow run's GitHub
-# Actions OIDC identity for a short-lived publish credential at publish time,
-# which is only possible once a human has registered this repo + this exact
-# workflow file as a Trusted Publisher for the package on npmjs.com (see
-# RELEASING.md — that one-time setup step cannot be done from CI).
+# Publishing (OIDC) with provenance. There is no NODE_AUTH_TOKEN or npm token;
+# npm trusts this repository's exact workflow identity.
 
 on:
   push:
@@ -18,7 +14,7 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       id-token: write # required to mint the OIDC token trusted publishing exchanges for a publish credential
       contents: read
@@ -44,9 +40,7 @@ jobs:
           package_version="$(node -e 'console.log(require("./package.json").version)')"
           test "$expected_version" = "$package_version"
 
-      # Trusted Publishing support landed in npm CLI 11.5.1; pin to a recent
-      # npm explicitly rather than relying on whatever ships with the Node
-      # version above.
+      # Pin a Trusted-Publishing-capable npm instead of relying on Node's bundled version.
       - name: Ensure a trusted-publishing-capable npm
         run: npm install -g npm@11.5.1
 

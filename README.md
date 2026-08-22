@@ -8,14 +8,13 @@ Files are encrypted on the client before upload. The server stores only opaque c
 never holds the decryption keys. Shared folders let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
-**Status:** library source only. `@telecrypt-io/storage@0.2.5` is the current public release,
-published from this repository's protected `v0.2.5` tag with NPM Trusted Publishing/OIDC
-provenance. The older `0.1.3` release is the immutable legacy combined library-and-CLI package.
+This repository publishes the library package from protected exact-version tags with NPM Trusted
+Publishing/OIDC provenance. The command-line client is maintained in its own repository.
 
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.2.5
+npm install @telecrypt-io/storage@0.3.0
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
@@ -61,13 +60,13 @@ stock Synapse.
 ## Development
 
 ```bash
-npm install
-npm run synapse:up     # disposable local Synapse for tests
+npm ci
+npm run synapse:up     # disposable local Synapse/MAS fixture
 npm test
 npm run synapse:down
 ```
 
-Tests run against a real local Synapse in podman, never against a production server.
+Tests run against a real local Synapse/MAS fixture in Podman, never against a production server.
 
 See [RELEASING.md](./RELEASING.md) for the guarded npm release procedure.
 

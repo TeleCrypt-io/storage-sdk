@@ -18,7 +18,9 @@ PGVOL="throwaway-mas-pgdata"
 for name in "$PROXY" "$SYN" "$MAS" "$DB"; do
   podman rm -f "$name" >/dev/null 2>&1 && echo "==> removed $name" || echo "==> $name was not running"
 done
-podman network rm "$NET" >/dev/null 2>&1 && echo "==> removed network $NET" || true
+if podman network rm "$NET" >/dev/null 2>&1; then
+  echo "==> removed network $NET"
+fi
 
 if [[ "${1:-}" == "--wipe" ]]; then
   podman volume rm -f "$PGVOL" >/dev/null 2>&1 || true

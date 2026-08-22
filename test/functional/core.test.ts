@@ -1,9 +1,7 @@
 // Proves src/core/operations.ts is independently consumable: call core.*
 // functions IN-PROCESS (no CLI subprocess, no commander, no stdout) against
 // a real Synapse, asserting on the typed results from src/core/types.ts.
-// This is the UI-readiness proof — everything exercised here is exactly
-// what a future React UI would call directly, with the exact same
-// TeleCryptIOStorage + core layer the CLI uses.
+// This proves callers use the same TeleCryptIOStorage + core layer.
 //
 // Layer 2 (server-side Secure Backup + restore, C.4) needs a persistent
 // crypto store so a genuinely new device's own crypto state survives its

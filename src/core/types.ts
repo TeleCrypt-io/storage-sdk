@@ -1,12 +1,4 @@
-/**
- * The shared typed result contract for every `core/operations.ts` function.
- * This is deliberately the ONE definition of these shapes: the CLI's
- * `--json` schema is these types (or a trivial projection of them, e.g.
- * `FolderInfo.id` -> the CLI's `folderId` key for backwards-compatible
- * command output), and the future React UI's data model is these types
- * directly. Keeping it here means the CLI and the UI can never drift apart
- * on what an operation returns.
- */
+/** The typed result contract for every `core/operations.ts` function. */
 
 export interface FolderInfo {
   id: string;

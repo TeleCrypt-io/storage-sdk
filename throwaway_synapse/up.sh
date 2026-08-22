@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
 # Launch a throwaway MAS-delegated Synapse stack for functional tests, via
-# podman: Postgres (MAS's database) + MAS + Synapse (delegating auth to MAS,
-# MSC3861, compatibility mode so m.login.password still works) + a Caddy
-# front door on :8008 (MAS's docs require the three compat auth endpoints —
-# login/logout/refresh — to be proxied to MAS directly; Synapse no longer
-# serves them once delegated).
+# podman: Postgres (MAS's database) + MAS + Synapse (delegating authentication
+# to MAS) + a Caddy front door on :8008. The local fixture routes MAS-owned
+# logout/refresh endpoints directly to MAS because Synapse delegates
+# authentication to it.
 #
 # Idempotent: safe to run repeatedly. Generates config on first run, reuses it
-# after. New accounts are provisioned via `mas-cli manage register-user`
-# (see test/harness/users.ts), not the old plain POST /register — MAS owns
-# account creation now.
+# after. MAS owns account creation; tests provision accounts with
+# `mas-cli manage register-user` (see test/harness/users.ts).
 #
 #   ./up.sh          # start (generate config if missing)
 #   ./up.sh --fresh  # wipe data and regenerate from scratch
 #
 # Verify it is up:  curl http://localhost:8008/_matrix/client/versions
-#                   curl http://localhost:8082/.well-known/openid-configuration
+#                   curl http://localhost:8008/auth/.well-known/openid-configuration
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-SYN_IMG="ghcr.io/element-hq/synapse:v1.155.0"
-MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.16.0"
+SYN_IMG="ghcr.io/element-hq/synapse:v1.159.0"
+MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.23.0"
 PROXY_IMG="docker.io/library/caddy:2.11.4-alpine"
 PG_IMG="docker.io/library/postgres:16.4-alpine"
 
@@ -71,8 +69,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Synapse base config (same generation step as before), plus the
-#    matrix_authentication_service delegation block appended.
+# 2. Synapse base config plus the matrix_authentication_service delegation
+#    block appended.
 # ---------------------------------------------------------------------------
 if [[ ! -f "$DATA/synapse/homeserver.yaml" ]]; then
   echo "==> generating base Synapse config"
@@ -85,7 +83,7 @@ if [[ ! -f "$DATA/synapse/homeserver.yaml" ]]; then
   echo "==> appending homeserver.extra.yaml + MAS delegation block"
   cat > "$DATA/mas-delegation.yaml" <<EOF
 
-# ---- MAS delegation (MSC3861) — throwaway test overrides ----
+# ---- MAS delegation — throwaway test overrides ----
 matrix_authentication_service:
   enabled: true
   endpoint: http://${MAS}:8080
@@ -101,11 +99,19 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. MAS config (generated once, then patched: db uri, matrix.* secret/
-#    endpoint, public_base/issuer, permissive dev DCR policy).
+#    endpoint, same-origin public_base/issuer, permissive dev DCR policy).
 # ---------------------------------------------------------------------------
 if [[ ! -f "$DATA/mas/config.yaml" ]]; then
   echo "==> generating MAS config"
-  podman run --rm "$MAS_IMG" config generate > "$DATA/mas/config.yaml"
+  # MAS 1.23 defaults `config generate` to a file inside the container.  That
+  # leaves the host redirect empty, so MAS later reports "missing field
+  # secrets".  Request stdout explicitly; the generated keys stay in this
+  # disposable local fixture's ignored data directory.
+  podman run --rm "$MAS_IMG" config generate --output /dev/stdout > "$DATA/mas/config.yaml"
+  if ! grep -q '^secrets:' "$DATA/mas/config.yaml"; then
+    echo "ERROR: MAS config generation produced no secrets section" >&2
+    exit 1
+  fi
   python3 "$PWD/patch_mas_config.py" "$DATA/mas/config.yaml" "$SHARED_SECRET"
 fi
 
@@ -114,7 +120,8 @@ fi
 #    startup — no separate migrate step needed.
 # ---------------------------------------------------------------------------
 podman rm -f "$MAS" >/dev/null 2>&1 || true
-echo "==> starting MAS ($MAS) on :8082"
+# Keep the direct port for local health/debug; advertised MAS URLs use :8008/auth.
+echo "==> starting MAS ($MAS) on :8082 (health/debug only)"
 podman run -d --name "$MAS" --network "$NET" \
   -p 8082:8080 \
   -v "$DATA/mas:/data:Z" \
@@ -134,6 +141,11 @@ podman run -d --name "$SYN" --network "$NET" \
 # 6. (Re)start the Caddy front door on :8008 — the public "homeserver" URL
 #    every test/CLI/UI default already points at.
 # ---------------------------------------------------------------------------
+echo "==> validating front-door configuration"
+podman run --rm \
+  -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro,Z" \
+  --entrypoint caddy \
+  "$PROXY_IMG" validate --config /etc/caddy/Caddyfile >/dev/null
 podman rm -f "$PROXY" >/dev/null 2>&1 || true
 echo "==> starting front door ($PROXY) on :8008"
 podman run -d --name "$PROXY" --network "$NET" \
@@ -146,7 +158,7 @@ podman run -d --name "$PROXY" --network "$NET" \
 # ---------------------------------------------------------------------------
 echo -n "==> waiting for MAS"
 for i in $(seq 1 60); do
-  if curl -fsS -m2 "http://localhost:8082/.well-known/openid-configuration" >/dev/null 2>&1; then
+  if curl -fsS -m2 "http://localhost:8008/auth/.well-known/openid-configuration" >/dev/null 2>&1; then
     echo " — ready"
     break
   fi
@@ -160,12 +172,12 @@ for i in $(seq 1 60); do
   fi
 done
 
-echo -n "==> waiting for the front door (Synapse + MAS compat proxy)"
+echo -n "==> waiting for the front door (Synapse + MAS auth proxy)"
 for i in $(seq 1 60); do
   if curl -fsS -m2 "http://localhost:8008/_matrix/client/versions" >/dev/null 2>&1; then
     echo " — ready"
     echo "Homeserver (via front door) is up at http://localhost:8008"
-    echo "MAS is up at http://localhost:8082"
+    echo "MAS health/debug endpoint is at http://localhost:8082"
     exit 0
   fi
   echo -n "."

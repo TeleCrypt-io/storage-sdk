@@ -42,8 +42,7 @@ async function runDeviceCodeLogin(
   deviceId: string,
   user: { localpart: string; password: string },
 ): Promise<{ authMetadata: oidc.OidcClientConfig; clientId: string; result: oidc.DeviceAccessTokenResponse }> {
-  // Discovery is the one OIDC call that needs a `window` shim under Node —
-  // see src/cli/oidcWindowPolyfill.ts. Scoped narrowly, same as the CLI.
+  // Discovery is the one OIDC call that needs a narrowly scoped `window` shim under Node.
   const authMetadata = await withOidcWindowShim(() => oidc.discoverOidcIssuer(HOMESERVER));
   expect(authMetadata.device_authorization_endpoint).toBeTruthy();
 
@@ -95,11 +94,10 @@ describe("OIDC/MAS login", () => {
       });
       try {
         // The mandatory proof this is a genuinely usable storage instance,
-        // not just "a token that whoami accepts" — mirrors what the
-        // password-login smoke test proves for m.login.password. A newly
-        // created room can take a beat to settle as "top-level" in this
-        // same client's own sync state — same real async-settling window
-        // core.test.ts's C.1 already polls for, not a fixed sleep.
+        // not just "a token that whoami accepts". A newly created room can
+        // take a beat to settle as "top-level" in this same client's own
+        // sync state — the same real async-settling window core.test.ts's
+        // C.1 already polls for, not a fixed sleep.
         const folder = await core.createFolder(storage, "OidcDeviceCodeFolder");
         expect(folder.id).toBeTruthy();
         await waitFor(
@@ -141,10 +139,9 @@ describe("OIDC/MAS login", () => {
       expect(who.userId).toBe(`@${user.localpart}:localhost`);
 
       // Also exercise `buildTokenRefreshFunction`'s persistence-hook wiring
-      // directly — this is the exact function src/cli/storage.ts and
-      // ui/src/context/StorageContext.tsx wire into `createFromOidc`'s
-      // `tokenRefreshFunction`, so this is what actually runs when
-      // matrix-js-sdk triggers an automatic refresh mid-request.
+      // directly — callers wire this into `createFromOidc`'s
+      // `tokenRefreshFunction`, which matrix-js-sdk invokes when refreshing
+      // a token mid-request.
       let persisted: { accessToken: string; refreshToken?: string } | null = null;
       const tokenRefreshFunction = oidc.buildTokenRefreshFunction(
         authMetadata.token_endpoint,
