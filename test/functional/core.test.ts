@@ -33,25 +33,60 @@ async function createStorage(user: {
 }
 
 describe("core operations", () => {
-  it("C.1 createFolder/listFolders: typed FolderInfo, top-level only", async () => {
+  it("C.1 createVault/listVaults: typed VaultInfo, top-level only", async () => {
+    const user = await registerTestUser("core_vault");
+    const storage = await createStorage(user);
+    try {
+      const created = await core.createVault(storage, "CoreVault");
+      expect(created.id).toBeTruthy();
+      expect(created.name).toBe("CoreVault");
+
+      const vaults = await waitFor(
+        async () => {
+          const all = await core.listVaults(storage);
+          return all.some((f) => f.id === created.id) ? all : null;
+        },
+        { label: "listVaults sees the new vault", timeoutMs: 15000 },
+      );
+      expect(vaults.find((f) => f.id === created.id)).toEqual({
+        id: created.id,
+        name: "CoreVault",
+      });
+    } finally {
+      stopTestClient(storage.getClient());
+    }
+  });
+
+  it("C.1b nested folders: create, list, rename, inspect, and delete", async () => {
     const user = await registerTestUser("core_folder");
     const storage = await createStorage(user);
     try {
-      const created = await core.createFolder(storage, "CoreFolder");
-      expect(created.id).toBeTruthy();
-      expect(created.name).toBe("CoreFolder");
+      const vault = await core.createVault(storage, "CoreFolderVault");
+      const folder = await core.createSubfolder(storage, vault.id, "Child");
+      expect(folder).toEqual({ id: expect.any(String), name: "Child" });
 
-      const folders = await waitFor(
+      const listed = await waitFor(
         async () => {
-          const all = await core.listFolders(storage);
-          return all.some((f) => f.id === created.id) ? all : null;
+          const folders = await core.listSubfolders(storage, vault.id);
+          return folders.some((entry) => entry.id === folder.id) ? folders : null;
         },
-        { label: "listFolders sees the new folder", timeoutMs: 15000 },
+        { label: "listSubfolders sees the new folder", timeoutMs: 15000 },
       );
-      expect(folders.find((f) => f.id === created.id)).toEqual({
-        id: created.id,
-        name: "CoreFolder",
-      });
+      expect(listed).toContainEqual(folder);
+
+      const renamed = await core.renameFolder(storage, folder.id, "Renamed");
+      expect(renamed).toEqual({ id: folder.id, name: "Renamed" });
+      const details = await core.getFolderDetails(storage, folder.id);
+      expect(details).toMatchObject({ id: folder.id, name: "Renamed" });
+
+      await core.deleteFolder(storage, folder.id);
+      await waitFor(
+        async () => {
+          const folders = await core.listSubfolders(storage, vault.id);
+          return folders.some((entry) => entry.id === folder.id) ? null : true;
+        },
+        { label: "listSubfolders no longer returns the deleted folder", timeoutMs: 15000 },
+      );
     } finally {
       stopTestClient(storage.getClient());
     }
@@ -63,18 +98,18 @@ describe("core operations", () => {
     const storageA = await createStorage(userA);
     const storageB = await createStorage(userB);
     try {
-      const folder = await core.createFolder(storageA, "CoreShared");
+      const vault = await core.createVault(storageA, "CoreShared");
 
-      const share = await core.shareFolder(storageA, folder.id, userB.userId, "editor");
-      expect(share).toEqual({ folderId: folder.id, userId: userB.userId, role: "editor" });
+      const share = await core.shareVault(storageA, vault.id, userB.userId, "editor");
+      expect(share).toEqual({ vaultId: vault.id, userId: userB.userId, role: "editor" });
 
-      const joined = await core.joinFolder(storageB, folder.id);
-      expect(joined).toEqual({ folderId: folder.id, joined: true });
+      const joined = await core.joinVault(storageB, vault.id);
+      expect(joined).toEqual({ vaultId: vault.id, joined: true });
 
       const originalBytes = new TextEncoder().encode(`core round-trip ${Math.random()}`);
       const uploaded = await core.uploadFile(
         storageB,
-        folder.id,
+        vault.id,
         "from-b.txt",
         originalBytes,
         "text/plain",
@@ -87,7 +122,7 @@ describe("core operations", () => {
       const downloaded = await waitFor(
         async () => {
           try {
-            return await core.downloadFile(storageA, folder.id, uploaded.id);
+            return await core.downloadFile(storageA, vault.id, uploaded.id);
           } catch {
             return null;
           }
@@ -108,11 +143,11 @@ describe("core operations", () => {
     const user = await registerTestUser("core_roundtrip");
     const storage = await createStorage(user);
     try {
-      const folder = await core.createFolder(storage, "RoundTrip");
+      const vault = await core.createVault(storage, "RoundTrip");
       const bytes = new Uint8Array([0, 1, 2, 253, 254, 255, 42, 7]);
       const uploaded = await core.uploadFile(
         storage,
-        folder.id,
+        vault.id,
         "bytes.bin",
         bytes,
         "application/octet-stream",
@@ -120,14 +155,14 @@ describe("core operations", () => {
 
       const files = await waitFor(
         async () => {
-          const listed = await core.listFiles(storage, folder.id);
+          const listed = await core.listFiles(storage, vault.id);
           return listed.length > 0 ? listed : null;
         },
         { label: "listFiles sees the upload" },
       );
       expect(files).toEqual([{ id: uploaded.id, name: "bytes.bin" }]);
 
-      const downloaded = await core.downloadFile(storage, folder.id, uploaded.id);
+      const downloaded = await core.downloadFile(storage, vault.id, uploaded.id);
       expect(downloaded.bytes).toEqual(bytes);
       expect(downloaded.mimetype).toBe("application/octet-stream");
       expect(downloaded.name).toBe("bytes.bin");
@@ -140,10 +175,10 @@ describe("core operations", () => {
     const user = await registerTestUser("core_rename");
     const storage = await createStorage(user);
     try {
-      const folder = await core.createFolder(storage, "RenameTest");
+      const vault = await core.createVault(storage, "RenameTest");
       const uploaded = await core.uploadFile(
         storage,
-        folder.id,
+        vault.id,
         "before.txt",
         new TextEncoder().encode("rename me"),
         "text/plain",
@@ -151,18 +186,18 @@ describe("core operations", () => {
 
       await waitFor(
         async () => {
-          const listed = await core.listFiles(storage, folder.id);
+          const listed = await core.listFiles(storage, vault.id);
           return listed.some((file) => file.id === uploaded.id) ? listed : null;
         },
         { label: "file visible before rename" },
       );
 
-      const renamed = await core.renameFile(storage, folder.id, uploaded.id, "after.txt");
+      const renamed = await core.renameFile(storage, vault.id, uploaded.id, "after.txt");
       expect(renamed).toEqual({ id: uploaded.id, name: "after.txt" });
 
       const filesAfter = await waitFor(
         async () => {
-          const listed = await core.listFiles(storage, folder.id);
+          const listed = await core.listFiles(storage, vault.id);
           return listed.some((file) => file.id === uploaded.id && file.name === "after.txt")
             ? listed
             : null;
@@ -179,12 +214,12 @@ describe("core operations", () => {
     const userA = await registerTestUser("core_recover");
     const storageA = await createStorage(userA);
     try {
-      const folder = await core.createFolder(storageA, "CoreRecoveryTest");
+      const vault = await core.createVault(storageA, "CoreRecoveryTest");
       const bytes = new TextEncoder().encode("core recovery content");
-      const uploaded = await core.uploadFile(storageA, folder.id, "secret.txt", bytes, "text/plain");
+      const uploaded = await core.uploadFile(storageA, vault.id, "secret.txt", bytes, "text/plain");
       await waitFor(
         async () => {
-          const listed = await core.listFiles(storageA, folder.id);
+          const listed = await core.listFiles(storageA, vault.id);
           return listed.length > 0 ? listed : null;
         },
         { label: "file visible on device A" },
@@ -220,14 +255,14 @@ describe("core operations", () => {
       try {
         await waitFor(
           async () => {
-            const folders = await core.listFolders(storageB);
-            return folders.some((f) => f.id === folder.id) ? true : null;
+            const vaults = await core.listVaults(storageB);
+            return vaults.some((f) => f.id === vault.id) ? true : null;
           },
-          { label: "device B lists the folder", timeoutMs: 15000 },
+          { label: "device B lists the vault", timeoutMs: 15000 },
         );
         await waitFor(
           async () => {
-            const listed = await core.listFiles(storageB, folder.id);
+            const listed = await core.listFiles(storageB, vault.id);
             return listed.length > 0 ? true : null;
           },
           { label: "device B sees the (still undecryptable) file", timeoutMs: 15000 },
@@ -239,7 +274,7 @@ describe("core operations", () => {
         // "success" would be meaningless. Also asserts the CLEAR error
         // message (regression: this used to surface as an opaque
         // "Cannot read properties of undefined (reading 'url')").
-        await expect(core.downloadFile(storageB, folder.id, uploaded.id)).rejects.toThrow(
+        await expect(core.downloadFile(storageB, vault.id, uploaded.id)).rejects.toThrow(
           /undecryptable on this device/,
         );
 
@@ -252,7 +287,7 @@ describe("core operations", () => {
         const downloaded = await waitFor(
           async () => {
             try {
-              return await core.downloadFile(storageB, folder.id, uploaded.id);
+              return await core.downloadFile(storageB, vault.id, uploaded.id);
             } catch {
               return null;
             }
@@ -269,29 +304,29 @@ describe("core operations", () => {
     }
   });
 
-  it("C.6 deleteFolder forgets the room immediately (no lingering listFolders entry)", async () => {
+  it("C.6 deleteVault forgets the room immediately (no lingering listVaults entry)", async () => {
     const user = await registerTestUser("core_delete");
     const storage = await createStorage(user);
     try {
-      const created = await core.createFolder(storage, "DeleteMe");
+      const created = await core.createVault(storage, "DeleteMe");
       await waitFor(
         async () => {
-          const all = await core.listFolders(storage);
+          const all = await core.listVaults(storage);
           return all.some((f) => f.id === created.id) ? all : null;
         },
-        { label: "listFolders sees the new folder", timeoutMs: 15000 },
+        { label: "listVaults sees the new vault", timeoutMs: 15000 },
       );
 
-      const deleted = await core.deleteFolder(storage, created.id);
+      const deleted = await core.deleteVault(storage, created.id);
       expect(deleted).toEqual({ id: created.id, deleted: true });
 
       // The room must be gone from the LOCAL store immediately after
-      // deleteFolder resolves — no waiting for the leave event to
+      // deleteVault resolves — no waiting for the leave event to
       // round-trip through the background sync loop. This is the contract
       // the production browser suite depends on (deleted vaults must
       // disappear from the UI without 30-60s of sync latency).
       expect(storage.getClient().getRoom(created.id)).toBeNull();
-      const after = await core.listFolders(storage);
+      const after = await core.listVaults(storage);
       expect(after.some((f) => f.id === created.id)).toBe(false);
     } finally {
       stopTestClient(storage.getClient());
@@ -304,25 +339,25 @@ describe("core operations", () => {
     const storageA = await createStorage(userA);
     const storageB = await createStorage(userB);
     try {
-      const folder = await core.createFolder(storageA, "DeclineMe");
-      await core.shareFolder(storageA, folder.id, userB.userId, "viewer");
+      const vault = await core.createVault(storageA, "DeclineMe");
+      await core.shareVault(storageA, vault.id, userB.userId, "viewer");
 
       // B sees the invite...
       await waitFor(
         async () => {
           const invites = await core.listPendingInvites(storageB);
-          return invites.some((i) => i.id === folder.id) ? invites : null;
+          return invites.some((i) => i.id === vault.id) ? invites : null;
         },
         { label: "B sees the pending invite", timeoutMs: 15000 },
       );
 
-      const declined = await core.declineInvite(storageB, folder.id);
-      expect(declined).toEqual({ folderId: folder.id, declined: true });
+      const declined = await core.declineInvite(storageB, vault.id);
+      expect(declined).toEqual({ vaultId: vault.id, declined: true });
 
       // ...and it must be gone from B's local store immediately.
-      expect(storageB.getClient().getRoom(folder.id)).toBeNull();
+      expect(storageB.getClient().getRoom(vault.id)).toBeNull();
       const invitesAfter = await core.listPendingInvites(storageB);
-      expect(invitesAfter.some((i) => i.id === folder.id)).toBe(false);
+      expect(invitesAfter.some((i) => i.id === vault.id)).toBe(false);
     } finally {
       stopTestClient(storageA.getClient());
       stopTestClient(storageB.getClient());

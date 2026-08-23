@@ -437,7 +437,7 @@ export class TeleCryptIOStorage {
   }
 
   /**
-   * Creates a new top-level shared folder (tree space).
+   * Creates a new top-level shared vault (tree space).
    *
    * Works around a genuine race in matrix-js-sdk's own
    * `unstableCreateFileTree()`: it creates the room via a plain
@@ -452,7 +452,7 @@ export class TeleCryptIOStorage {
    * how we get "Unknown room" at all); this method waits for the client's
    * own ongoing sync loop to surface it, then wraps it directly via
    * `unstableGetFileTreeSpace`, instead of surfacing a spurious failure for
-   * a folder that in fact exists.
+   * a vault that in fact exists.
    */
   async createTree(name: string): Promise<TreeSpace> {
     const knownRoomIdsBefore = new Set(this.client.getRooms().map((r) => r.roomId));
@@ -584,7 +584,7 @@ export class TeleCryptIOStorage {
   }
 
   /**
-   * Lists the participants of a shared folder (tree space) and their role,
+   * Lists the participants of a shared vault (tree space) and their role,
    * derived from room membership (join/invite state) + power levels.
    * Includes invited-but-not-yet-joined members as well as joined ones;
    * excludes anyone who has left/been kicked/banned.

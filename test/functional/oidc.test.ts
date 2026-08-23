@@ -98,14 +98,14 @@ describe("OIDC/MAS login", () => {
         // take a beat to settle as "top-level" in this same client's own
         // sync state — the same real async-settling window core.test.ts's
         // C.1 already polls for, not a fixed sleep.
-        const folder = await core.createFolder(storage, "OidcDeviceCodeFolder");
-        expect(folder.id).toBeTruthy();
+        const vault = await core.createVault(storage, "OidcDeviceCodeVault");
+        expect(vault.id).toBeTruthy();
         await waitFor(
           async () => {
-            const all = await core.listFolders(storage);
-            return all.some((f) => f.id === folder.id) || null;
+            const all = await core.listVaults(storage);
+            return all.some((f) => f.id === vault.id) || null;
           },
-          { label: "folder appears in listFolders" },
+          { label: "vault appears in listVaults" },
         );
       } finally {
         storage.getClient().stopClient();
@@ -163,8 +163,8 @@ describe("OIDC/MAS login", () => {
         deviceId,
       });
       try {
-        const folder = await core.createFolder(storage, "OidcRefreshedTokenFolder");
-        expect(folder.id).toBeTruthy();
+        const vault = await core.createVault(storage, "OidcRefreshedTokenVault");
+        expect(vault.id).toBeTruthy();
       } finally {
         storage.getClient().stopClient();
       }

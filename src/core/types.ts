@@ -1,5 +1,11 @@
 /** The typed result contract for every `core/operations.ts` function. */
 
+export interface VaultInfo {
+  id: string;
+  name: string;
+}
+
+/** A nested directory node inside a vault. */
 export interface FolderInfo {
   id: string;
   name: string;
@@ -18,19 +24,19 @@ export interface Member {
 }
 
 export interface ShareResult {
-  folderId: string;
+  vaultId: string;
   userId: string;
   role: string;
 }
 
 export interface UnshareResult {
-  folderId: string;
+  vaultId: string;
   userId: string;
   removed: boolean;
 }
 
 export interface JoinResult {
-  folderId: string;
+  vaultId: string;
   joined: boolean;
 }
 
@@ -68,6 +74,14 @@ export interface FileDetails {
   updatedAt: string | null;
 }
 
+export interface VaultDetails {
+  name: string;
+  id: string;
+  createdAt: string | null;
+  memberCount: number | null;
+}
+
+/** Details for a nested directory node inside a vault. */
 export interface FolderDetails {
   name: string;
   id: string;

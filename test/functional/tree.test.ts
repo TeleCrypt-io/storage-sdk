@@ -16,15 +16,15 @@ async function waitForName(
 }
 
 describe("tree operations", () => {
-  it("1.1 creates a top-level folder with correct name and isTopLevel", async () => {
+  it("1.1 creates a top-level vault with correct name and isTopLevel", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
       const storage = new TeleCryptIOStorage(client);
-      const tree = await storage.createTree("My Folder");
+      const tree = await storage.createTree("My Vault");
       expect(tree.id).toBeTruthy();
       expect(typeof tree.id).toBe("string");
-      await waitForName(tree, "My Folder", "initial name");
+      await waitForName(tree, "My Vault", "initial name");
       expect(tree.isTopLevel).toBe(true);
     } finally {
       stopTestClient(client);
@@ -85,7 +85,7 @@ describe("tree operations", () => {
     }
   });
 
-  it("1.3 creates nested subfolders three deep, hierarchy walkable", async () => {
+  it("1.3 creates nested folders three deep, hierarchy walkable", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
@@ -117,7 +117,7 @@ describe("tree operations", () => {
     }
   });
 
-  it("1.4 rename a folder is visible after sync", async () => {
+  it("1.4 rename a vault is visible after sync", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {

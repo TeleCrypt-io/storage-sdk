@@ -178,7 +178,7 @@ describe("sharing", () => {
     }
   });
 
-  it("3.5 uninvited user cannot see the folder", async () => {
+  it("3.5 uninvited user cannot see the vault", async () => {
     const aliceUser = await registerTestUser("share_a");
     const charlieUser = await registerTestUser("share_c");
     const alice = await createTestClient(aliceUser);

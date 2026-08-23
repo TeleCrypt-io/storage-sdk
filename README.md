@@ -5,7 +5,7 @@
 End-to-end encrypted file storage and sharing, built on Matrix.
 
 Files are encrypted on the client before upload. The server stores only opaque ciphertext and
-never holds the decryption keys. Shared folders let multiple people add and read files, and a
+never holds the decryption keys. Shared vaults let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
 This repository publishes the library package from protected exact-version tags with NPM Trusted
@@ -14,7 +14,7 @@ Publishing/OIDC provenance. The command-line client is maintained in its own rep
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.3.0
+npm install @telecrypt-io/storage@0.4.0
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
@@ -30,8 +30,8 @@ import * as core from "@telecrypt-io/storage/core";
 const storage = await TeleCryptIOStorage.create({
   baseUrl, userId, accessToken, deviceId,
 });
-const folder = await core.createFolder(storage, "Photos");
-await core.uploadFile(storage, folder.id, "cat.jpg", bytes, "image/jpeg");
+const vault = await core.createVault(storage, "Photos");
+await core.uploadFile(storage, vault.id, "cat.jpg", bytes, "image/jpeg");
 ```
 
 The command-line client is sourced by
@@ -44,10 +44,10 @@ application is sourced by
 Built on [MSC3089](https://github.com/matrix-org/matrix-spec-proposals/pull/3089), which models
 a file tree using Matrix primitives:
 
-| File-system concept | Matrix concept |
+| Storage concept | Matrix concept |
 |---|---|
-| Folder | A Space (room marked as a file tree) |
-| Subfolder | A child Space |
+| Vault | A Space (room marked as a file tree) |
+| Folder | A child Space |
 | File | An event pointing at encrypted uploaded content |
 | Version | A newer event superseding the old |
 | Sharing | Room invitation |

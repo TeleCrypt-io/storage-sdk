@@ -15,10 +15,12 @@ import { StorageError } from "./errors.js";
 import { waitForCondition } from "./poll.js";
 import type {
   DownloadedFile,
-  FileDetails,
-  FileInfo,
   FolderDetails,
   FolderInfo,
+  FileDetails,
+  FileInfo,
+  VaultDetails,
+  VaultInfo,
   DeleteResult,
   JoinResult,
   Member,
@@ -71,24 +73,24 @@ async function withRateLimitRetry<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Resolves a folder by ID, polling briefly: a room this same account just
+ * Resolves a vault or folder by ID, polling briefly: a room this same account just
  * created (or was just invited to, by another process/session) can be
  * momentarily absent from a from-scratch `/sync` before showing up moments
  * later — real async settling, not an instant "not found". Throws a clean
- * error if the folder still isn't visible once the poll times out.
+ * error if the storage tree still isn't visible once the poll times out.
  */
-async function resolveTree(storage: TeleCryptIOStorage, folderId: string): Promise<TreeSpace> {
+async function resolveTree(storage: TeleCryptIOStorage, treeId: string): Promise<TreeSpace> {
   try {
-    return await waitForCondition(() => storage.getTree(folderId), {
+    return await waitForCondition(() => storage.getTree(treeId), {
       timeoutMs: 15000,
     });
   } catch {
-    throw new StorageError(`folder not found: ${folderId}`);
+    throw new StorageError(`storage space not found: ${treeId}`);
   }
 }
 
 /** As `resolveTree`, but for a specific file within an already-resolved
- * folder — covers the same settling window for a file another
+ * vault or folder — covers the same settling window for a file another
  * process/session just uploaded. */
 async function resolveFile(tree: TreeSpace, fileId: string): Promise<FileBranch> {
   try {
@@ -102,32 +104,32 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
-export async function createFolder(storage: TeleCryptIOStorage, name: string): Promise<FolderInfo> {
+export async function createVault(storage: TeleCryptIOStorage, name: string): Promise<VaultInfo> {
   const tree = await withRateLimitRetry(() => storage.createTree(name));
   return { id: tree.id, name };
 }
 
-/** Top-level folders only — excludes subdirectories of an existing tree. */
-export async function listFolders(storage: TeleCryptIOStorage): Promise<FolderInfo[]> {
+/** Top-level vaults only — excludes subdirectories of an existing tree. */
+export async function listVaults(storage: TeleCryptIOStorage): Promise<VaultInfo[]> {
   const trees = await storage.listTrees();
   return trees.filter((t) => t.isTopLevel).map((t) => ({ id: t.id, name: t.room.name }));
 }
 
-/** Current account's effective role for a folder, or null while it is unavailable. */
-export function getMyFolderRole(storage: TeleCryptIOStorage, folderId: string): string | null {
+/** Current account's effective role for a vault, or null while it is unavailable. */
+export function getMyVaultRole(storage: TeleCryptIOStorage, vaultId: string): string | null {
   const userId = storage.getClient().getUserId();
-  const tree = storage.getTree(folderId);
+  const tree = storage.getTree(vaultId);
   if (!userId || !tree) return null;
   return tree.getPermissions(userId);
 }
 
-export async function joinFolder(storage: TeleCryptIOStorage, folderId: string): Promise<JoinResult> {
+export async function joinVault(storage: TeleCryptIOStorage, vaultId: string): Promise<JoinResult> {
   try {
-    await withRateLimitRetry(() => storage.getClient().joinRoom(folderId));
+    await withRateLimitRetry(() => storage.getClient().joinRoom(vaultId));
   } catch (err) {
     throw new StorageError(`join failed: ${(err as Error).message}`);
   }
-  return { folderId, joined: true };
+  return { vaultId, joined: true };
 }
 
 function roomDisplayName(
@@ -145,9 +147,9 @@ function roomDisplayName(
 }
 
 /** Rooms where this account is invited and the room looks like a file tree. */
-export async function listPendingInvites(storage: TeleCryptIOStorage): Promise<FolderInfo[]> {
+export async function listPendingInvites(storage: TeleCryptIOStorage): Promise<VaultInfo[]> {
   const client = storage.getClient();
-  const invites: FolderInfo[] = [];
+  const invites: VaultInfo[] = [];
 
   for (const room of client.getRooms()) {
     if (room.getMyMembership() !== "invite") continue;
@@ -177,46 +179,46 @@ export async function listPendingInvites(storage: TeleCryptIOStorage): Promise<F
   return invites;
 }
 
-/** Decline a folder invite (same as leaving before join). */
+/** Decline a vault invite (same as leaving before join). */
 export async function declineInvite(
   storage: TeleCryptIOStorage,
-  folderId: string,
-): Promise<{ folderId: string; declined: boolean }> {
+  vaultId: string,
+): Promise<{ vaultId: string; declined: boolean }> {
   const client = storage.getClient();
   try {
     await withRateLimitRetry(async () => {
-      await client.leave(folderId);
+      await client.leave(vaultId);
       // The server only allows forgetting a room once this account's
       // membership is `leave`; forgetting removes the room from the local
       // store immediately, so a declined invite stops showing up in
-      // listFolders/listPendingInvites without waiting for the leave event
+      // listVaults/listPendingInvites without waiting for the leave event
       // to round-trip through the background sync loop.
-      await client.forget(folderId);
+      await client.forget(vaultId);
     });
   } catch (err) {
     throw new StorageError(`decline failed: ${(err as Error).message}`);
   }
-  return { folderId, declined: true };
+  return { vaultId, declined: true };
 }
 
 /**
- * Invites `userId` to the folder at `role` and applies the role's
+ * Invites `userId` to the vault at `role` and applies the role's
  * permissions. Doubles as "change an existing participant's role" (call
  * again with a different role): inviting someone who's already a member is
  * a 403 from the server, not a real failure — that specific error is
  * swallowed and the role change still applies. Any other invite failure
  * (e.g. unknown user) propagates.
  */
-export async function shareFolder(
+export async function shareVault(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  vaultId: string,
   userId: string,
   role: string,
 ): Promise<ShareResult> {
   if (role !== "viewer" && role !== "editor") {
     throw new StorageError(`invalid --role "${role}" (must be viewer or editor)`);
   }
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, vaultId);
   try {
     await withRateLimitRetry(() => tree.invite(userId));
   } catch (err) {
@@ -225,72 +227,91 @@ export async function shareFolder(
     }
   }
   await withRateLimitRetry(() => tree.setPermissions(userId, role));
-  return { folderId, userId, role };
+  return { vaultId, userId, role };
 }
 
-export async function unshareFolder(
+export async function unshareVault(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  vaultId: string,
   userId: string,
 ): Promise<UnshareResult> {
-  await resolveTree(storage, folderId);
+  await resolveTree(storage, vaultId);
   try {
     await withRateLimitRetry(() =>
-      storage.getClient().kick(folderId, userId, "unshared"),
+      storage.getClient().kick(vaultId, userId, "unshared"),
     );
   } catch (err) {
     throw new StorageError(`unshare failed: ${(err as Error).message}`);
   }
-  return { folderId, userId, removed: true };
+  return { vaultId, userId, removed: true };
 }
 
-export async function listMembers(storage: TeleCryptIOStorage, folderId: string): Promise<Member[]> {
-  const tree = await resolveTree(storage, folderId);
+export async function listMembers(storage: TeleCryptIOStorage, vaultId: string): Promise<Member[]> {
+  const tree = await resolveTree(storage, vaultId);
   return withRateLimitRetry(() => storage.listMembers(tree));
 }
 
-export async function listFiles(storage: TeleCryptIOStorage, folderId: string): Promise<FileInfo[]> {
-  const tree = await resolveTree(storage, folderId);
-  await storage.refreshRoomState(folderId);
+export async function listFiles(storage: TeleCryptIOStorage, treeId: string): Promise<FileInfo[]> {
+  const tree = await resolveTree(storage, treeId);
+  await storage.refreshRoomState(treeId);
   return tree.listFiles().map((f) => ({ id: f.id, name: f.getName() }));
 }
 
+/** Lists the direct child folders of a vault or folder. */
 export async function listSubfolders(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  parentId: string,
 ): Promise<FolderInfo[]> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, parentId);
   return tree.getDirectories().map((d) => ({ id: d.id, name: d.room.name }));
 }
 
 export async function createSubfolder(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  parentId: string,
   name: string,
 ): Promise<FolderInfo> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, parentId);
   const sub = await withRateLimitRetry(() => storage.createSubtree(tree, name));
   return { id: sub.id, name };
 }
 
+async function renameTree(
+  storage: TeleCryptIOStorage,
+  treeId: string,
+  name: string,
+): Promise<RenameResult> {
+  const tree = await resolveTree(storage, treeId);
+  await withRateLimitRetry(() => tree.setName(name));
+  return { id: treeId, name };
+}
+
+/** Renames a top-level Vault. */
+export async function renameVault(
+  storage: TeleCryptIOStorage,
+  vaultId: string,
+  name: string,
+): Promise<RenameResult> {
+  return renameTree(storage, vaultId, name);
+}
+
+/** Renames a nested folder. */
 export async function renameFolder(
   storage: TeleCryptIOStorage,
   folderId: string,
   name: string,
 ): Promise<RenameResult> {
-  const tree = await resolveTree(storage, folderId);
-  await withRateLimitRetry(() => tree.setName(name));
-  return { id: folderId, name };
+  return renameTree(storage, folderId, name);
 }
 
-export async function deleteFolder(
+async function deleteTree(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
 ): Promise<DeleteResult> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   // `tree.delete()` kicks members and leaves this room AND every
   // subdirectory room, but never forgets any of them, so they all linger in
-  // the local store and listFolders keeps returning the deleted folder until
+  // the local store and tree listings keep returning the deleted tree until
   // the leave events round-trip through the background sync loop (30-60s
   // under full-suite load). Forgetting removes each room from the local
   // store immediately; the server only accepts a forget once membership is
@@ -299,21 +320,37 @@ export async function deleteFolder(
   const client = storage.getClient();
   await withRateLimitRetry(async () => {
     await tree.delete();
-    await client.forget(folderId);
+    await client.forget(treeId);
     for (const subId of subdirectoryIds) {
       await client.forget(subId);
     }
   });
-  return { id: folderId, deleted: true };
+  return { id: treeId, deleted: true };
+}
+
+/** Deletes a top-level Vault. */
+export async function deleteVault(
+  storage: TeleCryptIOStorage,
+  vaultId: string,
+): Promise<DeleteResult> {
+  return deleteTree(storage, vaultId);
+}
+
+/** Deletes a nested folder. */
+export async function deleteFolder(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<DeleteResult> {
+  return deleteTree(storage, folderId);
 }
 
 export async function renameFile(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
   fileId: string,
   name: string,
 ): Promise<RenameResult> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   const branch = await resolveFile(tree, fileId);
   await withRateLimitRetry(() => branch.setName(name));
   // `setName` resolves when the homeserver accepts the state event, but a
@@ -332,10 +369,10 @@ export async function renameFile(
 
 export async function deleteFile(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
   fileId: string,
 ): Promise<DeleteResult> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   const branch = await resolveFile(tree, fileId);
   await withRateLimitRetry(() => branch.delete());
   return { id: fileId, deleted: true };
@@ -343,12 +380,12 @@ export async function deleteFile(
 
 export async function uploadFile(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
   name: string,
   bytes: Uint8Array,
   mimetype: string,
 ): Promise<FileInfo> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   const fileId = await withRateLimitRetry(() =>
     storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype),
   );
@@ -357,10 +394,10 @@ export async function uploadFile(
 
 export async function downloadFile(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
   fileId: string,
 ): Promise<DownloadedFile> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   const branch = await resolveFile(tree, fileId);
   let result;
   try {
@@ -393,10 +430,10 @@ function tsToIso(ts: number | undefined | null): string | null {
 
 export async function getFileDetails(
   storage: TeleCryptIOStorage,
-  folderId: string,
+  treeId: string,
   fileId: string,
 ): Promise<FileDetails> {
-  const tree = await resolveTree(storage, folderId);
+  const tree = await resolveTree(storage, treeId);
   const branch = await resolveFile(tree, fileId);
   const name = branch.getName();
   let mimetype: string | null = null;
@@ -435,13 +472,13 @@ export async function getFileDetails(
   return { name, mimetype, size, createdAt, updatedAt };
 }
 
-export async function getFolderDetails(
+async function getTreeDetails(
   storage: TeleCryptIOStorage,
-  folderId: string,
-): Promise<FolderDetails> {
-  const tree = await resolveTree(storage, folderId);
+  treeId: string,
+): Promise<VaultDetails> {
+  const tree = await resolveTree(storage, treeId);
   const client = storage.getClient();
-  const room = client.getRoom(folderId);
+  const room = client.getRoom(treeId);
   let createdAt: string | null = null;
   let memberCount: number | null = null;
 
@@ -456,9 +493,25 @@ export async function getFolderDetails(
   }
 
   return {
-    name: tree.room.name || roomDisplayName(storage, folderId),
-    id: folderId,
+    name: tree.room.name || roomDisplayName(storage, treeId),
+    id: treeId,
     createdAt,
     memberCount,
   };
+}
+
+/** Returns details for a top-level Vault. */
+export async function getVaultDetails(
+  storage: TeleCryptIOStorage,
+  vaultId: string,
+): Promise<VaultDetails> {
+  return getTreeDetails(storage, vaultId);
+}
+
+/** Returns details for a nested folder. */
+export async function getFolderDetails(
+  storage: TeleCryptIOStorage,
+  folderId: string,
+): Promise<FolderDetails> {
+  return getTreeDetails(storage, folderId);
 }
