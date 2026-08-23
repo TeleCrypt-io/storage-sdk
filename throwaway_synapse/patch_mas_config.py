@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Patches a `mas-cli config generate` output in place for the throwaway
 dev/test stack: points it at the throwaway Postgres + Synapse containers,
-sets its externally-reachable public_base/issuer, and relaxes the dynamic
-client registration policy to allow http/localhost redirect URIs (this is a
+sets its same-origin public_base/issuer, and relaxes the dynamic client
+registration policy to allow http/localhost redirect URIs (this is a
 disposable dev instance we own, never production).
 
 Usage: patch_mas_config.py <config.yaml> <shared_secret>
@@ -33,12 +33,10 @@ content = re.sub(
     flags=re.M,
 )
 
-# http: public_base/issuer must be reachable directly by both the Node test
-# process/CLI and a real browser (UI E2E) — a plain host port is simplest for
-# local dev/test and needs no path-prefix rewriting, unlike production's
-# same-origin /auth/ path behind Caddy.
-content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8082/", content, flags=re.M)
-content = re.sub(r"^  issuer: .*$", "  issuer: http://localhost:8082/", content, flags=re.M)
+# http: public_base/issuer match the single homeserver origin. Caddy exposes
+# this MAS root under /auth and strips that prefix before forwarding.
+content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8008/auth/", content, flags=re.M)
+content = re.sub(r"^  issuer: .*$", "  issuer: http://localhost:8008/auth/", content, flags=re.M)
 
 # database: the default max_connections: 10 was observed to be too tight
 # under the full functional suite's concurrency (8 vitest files in parallel,
@@ -51,12 +49,14 @@ content = re.sub(r"^  max_connections: .*$", "  max_connections: 50", content, f
 # http/localhost redirect URIs and mismatched hosts freely — never do this on
 # a production MAS.
 #
-# rate_limiting: a functional test suite hammers /login from one IP far
-# harder than MAS's sane production defaults (login.per_ip burst 3 /
-# 0.05 per_second) allow — every registerTestUser() call logs in immediately
-# after registering. Mirrors throwaway_synapse/homeserver.extra.yaml's own
-# generous rc_login override; same "disposable dev/test instance" rationale.
+# rate_limiting: functional tests issue many authentication requests from one
+# local IP. Relax the development MAS rate limits only for this disposable
+# workload; production retains its own policy.
 content += """
+account:
+  password_registration_enabled: true
+  registration_token_required: false
+  password_registration_email_required: false
 policy:
   data:
     client_registration:

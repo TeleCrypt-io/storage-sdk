@@ -1,13 +1,17 @@
-# Front door for the throwaway MAS-delegated Synapse stack. Matches the
-# shape of a real MSC3861 deployment (compatibility mode): the homeserver
-# origin (this) serves everything EXCEPT the three Matrix C-S API endpoints
-# that MAS's docs say must be proxied to it directly — MAS's compat resource
-# handles those, Synapse no longer serves them once
-# `matrix_authentication_service.enabled: true` is set.
+# Front door for the throwaway MAS-delegated Synapse stack. The homeserver
+# origin serves Matrix and MAS endpoints from one origin; Synapse delegates
+# authentication to MAS.
 # See https://element-hq.github.io/matrix-authentication-service/setup/homeserver.html
 :8008 {
-	@compat path /_matrix/client/*/login /_matrix/client/*/logout /_matrix/client/*/refresh
-	handle @compat {
+	# MAS advertises http://localhost:8008/auth/ as its public origin. Strip
+	# that public prefix before forwarding to MAS's root-mounted listener.
+	redir /auth /auth/ 308
+	handle_path /auth/* {
+		reverse_proxy throwaway-mas:8080
+	}
+
+	@mas_auth path /_matrix/client/*/logout /_matrix/client/*/refresh
+	handle @mas_auth {
 		reverse_proxy throwaway-mas:8080
 	}
 	handle {

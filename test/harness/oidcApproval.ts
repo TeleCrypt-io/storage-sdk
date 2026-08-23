@@ -1,23 +1,22 @@
 /**
  * Approves a device grant against the disposable local MAS through its real
  * browser forms. This is test infrastructure only: the password is used
- * solely to approve MAS OAuth, never by the SDK or Matrix's compatibility
- * login endpoint.
+ * solely to approve MAS OAuth, never by the SDK's production login flow.
  */
-const MAS_BASE = new URL("http://localhost:8082/");
+const MAS_BASE = new URL("http://localhost:8008/auth/");
 
 function localMasUrl(location: string): URL {
   const url = new URL(location, MAS_BASE);
   if (url.origin !== MAS_BASE.origin || url.username || url.password) {
     throw new Error(`approveDeviceCode: refusing non-local MAS URL ${location}`);
   }
+  if (!url.pathname.startsWith(MAS_BASE.pathname)) {
+    throw new Error(`approveDeviceCode: refusing non-MAS URL ${location}`);
+  }
   return url;
 }
 
 function extractCsrf(html: string): string {
-  // MAS 1.16 emits `<input type="hidden" name="csrf" value="…">`.
-  // Attribute order is not semantically meaningful, so do not couple this
-  // test-only browser-form adapter to one particular template serialization.
   for (const match of html.matchAll(/<input\b[^>]*>/gi)) {
     const input = match[0];
     const name = input.match(/\bname\s*=\s*(["'])(.*?)\1/i)?.[2];
@@ -26,6 +25,13 @@ function extractCsrf(html: string): string {
     if (value) return value;
   }
   throw new Error("approveDeviceCode: no CSRF token on MAS page");
+}
+
+function extractFormAction(html: string, fallback: URL): string {
+  const form = html.match(/<form\b[^>]*>/i)?.[0];
+  if (!form) throw new Error("approveDeviceCode: no form on MAS page");
+  const action = form.match(/\baction\s*=\s*(["'])(.*?)\1/i)?.[2];
+  return new URL(action || fallback.toString(), fallback).toString();
 }
 
 class CookieJar {
@@ -92,25 +98,32 @@ export async function approveDeviceCodeViaHttp(
 ): Promise<void> {
   const jar = new CookieJar();
 
-  let response = await jar.get("/login");
+  let response = await jar.get(new URL("login", MAS_BASE).toString());
   let csrf = extractCsrf(await response.text());
-  response = await jar.post("/login", { csrf, username, password });
+  response = await jar.post(new URL("login", MAS_BASE).toString(), { csrf, username, password });
   if (response.status !== 303) {
     throw new Error(`approveDeviceCode: login did not redirect (${response.status})`);
   }
   await jar.follow(response);
 
-  // MAS 1.16's `/link` form is a GET carrying only the user code; it has no
-  // CSRF field. Keep the generated URL local and let localMasUrl validate it.
-  const linkUrl = new URL("/link", MAS_BASE);
-  linkUrl.searchParams.set("code", userCode);
-  response = await jar.get(`${linkUrl.pathname}${linkUrl.search}`);
+  const linkUrl = new URL("link", MAS_BASE);
+  response = await jar.get(linkUrl.toString());
+  const linkHtml = await response.text();
+  if (response.status !== 200) {
+    throw new Error(`approveDeviceCode: device-link form failed (${response.status})`);
+  }
+  csrf = extractCsrf(linkHtml);
+  const linkAction = extractFormAction(linkHtml, linkUrl);
+  response = await jar.post(linkAction, { csrf, code: userCode });
   const devicePath = response.headers.get("location");
   if (response.status !== 303 || !devicePath) {
-    throw new Error(`approveDeviceCode: device-link did not redirect (${response.status})`);
+    throw new Error(`approveDeviceCode: device-link submission failed (${response.status})`);
   }
   response = await jar.follow(response);
 
+  if (response.status !== 200) {
+    throw new Error(`approveDeviceCode: consent form failed (${response.status})`);
+  }
   csrf = extractCsrf(await response.text());
   response = await jar.post(devicePath, { csrf, confirm_device: "on", action: "consent" });
   if (response.status !== 200) {

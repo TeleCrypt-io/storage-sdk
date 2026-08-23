@@ -5,16 +5,15 @@
 
 ## Distribution boundary
 
-`@telecrypt-io/storage@0.2.5` is the current library-only release. Install it as a project
+`@telecrypt-io/storage@0.3.0` is the current library release. Install it as a project
 dependency:
 
 ```bash
-npm install @telecrypt-io/storage@0.2.5
+npm install @telecrypt-io/storage@0.3.0
 ```
 
-Do not install it globally and do not expect a `telecrypt-io` command. The immutable legacy
-`@telecrypt-io/storage@0.1.3` package contained both the library and CLI, but that combined package
-must not be overwritten or used as the model for new releases.
+Do not install it globally and do not expect a `telecrypt-io` command. The command-line client is
+distributed separately.
 
 The standalone command-line client is distributed only through exact GitHub Release archives from
 `TeleCrypt-io/storage-cli`. The browser application is maintained in

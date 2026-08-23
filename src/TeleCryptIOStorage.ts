@@ -676,8 +676,7 @@ export class TeleCryptIOStorage {
         `downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)`,
       );
     }
-    // Belt-and-braces: if a future matrix-js-sdk version returns a
-    // placeholder without throwing, still fail with the clear message.
+    // Also reject an incomplete placeholder if matrix-js-sdk returns one.
     if (!info || typeof info.url !== "string") {
       throw new Error(
         "downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)",

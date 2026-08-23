@@ -26,7 +26,7 @@ import {
 import { OidcClient, WebStorageStateStore, type SigninRequestCreateArgs } from "oidc-client-ts";
 import type { AccessTokens, TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
 import type { IdTokenClaims } from "oidc-client-ts";
-import { CliError } from "./errors.js";
+import { StorageError } from "./errors.js";
 
 export type {
   OidcClientConfig,
@@ -58,10 +58,8 @@ export interface OidcTokenSet {
 }
 
 /**
- * Discovers the OIDC/MAS issuer + endpoints for a homeserver, via
- * `MatrixClient.getAuthMetadata()` (MSC2965 `/auth_metadata`, falling back to
- * the legacy `/auth_issuer` + issuer well-known) — the non-deprecated path
- * recommended over `discoverAndValidateOIDCIssuerWellKnown`.
+ * Discovers the OIDC/MAS issuer and endpoints for a homeserver via the
+ * Matrix client's authentication metadata endpoint.
  *
  * NODE CALLERS: this internally constructs oidc-client-ts state that
  * requires `window.sessionStorage`/`window.localStorage` to exist (a real
@@ -75,7 +73,7 @@ export async function discoverOidcIssuer(homeserverBaseUrl: string): Promise<Oid
   try {
     return await client.getAuthMetadata();
   } catch (err) {
-    throw new CliError(`OIDC discovery failed: ${(err as Error).message}`);
+    throw new StorageError(`OIDC discovery failed: ${(err as Error).message}`);
   }
 }
 
@@ -91,7 +89,7 @@ export async function registerClient(
   try {
     return await registerOidcClient(authMetadata, metadata);
   } catch (err) {
-    throw new CliError(`OIDC dynamic client registration failed: ${(err as Error).message}`);
+    throw new StorageError(`OIDC dynamic client registration failed: ${(err as Error).message}`);
   }
 }
 
@@ -266,30 +264,30 @@ export async function refreshOidcToken(
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new CliError(`OIDC token refresh failed (${res.status}): ${body}`);
+    throw new StorageError(`OIDC token refresh failed (${res.status}): ${body}`);
   }
   const data: unknown = await res.json();
   if (!data || typeof data !== "object") {
-    throw new CliError("OIDC token refresh returned an invalid response");
+    throw new StorageError("OIDC token refresh returned an invalid response");
   }
   const record = data as Record<string, unknown>;
   const accessToken = record.access_token;
   const nextRefreshToken = record.refresh_token;
   const expiresIn = record.expires_in;
   if (typeof accessToken !== "string" || accessToken.trim() === "") {
-    throw new CliError("OIDC token refresh returned no access token");
+    throw new StorageError("OIDC token refresh returned no access token");
   }
   if (
     nextRefreshToken !== undefined &&
     (typeof nextRefreshToken !== "string" || nextRefreshToken.trim() === "")
   ) {
-    throw new CliError("OIDC token refresh returned an invalid refresh token");
+    throw new StorageError("OIDC token refresh returned an invalid refresh token");
   }
   if (
     expiresIn !== undefined &&
     (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn < 0)
   ) {
-    throw new CliError("OIDC token refresh returned an invalid expiry");
+    throw new StorageError("OIDC token refresh returned an invalid expiry");
   }
   return {
     accessToken,
