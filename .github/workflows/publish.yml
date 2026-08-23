@@ -28,6 +28,14 @@ jobs:
         run: |
           test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
 
+      - name: Require release commit to be contained in refreshed main
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main
+          release_commit="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          test "$(git rev-parse HEAD)" = "$release_commit"
+          git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+
       - name: Set up Node.js
         uses: actions/setup-node@v6.4.0
         with:

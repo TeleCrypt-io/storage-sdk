@@ -69,6 +69,20 @@ else
   podman start "$DB" >/dev/null 2>&1 || true
 fi
 
+DB_STATUS="$(podman inspect --format '{{.State.Status}}' "$DB" 2>/dev/null || true)"
+DB_IP="$(podman inspect --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$DB" 2>/dev/null || true)"
+if [[ "$DB_STATUS" != "running" || ! "$DB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  echo "ERROR: PostgreSQL did not expose a running container with a valid IPv4 address" >&2
+  exit 1
+fi
+IFS=. read -r -a DB_OCTETS <<< "$DB_IP"
+for octet in "${DB_OCTETS[@]}"; do
+  if (( 10#$octet > 255 )); then
+    echo "ERROR: PostgreSQL container IPv4 address is invalid" >&2
+    exit 1
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # 2. Synapse base config plus the matrix_authentication_service delegation
 #    block appended.
@@ -121,10 +135,9 @@ fi
 #    startup — no separate migrate step needed.
 # ---------------------------------------------------------------------------
 podman rm -f "$MAS" >/dev/null 2>&1 || true
-# Keep the direct port for local health/debug; advertised MAS URLs use :8008/auth.
-echo "==> starting MAS ($MAS) on :8082 (health/debug only)"
+echo "==> starting MAS ($MAS)"
 podman run -d --name "$MAS" --network "$NET" \
-  -p 8082:8080 \
+  --add-host "$DB:$DB_IP" \
   -v "$DATA/mas:/data:Z" \
   "$MAS_IMG" server -c /data/config.yaml >/dev/null
 
@@ -134,7 +147,6 @@ podman run -d --name "$MAS" --network "$NET" \
 podman rm -f "$SYN" >/dev/null 2>&1 || true
 echo "==> starting Synapse ($SYN)"
 podman run -d --name "$SYN" --network "$NET" \
-  -p 8009:8008 \
   -v "$DATA/synapse:/data:Z" \
   "$SYN_IMG" >/dev/null
 
@@ -178,7 +190,6 @@ for i in $(seq 1 60); do
   if curl -fsS -m2 "http://localhost:8008/_matrix/client/versions" >/dev/null 2>&1; then
     echo " — ready"
     echo "Homeserver (via front door) is up at http://localhost:8008"
-    echo "MAS health/debug endpoint is at http://localhost:8082"
     exit 0
   fi
   echo -n "."
