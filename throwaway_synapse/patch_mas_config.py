@@ -53,6 +53,10 @@ content = re.sub(r"^  max_connections: .*$", "  max_connections: 50", content, f
 # local IP. Relax the development MAS rate limits only for this disposable
 # workload; production retains its own policy.
 content += """
+account:
+  password_registration_enabled: true
+  registration_token_required: false
+  password_registration_email_required: false
 policy:
   data:
     client_registration:
