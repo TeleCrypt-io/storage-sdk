@@ -58,10 +58,12 @@ export async function registerUserInMas(username: string, password: string): Pro
       await execFileAsync("podman", args);
       return;
     } catch (err) {
-      const e = err as { stdout?: string; stderr?: string; message: string };
-      const message = e.stderr || e.stdout || e.message;
-      if (!message.includes("Temporary failure in name resolution") || attempt === 3) {
-        throw new Error(`mas-cli register-user failed for "${username}": ${message}`);
+      const e = err as { stdout?: unknown; stderr?: unknown };
+      const output = [e.stderr, e.stdout].filter((value): value is string => typeof value === "string").join("\n");
+      if (!output.includes("Temporary failure in name resolution") || attempt === 3) {
+        // Do not propagate execFile's message or command output: both may
+        // contain the generated --password argument.
+        throw new Error("mas-cli register-user failed");
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }

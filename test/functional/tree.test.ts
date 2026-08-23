@@ -1,3 +1,6 @@
+// 1.10 restarts a client with the same persistent crypto store. Node has no
+// native IndexedDB, so provide the same per-file polyfill as versions.test.
+import "fake-indexeddb/auto";
 import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
@@ -262,7 +265,11 @@ describe("tree operations", () => {
 
   it("1.10 fresh client for the same user can find a tree via listTrees", async () => {
     const user = await registerTestUser("tree");
-    const clientA = await createTestClient(user);
+    // Reuse the same device's persisted crypto state across the restart. An
+    // in-memory store would make clientB advertise a fresh set of one-time
+    // keys under the same Matrix device ID, which the server correctly
+    // rejects as a collision.
+    const clientA = await createTestClient(user, { useIndexedDB: true });
     let treeId: string;
     try {
       const storageA = new TeleCryptIOStorage(clientA);
@@ -281,8 +288,8 @@ describe("tree operations", () => {
       stopTestClient(clientA);
     }
 
-    // Fresh client, same user
-    const clientB = await createTestClient(user);
+    // Fresh client, same user and device; reconnect using clientA's store.
+    const clientB = await createTestClient(user, { useIndexedDB: true });
     try {
       const storageB = new TeleCryptIOStorage(clientB);
       const treesB = await waitFor<MSC3089TreeSpace[]>(
