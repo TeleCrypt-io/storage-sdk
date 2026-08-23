@@ -53,6 +53,7 @@ if [[ ! -f "$SECRET_FILE" ]]; then
   echo "==> generating MAS<->Synapse shared secret"
   openssl rand -hex 32 > "$SECRET_FILE"
 fi
+chmod 600 "$SECRET_FILE"
 SHARED_SECRET="$(cat "$SECRET_FILE")"
 
 # ---------------------------------------------------------------------------

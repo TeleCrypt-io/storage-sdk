@@ -7,6 +7,7 @@ export default defineConfig({
       "test/oidcApproval.test.ts",
       "test/oidc-refresh.test.ts",
       "test/recovery-callback.test.ts",
+      "test/users.test.ts",
     ],
   },
 });
