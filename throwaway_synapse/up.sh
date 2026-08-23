@@ -17,6 +17,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+# shellcheck disable=SC1091
+source ./fixture-common.sh
 
 SYN_IMG="ghcr.io/element-hq/synapse:v1.159.0"
 MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.23.0"
@@ -38,9 +40,7 @@ if [[ "${1:-}" == "--fresh" ]]; then
   podman rm -f "$SYN" "$MAS" "$DB" "$PROXY" >/dev/null 2>&1 || true
   podman volume rm -f "$PGVOL" >/dev/null 2>&1 || true
   podman network rm "$NET" >/dev/null 2>&1 || true
-  # Data is owned by the container-mapped UID under rootless podman, so a plain
-  # host `rm` is denied. Delete inside the user namespace instead.
-  podman unshare rm -rf "$DATA" 2>/dev/null || rm -rf "$DATA"
+  remove_fixture_data "--fresh" "$DATA"
 fi
 
 mkdir -p "$DATA/synapse" "$DATA/mas"

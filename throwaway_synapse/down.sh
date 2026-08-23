@@ -7,6 +7,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+# shellcheck disable=SC1091
+source ./fixture-common.sh
 
 NET="throwaway-net"
 DB="throwaway-mas-db"
@@ -14,6 +16,7 @@ MAS="throwaway-mas"
 SYN="throwaway-synapse"
 PROXY="throwaway-proxy"
 PGVOL="throwaway-mas-pgdata"
+DATA="$PWD/data"
 
 for name in "$PROXY" "$SYN" "$MAS" "$DB"; do
   podman rm -f "$name" >/dev/null 2>&1 && echo "==> removed $name" || echo "==> $name was not running"
@@ -24,8 +27,6 @@ fi
 
 if [[ "${1:-}" == "--wipe" ]]; then
   podman volume rm -f "$PGVOL" >/dev/null 2>&1 || true
-  # Data is owned by the container-mapped UID (rootless podman); delete inside
-  # the user namespace so the host user is allowed to remove it.
-  podman unshare rm -rf "$PWD/data" 2>/dev/null || rm -rf "$PWD/data"
+  remove_fixture_data "--wipe" "$DATA"
   echo "==> wiped ./data and Postgres volume"
 fi
