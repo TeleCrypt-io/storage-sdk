@@ -11,13 +11,19 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    env:
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+      GIT_CONFIG_KEY_1: advice.detachedHead
+      GIT_CONFIG_VALUE_1: "false"
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v6.4.0
         with:
           node-version: "22.14.0"
           cache: npm
-      - run: npm ci
+      - run: npm ci --no-fund
       - run: npm run lint
       - run: npm run test:unit
       - run: npm run build
