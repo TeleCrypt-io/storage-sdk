@@ -576,11 +576,11 @@ jobs:
           asset_id="$(jq -er --arg name "$asset_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
           downloaded="$RUNNER_TEMP/downloaded.tgz"
           set +e
-          python3 scripts/bounded-command.py --stdout "$downloaded.stdout" --stderr "$downloaded.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' --output "$downloaded" "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          python3 scripts/bounded-command.py --stdout "$downloaded" --stderr "$downloaded.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
           status="$?"
           set -e
           test "$status" = 0
-          test "$(wc -c <"$downloaded.err")" -le 131072 -a ! -s "$downloaded.err" -a ! -s "$downloaded.stdout"
+          test "$(wc -c <"$downloaded.err")" -le 131072 -a ! -s "$downloaded.err"
           test "$(wc -c <"$downloaded")" = "$EXPECTED_SIZE"
           test "sha256:$(sha256sum "$downloaded" | awk '{print $1}')" = "$EXPECTED_DIGEST"
           cmp -s "$archive" "$downloaded"
@@ -588,17 +588,17 @@ jobs:
           record_id="$(jq -er --arg name "$record_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
           downloaded_record="$RUNNER_TEMP/downloaded.integrity.json"
           set +e
-          python3 scripts/bounded-command.py --stdout "$downloaded_record.stdout" --stderr "$downloaded_record.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' --output "$downloaded_record" "repos/$GITHUB_REPOSITORY/releases/assets/$record_id"
+          python3 scripts/bounded-command.py --stdout "$downloaded_record" --stderr "$downloaded_record.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$record_id"
           status="$?"
           set -e
-          test "$status" = 0 -a "$(wc -c <"$downloaded_record.err")" -le 131072 -a ! -s "$downloaded_record.err" -a ! -s "$downloaded_record.stdout"
+          test "$status" = 0 -a "$(wc -c <"$downloaded_record.err")" -le 131072 -a ! -s "$downloaded_record.err"
           verify_record "$downloaded_record"
           version="${RELEASE_TAG#v}"
           registry_status="$RUNNER_TEMP/npm-registry.status"
           registry_body="$RUNNER_TEMP/npm-registry.body"
           registry_err="$registry_body.err"
           set +e
-          python3 scripts/bounded-command.py --stdout "$registry_status" --stderr "$registry_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --max-time 120s --connect-timeout 20s --max-filesize 131072 --output "$registry_body" --write-out '%{http_code}' "https://registry.npmjs.org/@telecrypt-io%2fstorage/$version"
+          python3 scripts/bounded-command.py --stdout "$registry_status" --stderr "$registry_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --max-time 120 --connect-timeout 20 --max-filesize 131072 --output "$registry_body" --write-out '%{http_code}' "https://registry.npmjs.org/@telecrypt-io%2fstorage/$version"
           registry_curl_status="$?"
           set -e
           test "$registry_curl_status" = 0

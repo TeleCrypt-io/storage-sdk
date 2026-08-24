@@ -282,6 +282,8 @@ def check_workflow_operations() -> None:
         raise ContractError("registry existence check is missing")
     if "curl" not in publish or "'%{http_code}'" not in publish or "https://registry.npmjs.org/@telecrypt-io%2fstorage/" not in publish:
         raise ContractError("npm existence check is not a machine-confirmed registry status")
+    if '--output "$downloaded"' in publish or '--output "$downloaded_record"' in publish or "--max-time 120s" in publish:
+        raise ContractError("binary release readback or curl timeout uses an unsupported option")
     if PACKAGE.get("packageManager") != "npm@10.9.8" or PACKAGE.get("engines", {}).get("node") != "22.23.2":
         raise ContractError("package.json does not declare the exact toolchain")
     if "npm ci --ignore-scripts --no-fund --no-audit" not in build:
