@@ -266,6 +266,29 @@ describe("operation safety", () => {
     expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(client.leave.mock.invocationCallOrder[0]);
   });
 
+  it("uses stripped invite state when Synapse forbids pre-join room reads", async () => {
+    const leave = vi.fn().mockResolvedValue(undefined);
+    const forget = vi.fn().mockResolvedValue(undefined);
+    const removeRoom = vi.fn();
+    const room = reviewedInviteRoom({ getMyMembership: () => "invite" });
+    const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+    const storage = {
+      getClient: () => ({ getRoom: () => room, leave, forget, store: { removeRoom } }),
+      getTree: () => null,
+      refreshRoomState,
+      getRoomMembership: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(declineInvite(storage, "!invite-prejoin:example.test")).resolves.toEqual({
+      vaultId: "!invite-prejoin:example.test",
+      declined: true,
+    });
+    expect(refreshRoomState).not.toHaveBeenCalled();
+    expect(leave).toHaveBeenCalledWith("!invite-prejoin:example.test");
+    expect(forget).toHaveBeenCalledWith("!invite-prejoin:example.test");
+    expect(removeRoom).toHaveBeenCalledWith("!invite-prejoin:example.test");
+  });
+
   it("fails closed when invite membership cannot be re-read", async () => {
     const client = {
       getRoom: vi.fn(() => undefined),
@@ -437,6 +460,20 @@ describe("operation safety", () => {
       joined: true,
     });
     expect(joinRoom).not.toHaveBeenCalled();
+  });
+
+  it("attempts a join when Synapse hides invite membership behind M_FORBIDDEN", async () => {
+    const joinRoom = vi.fn().mockResolvedValue(undefined);
+    const storage = {
+      getRoomMembership: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
+      getClient: () => ({ joinRoom }),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(joinVault(storage, "!invited:example.test")).resolves.toEqual({
+      vaultId: "!invited:example.test",
+      joined: true,
+    });
+    expect(joinRoom).toHaveBeenCalledWith("!invited:example.test");
   });
 
   it("suppresses join M_FORBIDDEN only after authoritative recheck confirms join", async () => {

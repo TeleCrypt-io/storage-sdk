@@ -22,13 +22,13 @@ content = content.replace(
 )
 
 # matrix: server_name must match Synapse's SYNAPSE_SERVER_NAME (up.sh uses
-# "localhost"); secret must match Synapse's matrix_authentication_service.secret;
+# "localhost:8008"); secret must match Synapse's matrix_authentication_service.secret;
 # endpoint is the container-to-container address (internal network).
-content = re.sub(r"^  homeserver: .*$", "  homeserver: localhost", content, flags=re.M)
+content = re.sub(r"^  homeserver: .*$", "  homeserver: localhost:8008", content, flags=re.M)
 content = re.sub(r"^  secret: .*$", f'  secret: "{secret}"', content, flags=re.M)
 content = re.sub(
     r"^  endpoint: http://localhost:8008/$",
-    "  endpoint: http://throwaway-synapse:8008/",
+    "  endpoint: http://throwaway-synapse:7608/",
     content,
     flags=re.M,
 )

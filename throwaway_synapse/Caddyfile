@@ -23,6 +23,9 @@
 		reverse_proxy throwaway-mas:8080
 	}
 	handle {
-		reverse_proxy throwaway-synapse:8008
+		# Synapse generates its internal listener on 7608 when the logical
+		# server name includes the public :8008 port.  Keep that internal
+		# detail behind the single :8008 front door.
+		reverse_proxy throwaway-synapse:7608
 	}
 }

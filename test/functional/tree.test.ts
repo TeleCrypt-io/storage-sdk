@@ -180,7 +180,7 @@ describe("tree operations", () => {
       expect(found).toBeDefined();
       expect(found!.id).toBe(sub.id);
 
-      const missing = root.getDirectory("!nonexistent:localhost");
+      const missing = root.getDirectory("!nonexistent:localhost:8008");
       expect(missing).toBeUndefined();
     } finally {
       stopTestClient(client);

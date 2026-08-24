@@ -562,6 +562,26 @@ describe("Matrix 42 OAuth migration", () => {
     );
   });
 
+  it("accepts the MAS twenty-minute device-code lifetime", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        response({
+          device_code: "device",
+          user_code: "code",
+          verification_uri: "https://auth.example.test/device",
+          expires_in: 20 * 60,
+        }),
+      ),
+    );
+
+    await expect(startDeviceCodeLogin(OAUTH_METADATA, "client-id", "DEVICE123")).resolves.toMatchObject({
+      device_code: "device",
+      user_code: "code",
+      expires_in: 20 * 60,
+    });
+  });
+
   it("aborts a device authorization request that exceeds its deadline", async () => {
     vi.useFakeTimers();
     try {
@@ -635,7 +655,7 @@ describe("Matrix 42 OAuth migration", () => {
         device_code: "device-code",
         user_code: "ABCD",
         verification_uri: "https://auth.example.test/device",
-        expires_in: 901,
+        expires_in: 20 * 60 + 1,
       },
       undefined,
       "DEVICE123",

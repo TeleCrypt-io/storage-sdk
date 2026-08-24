@@ -105,7 +105,7 @@ if [[ ! -f "$DATA/synapse/homeserver.yaml" ]]; then
   echo "==> generating base Synapse config"
   podman run --rm \
     -v "$DATA/synapse:/data:Z" \
-    -e SYNAPSE_SERVER_NAME=localhost \
+    -e SYNAPSE_SERVER_NAME=localhost:8008 \
     -e SYNAPSE_REPORT_STATS=no \
     "$SYN_IMG" generate
 

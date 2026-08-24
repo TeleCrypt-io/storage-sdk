@@ -76,7 +76,7 @@ interface DeviceLogin {
 }
 
 function localpartFromUserId(userId: string): string {
-  const match = userId.match(/^@([^:]+):[^:]+$/);
+  const match = userId.match(/^@([^:]+):(.+)$/);
   if (!match) throw new Error(`invalid Matrix user id returned by MAS: ${userId}`);
   return match[1];
 }

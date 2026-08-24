@@ -741,9 +741,17 @@ export async function joinVault(
     let membership: string | null;
     try {
       membership = await storage.getRoomMembership(vaultId, undefined, { signal });
-    } catch {
+    } catch (err) {
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("join failed");
+      // Synapse refuses GET /rooms/:room/members for an invited user with
+      // M_FORBIDDEN. That response means the membership preflight cannot
+      // inspect the room yet; it is not evidence that joining is forbidden.
+      // Attempt the idempotent join and let its own response decide access.
+      if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
+        membership = null;
+      } else {
+        throw new StorageError("join failed");
+      }
     }
     if (membership === "join") return { vaultId, joined: true };
     try {
@@ -858,10 +866,19 @@ export async function declineInvite(
     try {
       const room = typeof client.getRoom === "function" ? client.getRoom(vaultId) : undefined;
       if (!room) throw new StorageError("decline failed");
+      const localMembership =
+        typeof (room as { getMyMembership?: unknown }).getMyMembership === "function"
+          ? (room as { getMyMembership: () => string | null }).getMyMembership()
+          : null;
       // Invites are destructive: refresh the exact room before validating its
       // space relation and local tree metadata. A stale sync snapshot could
       // otherwise make a now-nested or unrelated room look safe to forget.
-      await storage.refreshRoomState(vaultId, { signal });
+      // Synapse deliberately rejects full-state reads for pre-join rooms, so
+      // an invite/knock must use the reviewed stripped state delivered with
+      // the invite; joined rooms still get the authoritative refresh.
+      if (localMembership !== "invite" && localMembership !== "knock") {
+        await storage.refreshRoomState(vaultId, { signal });
+      }
       const currentRoom = typeof client.getRoom === "function" ? client.getRoom(vaultId) : undefined;
       // Matrix 42's unstableGetFileTreeSpace() intentionally returns null for
       // invited rooms: it only constructs a tree after local membership is
@@ -875,7 +892,23 @@ export async function declineInvite(
       ) {
         throw new StorageError("decline failed");
       }
-      const membership = await storage.getRoomMembership(vaultId, undefined, { signal });
+      let membership: string | null;
+      try {
+        membership = await storage.getRoomMembership(vaultId, undefined, { signal });
+      } catch (error) {
+        // The membership endpoint is also forbidden for an invited user. The
+        // local pre-join membership is the server-delivered invite state that
+        // authorizes this narrowly scoped leave/forget operation.
+        if (
+          error instanceof MatrixError &&
+          error.errcode === "M_FORBIDDEN" &&
+          (localMembership === "invite" || localMembership === "knock")
+        ) {
+          membership = localMembership;
+        } else {
+          throw error;
+        }
+      }
       // Decline is intentionally narrower than delete/leave: it must never
       // remove an already-joined vault or forget an unrelated room ID.
       if (membership !== "invite" && membership !== "knock") {

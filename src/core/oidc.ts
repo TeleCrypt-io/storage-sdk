@@ -87,7 +87,9 @@ const MAX_OIDC_TOKEN_LENGTH = 8192;
 const MAX_OIDC_SCOPE_LENGTH = 4096;
 const MAX_OIDC_CONTACTS = 16;
 const MAX_OIDC_REDIRECT_URIS = 8;
-const MAX_DEVICE_EXPIRES_IN_SECONDS = 15 * 60;
+// MAS advertises a 20-minute device-code lifetime. Keep that provider window
+// as the hard upper bound while retaining a finite polling budget.
+const MAX_DEVICE_EXPIRES_IN_SECONDS = 20 * 60;
 const MAX_DEVICE_INTERVAL_SECONDS = 5 * 60;
 const MAX_DEVICE_POLL_DURATION_MS = MAX_DEVICE_EXPIRES_IN_SECONDS * 1000;
 const deviceAuthorizationDeviceIds = new WeakMap<object, string>();

@@ -82,7 +82,7 @@ describe("OIDC/MAS login", () => {
       expect(result.refresh_token).toBeTruthy();
 
       const who = await oidc.whoAmI(HOMESERVER, result.access_token);
-      expect(who.userId).toBe(`@${user.localpart}:localhost`);
+      expect(who.userId).toBe(`@${user.localpart}:localhost:8008`);
       expect(who.deviceId).toBe(deviceId);
 
       const storage = await TeleCryptIOStorage.createFromOidc({
@@ -138,7 +138,7 @@ describe("OIDC/MAS login", () => {
       // just "the endpoint returned a string" — by driving a real storage
       // operation with it, same bar as O.1.
       const who = await oidc.whoAmI(HOMESERVER, refreshed.accessToken);
-      expect(who.userId).toBe(`@${user.localpart}:localhost`);
+      expect(who.userId).toBe(`@${user.localpart}:localhost:8008`);
 
       // Also exercise `buildTokenRefreshFunction`'s persistence-hook wiring
       // directly — callers wire this into `createFromOidc`'s
