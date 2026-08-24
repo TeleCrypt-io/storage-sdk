@@ -13,6 +13,7 @@ import {
 } from "../src/TeleCryptIOStorage.js";
 import {
   declineInvite,
+  deleteFile,
   deleteVault,
   downloadFile as downloadCoreFile,
   joinVault,
@@ -52,6 +53,101 @@ function reviewedInviteRoom(extra: Record<string, unknown> = {}): Record<string,
 }
 
 describe("operation safety", () => {
+  function deletionFixture(history: Array<{ id: string; mediaId: string }>) {
+    const versions = history.map(({ id, mediaId }) => ({
+      id,
+      getFileInfo: vi.fn().mockResolvedValue({ info: { url: mediaId }, httpUrl: "https://matrix.invalid" }),
+    }));
+    versions[0].getVersionHistory = vi.fn().mockResolvedValue(versions);
+    const tree = makeTree("!delete-file:example.test", "Delete file", true);
+    tree.getFile = vi.fn().mockReturnValue(versions[0]);
+    const client = {
+      http: { authedRequest: vi.fn().mockResolvedValue({}) },
+      sendStateEvent: vi.fn().mockResolvedValue({}),
+      redactEvent: vi.fn().mockResolvedValue({}),
+    };
+    const storage = {
+      getTree: () => tree,
+      getClient: () => client,
+    } as unknown as TeleCryptIOStorage;
+    return { client, storage, tree, versions };
+  }
+
+  it("deletes every version's media before redacting its Matrix events", async () => {
+    const fixture = deletionFixture([
+      { id: "$v2", mediaId: "mxc://example.test/v2" },
+      { id: "$v1", mediaId: "mxc://example.test/v1" },
+    ]);
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).resolves.toEqual({
+      id: "$v2",
+      deleted: true,
+    });
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledWith(
+      "POST",
+      "/io.telecrypt.storage/delete_media",
+      undefined,
+      { media_ids: ["mxc://example.test/v2", "mxc://example.test/v1"] },
+      expect.objectContaining({ prefix: "/_matrix/client/unstable" }),
+    );
+    expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
+      fixture.client.sendStateEvent.mock.invocationCallOrder[0],
+    );
+    expect(fixture.client.sendStateEvent).toHaveBeenNthCalledWith(
+      1,
+      fixture.tree.id,
+      "org.matrix.msc3089.branch",
+      {},
+      "$v2",
+    );
+    expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
+  });
+
+  it("rejects a cyclic version chain before any media or event mutation", async () => {
+    const fixture = deletionFixture([{ id: "$v2", mediaId: "mxc://example.test/v2" }]);
+    fixture.versions[0].getVersionHistory.mockResolvedValue([
+      fixture.versions[0],
+      fixture.versions[0],
+    ]);
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toThrow(
+      "file version history contains a cycle",
+    );
+    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
+    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
+    expect(fixture.client.redactEvent).not.toHaveBeenCalled();
+  });
+
+  it("reports typed partial state when event cleanup fails after media deletion", async () => {
+    const fixture = deletionFixture([
+      { id: "$v2", mediaId: "mxc://example.test/v2" },
+      { id: "$v1", mediaId: "mxc://example.test/v1" },
+    ]);
+    fixture.client.redactEvent.mockRejectedValueOnce(new Error("redaction failed"));
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "delete file",
+      completedIds: [],
+    });
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
+    expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds the version chain before issuing a deletion request", async () => {
+    const fixture = deletionFixture(
+      Array.from({ length: 129 }, (_, index) => ({
+        id: `$v${index}`,
+        mediaId: `mxc://example.test/v${index}`,
+      })),
+    );
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v0")).rejects.toThrow(
+      "file version history is invalid or too large",
+    );
+    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
+  });
+
   it("bounds the pending-invite room inventory before iterating it", async () => {
     const storage = {
       getClient: () => ({ getRooms: () => Array.from({ length: 10_001 }, () => ({}) ) }),

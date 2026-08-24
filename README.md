@@ -99,8 +99,9 @@ after some versions. Delete empty child folders before deleting their parent. A 
 fails with `NonEmptyTreeError`, so a shared or nested tree is never removed implicitly.
 
 Encryption uses the same scheme as Matrix attachments (AES-CTR with a per-file key, keys
-distributed via the room's Megolm session). Requires no server-side changes — it runs against
-stock Synapse.
+distributed via the room's Megolm session). File deletion uses TeleCrypt's authenticated Synapse
+storage extension to remove the local media and thumbnail objects before Matrix redaction; stock
+Synapse without that extension cannot provide the SDK deletion contract.
 
 ## Development
 

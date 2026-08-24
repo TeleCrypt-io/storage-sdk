@@ -22,11 +22,14 @@ import {
   MatrixError,
   RoomCreateTypeField,
   RoomType,
+  UNSTABLE_MSC3089_BRANCH,
   UNSTABLE_MSC3088_ENABLED,
   UNSTABLE_MSC3088_PURPOSE,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
   type MatrixClient,
 } from "matrix-js-sdk";
+import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
+import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import {
   FileTooLargeError,
   MutationPartialError,
@@ -78,6 +81,7 @@ const RATE_LIMIT_MAX_DELAY_MS = 30_000;
 const RATE_LIMIT_MAX_TOTAL_DELAY_MS = 90_000;
 const MAX_DELETION_ROOMS = 4096;
 const MAX_DELETION_DEPTH = 128;
+const MAX_FILE_VERSION_CHAIN = 128;
 const MAX_LIST_ITEMS = 10000;
 const DEFAULT_MUTATION_TIMEOUT_MS = 5 * 60_000;
 const MAX_MUTATION_TIMEOUT_MS = 15 * 60_000;
@@ -1396,6 +1400,116 @@ export async function renameFile(
   }, "mutation");
 }
 
+interface FileVersionToDelete {
+  branch: FileBranch;
+  mediaId: string;
+}
+
+interface FileDeletionHttpTransport {
+  authedRequest: <T>(
+    method: Method,
+    path: string,
+    query?: undefined,
+    body?: unknown,
+    options?: { prefix?: string; abortSignal?: AbortSignal },
+  ) => Promise<T>;
+}
+
+/**
+ * Resolve the complete encrypted version chain before mutating Matrix.
+ *
+ * matrix-js-sdk returns the active version first and older versions after it.
+ * Treat a repeated event ID as a cycle/invalid relation graph, and bound both
+ * the event walk and the media identifiers sent to Synapse. Resolving every
+ * media URL first is important: a decryption or relation failure must not leave
+ * a partially deleted file chain.
+ */
+async function resolveFileVersions(
+  branch: FileBranch,
+  signal?: AbortSignal,
+): Promise<FileVersionToDelete[]> {
+  let history: FileBranch[];
+  try {
+    history = await branch.getVersionHistory();
+  } catch {
+    throw new StorageError("could not resolve file version history safely");
+  }
+  if (!Array.isArray(history) || history.length === 0 || history.length > MAX_FILE_VERSION_CHAIN) {
+    throw new StorageError("file version history is invalid or too large");
+  }
+
+  const eventIds = new Set<string>();
+  const mediaIds = new Set<string>();
+  const versions: FileVersionToDelete[] = [];
+  for (const version of history) {
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    if (!version || typeof version.id !== "string" || version.id.length === 0) {
+      throw new StorageError("file version history is invalid");
+    }
+    if (eventIds.has(version.id)) {
+      throw new StorageError("file version history contains a cycle");
+    }
+    eventIds.add(version.id);
+
+    let fileInfo: Awaited<ReturnType<FileBranch["getFileInfo"]>>;
+    try {
+      fileInfo = await version.getFileInfo();
+    } catch {
+      throw new StorageError("could not resolve encrypted file version safely");
+    }
+    const mediaId = fileInfo?.info?.url;
+    if (typeof mediaId !== "string" || mediaId.length === 0) {
+      throw new StorageError("encrypted file version has no media identifier");
+    }
+    mediaIds.add(mediaId);
+    if (mediaIds.size > MAX_FILE_VERSION_CHAIN) {
+      throw new StorageError("file media version history is too large");
+    }
+    versions.push({ branch: version, mediaId });
+  }
+  return versions;
+}
+
+function requireFileDeletionTransport(client: MatrixClient): FileDeletionHttpTransport {
+  const http = (client as unknown as { http?: FileDeletionHttpTransport }).http;
+  if (!http || typeof http.authedRequest !== "function") {
+    throw new StorageError("Matrix HTTP transport unavailable");
+  }
+  return http;
+}
+
+async function deleteFileMedia(
+  storage: TeleCryptIOStorage,
+  mediaIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const client = storage.getClient();
+  const http = requireFileDeletionTransport(client);
+  try {
+    await withRateLimitRetry(
+      () =>
+        withMatrixMutationAbort(
+          client,
+          () =>
+            http.authedRequest(
+              Method.Post,
+              "/io.telecrypt.storage/delete_media",
+              undefined,
+              { media_ids: [...mediaIds] },
+              { prefix: ClientPrefix.Unstable, abortSignal: signal },
+            ),
+          signal,
+          "delete file media",
+        ),
+      signal,
+    );
+  } catch (error) {
+    if (error instanceof MutationOutcomeUnknownError) throw error;
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    throw new StorageError("delete file media failed");
+  }
+}
+
 export async function deleteFile(
   storage: TeleCryptIOStorage,
   treeId: string,
@@ -1405,16 +1519,51 @@ export async function deleteFile(
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(tree, fileId, signal);
+    const versions = await resolveFileVersions(branch, signal);
+    const mediaIds = [...new Set(versions.map(({ mediaId }) => mediaId))];
+    await deleteFileMedia(storage, mediaIds, signal);
+
+    const completedIds: string[] = [];
     try {
       const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
-      await withRateLimitRetry(
-        () => client ? withMatrixMutationAbort(client, () => branch.delete(), signal) : branch.delete(),
-        signal,
-      );
+      if (!client) throw new StorageError("Matrix client unavailable");
+      for (const { branch: version } of versions) {
+        await withRateLimitRetry(
+          () =>
+            withMatrixMutationAbort(
+              client,
+              () => client.sendStateEvent(tree.id, UNSTABLE_MSC3089_BRANCH.name, {}, version.id),
+              signal,
+              "delete file state",
+            ),
+          signal,
+        );
+        await withRateLimitRetry(
+          () =>
+            withMatrixMutationAbort(
+              client,
+              () => client.redactEvent(tree.id, version.id),
+              signal,
+              "delete file event",
+            ),
+          signal,
+        );
+        completedIds.push(version.id);
+      }
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
-      if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("delete file failed");
+      if (signal.aborted) {
+        throw new MutationPartialError(
+          "delete file",
+          completedIds,
+          "media was deleted but Matrix event cleanup was cancelled",
+        );
+      }
+      throw new MutationPartialError(
+        "delete file",
+        completedIds,
+        "media was deleted but Matrix event cleanup stopped",
+      );
     }
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
