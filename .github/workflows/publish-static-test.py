@@ -226,8 +226,10 @@ def check_workflow_operations() -> None:
         "--method POST",
         "--field draft=true",
         "--method DELETE",
-        "--input \"$archive\"",
-        "Accept: application/octet-stream",
+        "bounded_upload",
+        "uploads.github.com",
+        "Authorization: Bearer",
+        "--data-binary \"@$input\"",
         "cmp -s \"$archive\"",
         "--method PATCH",
         "--field draft=false",
@@ -246,9 +248,9 @@ def check_workflow_operations() -> None:
             raise ContractError(f"release state machine is missing {fragment}")
     if release_shell.index("--method POST") > release_shell.index("--method DELETE"):
         raise ContractError("draft creation must precede asset replacement")
-    if release_shell.index("--method DELETE") > release_shell.index("--input \"$archive\""):
+    if release_shell.index("--method DELETE") > release_shell.index('bounded_upload "$RUNNER_TEMP/upload.json"'):
         raise ContractError("asset deletion must precede upload")
-    if release_shell.index("--input \"$archive\"") > release_shell.index("--method PATCH"):
+    if release_shell.index('bounded_upload "$RUNNER_TEMP/upload-record.json"') > release_shell.index("--method PATCH"):
         raise ContractError("publication must follow draft upload")
     if "release create" in WORKFLOW or "gh release create" in WORKFLOW or "--draft" in WORKFLOW:
         raise ContractError("one-shot Release creation remains")
