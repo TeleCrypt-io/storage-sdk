@@ -66,6 +66,21 @@ export interface RecoveryRestore {
   total: number;
 }
 
+/** One atomic recovery topology snapshot used to decide whether setup is safe. */
+export interface RecoveryStatus {
+  state: "unconfigured" | "ready" | "partial";
+  crossSigning: {
+    publicKeysOnDevice: boolean;
+    privateKeysCachedLocally: boolean;
+    privateKeysInSecretStorage: boolean;
+  };
+  secretStorage: {
+    ready: boolean;
+    defaultKeyId: string | null;
+  };
+  backupVersion: string | null;
+}
+
 export interface FileDetails {
   name: string;
   mimetype: string | null;

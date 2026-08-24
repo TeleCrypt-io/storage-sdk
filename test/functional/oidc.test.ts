@@ -8,7 +8,6 @@ import { describe, it, expect } from "vitest";
 import { registerAndWaitForMasProvisioning } from "../harness/users";
 import { approveDeviceCodeViaHttp } from "../harness/oidcApproval";
 import { waitFor } from "../harness/waitFor";
-import { withOidcWindowShim } from "../harness/oidcWindowShim.js";
 import * as oidc from "../../src/core/oidc.js";
 import * as core from "../../src/core/operations.js";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
@@ -42,8 +41,8 @@ async function runDeviceCodeLogin(
   deviceId: string,
   user: { localpart: string; password: string },
 ): Promise<{ authMetadata: oidc.OidcClientConfig; clientId: string; result: oidc.DeviceAccessTokenResponse }> {
-  // Discovery is the one OIDC call that needs a narrowly scoped `window` shim under Node.
-  const authMetadata = await withOidcWindowShim(() => oidc.discoverOidcIssuer(HOMESERVER));
+  // Matrix 42 discovery is a plain metadata fetch and works under Node.
+  const authMetadata = await oidc.discoverOidcIssuer(HOMESERVER);
   expect(authMetadata.device_authorization_endpoint).toBeTruthy();
 
   const clientId = await oidc.registerClient(authMetadata, {
@@ -123,12 +122,15 @@ describe("OIDC/MAS login", () => {
       const { authMetadata, clientId, result } = await runDeviceCodeLogin(deviceId, user);
       expect(result.refresh_token).toBeTruthy();
 
-      // Deliberately NOT matrix-js-sdk's OidcTokenRefresher — see
-      // src/cli/oidcWindowPolyfill.ts's doc comment for why
-      // `refreshOidcToken` (plain fetch, no `window` dependency at all) is
-      // used instead. Assert directly on the raw refresh, then again via
-      // `buildTokenRefreshFunction`'s wiring (persistence hook) below.
-      const refreshed = await oidc.refreshOidcToken(authMetadata.token_endpoint, clientId, result.refresh_token!);
+      // Use the shared validated refresh path so the CLI and browser adapters
+      // persist the same token shape. Assert directly on the raw refresh, then
+      // again via `buildTokenRefreshFunction`'s persistence-hook wiring below.
+      const refreshed = await oidc.buildTokenRefreshFunction(
+        authMetadata,
+        clientId,
+        async () => {},
+        deviceId,
+      )(result.refresh_token!);
       expect(refreshed.accessToken).toBeTruthy();
       expect(refreshed.accessToken).not.toBe(result.access_token);
 
@@ -144,11 +146,12 @@ describe("OIDC/MAS login", () => {
       // a token mid-request.
       let persisted: { accessToken: string; refreshToken?: string } | null = null;
       const tokenRefreshFunction = oidc.buildTokenRefreshFunction(
-        authMetadata.token_endpoint,
+        authMetadata,
         clientId,
         async (tokens) => {
           persisted = tokens;
         },
+        deviceId,
       );
       const secondRefresh = await tokenRefreshFunction(refreshed.refreshToken!);
       expect(secondRefresh.accessToken).toBeTruthy();

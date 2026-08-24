@@ -11,10 +11,25 @@
 # appended separately by up.sh, and test/harness/users.ts / ui/test/e2e/testUsers.ts,
 # which provision accounts via `mas-cli manage register-user`).
 
-# Media: allow large-ish uploads for file tests. Local media is not purged by
-# default (no media_retention lifetimes set), which is what we want for a storage
-# product — silent media deletion would corrupt every test.
-max_upload_size: 100M
+# Include the reviewed MSC3089 marker in invite stripped-state. Synapse's
+# default invite state omits custom m.room.purpose events, so an invited client
+# cannot identify a storage tree until it joins. Keep the standard invite
+# state types and add the purpose/parent events needed to classify top-level
+# storage invites without joining; the SDK still requires the m.space create
+# type plus the enabled data-tree subtype.
+room_invite_state_types:
+  - m.room.join_rules
+  - m.room.canonical_alias
+  - m.room.avatar
+  - m.room.name
+  - m.room.encryption
+  - m.room.create
+  - m.room.member
+  - m.room.purpose
+  - m.space.parent
+
+# Keep the fixture aligned with the SDK/CLI/Web single product limit.
+max_upload_size: 64M
 
 rc_message:
   per_second: 1000

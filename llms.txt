@@ -1,48 +1,10 @@
 # TeleCrypt.io Storage SDK
 
-> Library-only end-to-end encrypted file storage and sharing on Matrix. Install the exact public
-> `@telecrypt-io/storage` version required by the consumer. This package provides no executable.
+Library-only end-to-end encrypted file storage and sharing on Matrix. The canonical installation,
+API, encryption, sharing, Recovery Key, and development guidance is in [README.md](./README.md);
+the guarded exact-tag publication procedure is in [RELEASING.md](./RELEASING.md).
 
-## Distribution boundary
-
-`@telecrypt-io/storage@0.4.0` is the current library release. Install it as a project
-dependency:
-
-```bash
-npm install @telecrypt-io/storage@0.4.0
-```
-
-Do not install it globally and do not expect a `telecrypt-io` command. The command-line client is
-distributed separately.
-
-The standalone command-line client is distributed only through exact GitHub Release archives from
-`TeleCrypt-io/storage-cli`. The browser application is maintained in
-`TeleCrypt-io/storage.telecrypt.io`.
-
-## Library API
-
-```ts
-import { TeleCryptIOStorage } from "@telecrypt-io/storage";
-import * as core from "@telecrypt-io/storage/core";
-
-const storage = await TeleCryptIOStorage.create({
-  baseUrl,
-  userId,
-  accessToken,
-  deviceId,
-});
-
-const vault = await core.createVault(storage, "Photos");
-await core.uploadFile(storage, vault.id, "cat.jpg", bytes, "image/jpeg");
-```
-
-Files are encrypted locally before upload; the server stores ciphertext. Sharing uses full Matrix
-user IDs such as `@alice:example.org`. Recovery material and authenticated SDK state belong only in
-the consuming application or authorized test environment—never in source, logs, fixtures, or
-hosted CI secrets.
-
-## Release policy
-
-Library releases are immutable exact versions published from protected `v*` tags through NPM
-Trusted Publishing/OIDC with provenance. Consumers must pin an exact version and publish their own
-immutable release before deployment.
+Current package: `@telecrypt-io/storage@0.5.0`. Consumers must pin an exact version. The package
+exports the `TeleCryptIOStorage` library and the browser-safe `@telecrypt-io/storage/core` API; it
+does not provide a command-line executable. The CLI and static web application are separate
+repositories and release artifacts.

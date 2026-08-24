@@ -2,6 +2,14 @@
 # origin serves Matrix and MAS endpoints from one origin; Synapse delegates
 # authentication to MAS.
 # See https://element-hq.github.io/matrix-authentication-service/setup/homeserver.html
+{
+	servers :8008 {
+		# This fixture is intentionally HTTP-only; do not advertise TLS-only
+		# HTTP/2 and HTTP/3 protocols that Caddy must then skip.
+		protocols h1
+	}
+}
+
 :8008 {
 	# MAS advertises http://localhost:8008/auth/ as its public origin. Strip
 	# that public prefix before forwarding to MAS's root-mounted listener.

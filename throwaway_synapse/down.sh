@@ -18,6 +18,18 @@ PROXY="throwaway-proxy"
 PGVOL="throwaway-mas-pgdata"
 DATA="$PWD/data"
 
+if (( $# > 1 )); then
+  echo "ERROR: expected no option or --wipe" >&2
+  exit 2
+fi
+case "${1:-}" in
+""|--wipe) ;;
+*)
+  echo "ERROR: unsupported option; use --wipe for full teardown" >&2
+  exit 2
+  ;;
+esac
+
 for name in "$PROXY" "$SYN" "$MAS" "$DB"; do
   podman rm -f "$name" >/dev/null 2>&1 && echo "==> removed $name" || echo "==> $name was not running"
 done

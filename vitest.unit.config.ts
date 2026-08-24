@@ -6,7 +6,12 @@ export default defineConfig({
     include: [
       "test/oidcApproval.test.ts",
       "test/oidc-refresh.test.ts",
-      "test/recovery-callback.test.ts",
+      "test/oidc-deviceid.test.ts",
+      "test/pending-invites.test.ts",
+      "test/bootstrap-recovery.test.ts",
+      "test/tree-mutations.test.ts",
+      "test/operations-safety.test.ts",
+      "test/media-safety.test.ts",
       "test/users.test.ts",
     ],
   },

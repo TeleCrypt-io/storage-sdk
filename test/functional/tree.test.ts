@@ -54,7 +54,7 @@ describe("tree operations", () => {
     }
   });
 
-  it("1.2b createSubtree links the child even when sync lags (Unknown room workaround)", async () => {
+  it("1.2b createSubtree links the child even when sync lags", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
@@ -62,9 +62,8 @@ describe("tree operations", () => {
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
-      // createSubtree must return a usable tree AND the space.child link
-      // must be in place (the workaround re-sends it if createDirectory
-      // threw "Unknown room" before linking).
+      // createSubtree must return a usable tree and leave the exact
+      // space.child link visible after its authoritative state refresh.
       const sub = await storage.createSubtree(root, "Linked");
       expect(sub.id).toBeTruthy();
 
@@ -221,7 +220,7 @@ describe("tree operations", () => {
     }
   });
 
-  it("1.8 creating a folder with empty name does not throw", async () => {
+  it("1.8 creating a folder with empty name is rejected before room creation", async () => {
     const user = await registerTestUser("tree");
     const client = await createTestClient(user);
     try {
@@ -229,8 +228,7 @@ describe("tree operations", () => {
       const root = await storage.createTree("Root");
       await waitForName(root, "Root");
 
-      const empty = await root.createDirectory("");
-      expect(empty.id).toBeTruthy();
+      await expect(root.createDirectory("")).rejects.toThrow("invalid name");
     } finally {
       stopTestClient(client);
     }

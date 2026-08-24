@@ -10,7 +10,6 @@ import {
   whoAmI,
 } from "../../src/core/oidc.js";
 import { approveDeviceCodeViaHttp } from "./oidcApproval.js";
-import { withOidcWindowShim } from "./oidcWindowShim.js";
 
 const execFileAsync = promisify(execFile);
 const HOMESERVER = "http://localhost:8008";
@@ -92,7 +91,7 @@ async function loginViaDeviceCode(
   password: string,
   deviceId: string,
 ): Promise<DeviceLogin> {
-  const authMetadata = await withOidcWindowShim(() => discoverOidcIssuer(HOMESERVER));
+  const authMetadata = await discoverOidcIssuer(HOMESERVER);
   const clientId = await registerClient(authMetadata, {
     clientName: "TeleCrypt.io disposable test",
     clientUri: "http://localhost:1234/",

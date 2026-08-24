@@ -1,73 +1,686 @@
 name: Publish to npm
 
-# Publishes @telecrypt-io/storage to the npm registry using npm Trusted
-# Publishing (OIDC) with provenance. There is no NODE_AUTH_TOKEN or npm token;
-# npm trusts this repository's exact workflow identity.
-
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: storage-sdk-publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GIT_CONFIG_NOSYSTEM: "1"
+  GIT_CONFIG_SYSTEM: /dev/null
+  GIT_CONFIG_GLOBAL: /dev/null
+  GIT_CONFIG_COUNT: "0"
+  GIT_CONFIG_PARAMETERS: ""
+  GIT_NO_REPLACE_OBJECTS: "1"
+  GIT_TERMINAL_PROMPT: "0"
+  GIT_ASKPASS: /bin/false
+  SSH_ASKPASS: /bin/false
+  GIT_ALLOW_PROTOCOL: https
+  GIT_PROTOCOL_FROM_USER: "0"
+  GH_HOST: github.com
+  http_proxy: ""
+  https_proxy: ""
+  all_proxy: ""
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  ALL_PROXY: ""
+  NO_PROXY: ""
+
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {contents: read}
+    outputs:
+      archive_digest: ${{ steps.package.outputs.archive_digest }}
+      archive_size: ${{ steps.package.outputs.archive_size }}
+      record_digest: ${{ steps.package.outputs.record_digest }}
+      record_size: ${{ steps.package.outputs.record_size }}
     env:
-      GIT_CONFIG_COUNT: "2"
-      GIT_CONFIG_KEY_0: init.defaultBranch
-      GIT_CONFIG_VALUE_0: main
-      GIT_CONFIG_KEY_1: advice.detachedHead
-      GIT_CONFIG_VALUE_1: "false"
-    permissions:
-      id-token: write # required to mint the OIDC token trusted publishing exchanges for a publish credential
-      contents: read
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ github.sha }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Require an annotated immutable release tag
-        run: |
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
-
-      - name: Require release commit to be contained in refreshed main
+      - uses: actions/checkout@v7.0.1
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Verify exact annotated source
+        shell: bash
         run: |
           set -euo pipefail
-          git fetch --force --no-tags origin refs/heads/main:refs/remotes/origin/main
-          release_commit="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
-          test "$(git rev-parse HEAD)" = "$release_commit"
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          config_file="$RUNNER_TEMP/git-local-config"
+          set +e
+          git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
+          config_status="$?"
+          set -e
+          test "$config_status" = 0 -o "$config_status" = 1
+          while IFS= read -r key; do
+            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+          done <"$config_file"
+          rm -f "$config_file"
+          git remote set-url origin "$repo_url"
+          test "$(git remote get-url origin)" = "$repo_url"
+          d="$(mktemp -d)"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
+          test ! -s "$d/out" -a ! -s "$d/err"
+          test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
+          release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
+          test "$release_commit" = "$RELEASE_SHA"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
           git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6.4.0
+          rm -rf "$d"
+      - uses: actions/setup-node@v7.0.0
+        with: {node-version: "22.23.2", cache: npm}
+      - name: Verify toolchain and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v22.23.2
+          test "$(npm --version)" = 10.9.8
+          expected="${RELEASE_TAG#v}"
+          EXPECTED="$expected" node -e 'const f=require("fs"),p=JSON.parse(f.readFileSync("package.json")),l=JSON.parse(f.readFileSync("package-lock.json")); if(p.name!=="@telecrypt-io/storage"||p.version!==process.env.EXPECTED||l.name!==p.name||l.lockfileVersion!==3||l.packages?.[""].version!==process.env.EXPECTED)process.exit(1)'
+      - name: Test and build the release source
+        run: |
+          set -euo pipefail
+          bounded_command() {
+            local output="$1" seconds="$2" status error
+            shift 2
+            error="$output.err"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds "$seconds" --kill-after-seconds 5 -- "$@"
+            status="$?"
+            set -e
+            test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
+            if test "$status" = 0; then
+              test ! -s "$error"
+              if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+            fi
+            return "$status"
+          }
+          bounded_command "$RUNNER_TEMP/npm-ci.out" 600 npm ci --ignore-scripts --no-fund --no-audit --loglevel=error
+          bounded_command "$RUNNER_TEMP/npm-lint.out" 300 npm run lint
+          bounded_command "$RUNNER_TEMP/npm-test-unit.out" 600 npm run test:unit
+          bounded_command "$RUNNER_TEMP/npm-build.out" 300 npm run build
+      - name: Package the exact tested archive
+        id: package
+        shell: bash
+        run: |
+          # shellcheck disable=SC2097,SC2098,SC2016
+          set -euo pipefail
+          mkdir -p release
+          bounded_command() {
+            local output="$1" status error
+            shift
+            error="$output.err"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- "$@"
+            status="$?"
+            set -e
+            test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
+            test "$status" = 0
+            test ! -s "$error"
+            if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+          }
+          bounded_command "$RUNNER_TEMP/npm-pack.out" npm pack --ignore-scripts --pack-destination release --loglevel=error
+          mapfile -t archives < <(find release -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#archives[@]}" = 1
+          archive="release/${RELEASE_TAG}.tgz"
+          mv "${archives[0]}" "$archive"
+          expected='package/LICENSE
+          package/README.md
+          package/dist/TeleCryptIOStorage.d.ts
+          package/dist/TeleCryptIOStorage.js
+          package/dist/core/constants.d.ts
+          package/dist/core/constants.js
+          package/dist/core/errors.d.ts
+          package/dist/core/errors.js
+          package/dist/core/http.d.ts
+          package/dist/core/http.js
+          package/dist/core/index.d.ts
+          package/dist/core/index.js
+          package/dist/core/oidc.d.ts
+          package/dist/core/oidc.js
+          package/dist/core/operations.d.ts
+          package/dist/core/operations.js
+          package/dist/core/poll.d.ts
+          package/dist/core/poll.js
+          package/dist/core/types.d.ts
+          package/dist/core/types.js
+          package/dist/index.d.ts
+          package/dist/index.js
+          package/package.json'
+          test "$(tar -tzf "$archive" | sort)" = "$(printf '%b\n' "$expected" | sort)"
+          if tar -tzf "$archive" | rg -q '(^|/)node_modules(/|$)'; then exit 1; fi
+          test "$(tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
+          size="$(wc -c <"$archive")"
+          test "$size" -gt 0 -a "$size" -le 134217728
+          archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          archive_sha512="$(node -e 'const fs=require("node:fs"),crypto=require("node:crypto"); process.stdout.write(crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$archive")"
+          # shellcheck disable=SC2097,SC2098,SC2016
+          record="release/${RELEASE_TAG}.integrity.json"
+          VERSION="${RELEASE_TAG#v}" RELEASE_TAG="$RELEASE_TAG" RELEASE_SHA="$RELEASE_SHA" SHA256="$archive_sha256" SHA512="$archive_sha512" SIZE="$size" RECORD="$record" node -e 'const fs=require("node:fs"); const value={schema:1,package:"@telecrypt-io/storage",version:process.env.VERSION,tag:process.env.RELEASE_TAG,commit:process.env.RELEASE_SHA,tarball_sha256:`sha256:${process.env.SHA256}`,tarball_sha512:`sha512-${process.env.SHA512}`,tarball_size:Number(process.env.SIZE)}; fs.writeFileSync(process.env.RECORD,`${JSON.stringify(value)}\n`)'
+          record_size="$(wc -c <"$record")"
+          test "$record_size" -gt 0 -a "$record_size" -le 65536
+          printf 'archive_digest=sha256:%s\narchive_size=%s\nrecord_digest=sha256:%s\nrecord_size=%s\n' "$archive_sha256" "$size" "$(sha256sum "$record" | awk '{print $1}')" "$record_size" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7.0.1
         with:
-          node-version: "22.23.2"
-          registry-url: "https://registry.npmjs.org"
+          name: storage-sdk-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            release/${{ github.ref_name }}.tgz
+            release/${{ github.ref_name }}.integrity.json
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Require a tag matching the package version
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions: {contents: write}
+    outputs:
+      release_id: ${{ steps.publish.outputs.release_id }}
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ github.sha }}
+      EXPECTED_DIGEST: ${{ needs.build.outputs.archive_digest }}
+      EXPECTED_SIZE: ${{ needs.build.outputs.archive_size }}
+      EXPECTED_RECORD_DIGEST: ${{ needs.build.outputs.record_digest }}
+      EXPECTED_RECORD_SIZE: ${{ needs.build.outputs.record_size }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: storage-sdk-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: release
+      - name: Create or reuse the exact draft Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          expected_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -e 'console.log(require("./package.json").version)')"
-          test "$expected_version" = "$package_version"
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          config_file="$RUNNER_TEMP/git-local-config"
+          set +e
+          git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
+          config_status="$?"
+          set -e
+          test "$config_status" = 0 -o "$config_status" = 1
+          while IFS= read -r key; do
+            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+          done <"$config_file"
+          rm -f "$config_file"
+          git remote set-url origin "$repo_url"
+          test "$(git remote get-url origin)" = "$repo_url"
+          verify_source() {
+            local d status release_commit
+            d="$(mktemp -d)"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+            status="$?"
+            set -e
+            test "$status" = 0
+            test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
+            test ! -s "$d/out" -a ! -s "$d/err"
+            test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
+            release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
+            test "$release_commit" = "$RELEASE_SHA"
+            test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+            test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
+            git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+            rm -rf "$d"
+          }
+          verify_source
+          archive="release/${RELEASE_TAG}.tgz"
+          test -f "$archive"
+          test "$(wc -c <"$archive")" = "$EXPECTED_SIZE"
+          test "sha256:$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_DIGEST"
+          record="release/${RELEASE_TAG}.integrity.json"
+          test -f "$record"
+          verify_record() {
+            local file="$1"
+            test "$(wc -c <"$file")" = "$EXPECTED_RECORD_SIZE"
+            test "sha256:$(sha256sum "$file" | awk '{print $1}')" = "$EXPECTED_RECORD_DIGEST"
+            EXPECTED_VERSION="${RELEASE_TAG#v}" EXPECTED_TAG="$RELEASE_TAG" EXPECTED_COMMIT="$RELEASE_SHA" EXPECTED_ARCHIVE_DIGEST="$EXPECTED_DIGEST" EXPECTED_ARCHIVE_SIZE="$EXPECTED_SIZE" node -e 'const fs=require("node:fs"),p=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const keys=["commit","package","schema","tag","tarball_sha256","tarball_sha512","tarball_size","version"]; if(JSON.stringify(Object.keys(p).sort())!==JSON.stringify(keys.sort())||p.schema!==1||p.package!=="@telecrypt-io/storage"||p.version!==process.env.EXPECTED_VERSION||p.tag!==process.env.EXPECTED_TAG||p.commit!==process.env.EXPECTED_COMMIT||p.tarball_sha256!==process.env.EXPECTED_ARCHIVE_DIGEST||p.tarball_size!==Number(process.env.EXPECTED_ARCHIVE_SIZE)||typeof p.tarball_sha512!=="string"||!/^sha512-[A-Za-z0-9+/]+=*$/.test(p.tarball_sha512))process.exit(1)' "$file"
+          }
+          verify_record "$record"
+          bounded_gh() {
+            local output="$1" error status
+            shift
+            error="$output.err"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh "$@"
+            status="$?"
+            set -e
+            test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
+            if test "$status" = 0; then test ! -s "$error"; fi
+            return "$status"
+          }
+          verify_draft() {
+            local json="$1" id="$2"
+            jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==true and .prerelease==false and (.immutable==false or .immutable==null) and (.created_at|iso) and .published_at==null and ((.assets|type)=="array")' "$json" >/dev/null
+          }
+          revalidate_draft_for_publish() {
+            local json="$1" id="$2"
+            bounded_gh "$json" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$id"
+            verify_draft "$json" "$id"
+            test "$(jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$json")" = "$expected_draft_asset_metadata"
+            jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|type)=="array" and (.assets|length)==2) and all(.assets[]; type=="object" and (.id|type=="number" and .id>0 and floor==.) and .state=="uploaded") and (any(.assets[]; .name==($tag+".tgz") and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+          }
+          verify_published() {
+            local json="$1" id="$2"
+            jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type)=="array" and (.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+          }
+          download_asset() {
+            local json="$1" output="$2" name="$3" asset_id error status
+            asset_id="$(jq -er --arg name "$name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+            error="$output.err"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$output.stdout" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' --output "$output" "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            status="$?"
+            set -e
+            test "$status" = 0
+            test "$(wc -c <"$error")" -le 131072 -a ! -s "$error" -a ! -s "$output.stdout"
+            if test "$name" = "${RELEASE_TAG}.tgz"; then
+              test "$(wc -c <"$output")" = "$EXPECTED_SIZE"
+              test "sha256:$(sha256sum "$output" | awk '{print $1}')" = "$EXPECTED_DIGEST"
+              cmp -s "$archive" "$output"
+              verify_archive "$output"
+            else
+              verify_record "$output"
+            fi
+          }
+          verify_archive() {
+            local file="$1" listing="$RUNNER_TEMP/sdk-archive-list" status expected
+            expected='package/LICENSE
+          package/README.md
+          package/dist/TeleCryptIOStorage.d.ts
+          package/dist/TeleCryptIOStorage.js
+          package/dist/core/constants.d.ts
+          package/dist/core/constants.js
+          package/dist/core/errors.d.ts
+          package/dist/core/errors.js
+          package/dist/core/http.d.ts
+          package/dist/core/http.js
+          package/dist/core/index.d.ts
+          package/dist/core/index.js
+          package/dist/core/oidc.d.ts
+          package/dist/core/oidc.js
+          package/dist/core/operations.d.ts
+          package/dist/core/operations.js
+          package/dist/core/poll.d.ts
+          package/dist/core/poll.js
+          package/dist/core/types.d.ts
+          package/dist/core/types.js
+          package/dist/index.d.ts
+          package/dist/index.js
+          package/package.json'
+            set +e
+            python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
+            status="$?"
+            set -e
+            test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
+            test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
+            if rg -q '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
+            python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
+            cmp -s "$listing.license" LICENSE
+            test "$(wc -c <"$listing.license")" -le 65536
+            test "$(tar -xOf "$file" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
+          }
+          probe="$RUNNER_TEMP/release-probe.json"
+          set +e
+          bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          probe_status="$?"
+          set -e
+          if test "$probe_status" != 0; then
+            test ! -s "$probe"
+            test -s "$probe.err"
+            test "$(wc -c <"$probe.err")" -le 131072
+            status_probe="$RUNNER_TEMP/release-status"
+            set +e
+            bounded_gh "$status_probe" api --include --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+            status_probe_exit="$?"
+            set -e
+            test "$status_probe_exit" != 0
+            status_line="$(awk '/^HTTP\/[0-9.]+[[:space:]]/{print; exit}' "$status_probe")"
+            [[ "$status_line" =~ ^HTTP/[0-9.]+[[:space:]]+404([[:space:]]|$) ]]
+            create="$RUNNER_TEMP/release-create.json"
+            verify_source
+            bounded_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"
+            release_id="$(jq -er '.id | select(type=="number" and .>0 and floor==.)' "$create")"
+            bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+          else
+            release_id="$(jq -er '.id | select(type=="number" and .>0 and floor==.)' "$probe")"
+          fi
+          state="$(jq -er 'if .draft==true then "draft" elif .draft==false then "published" else empty end' "$probe")"
+          case "$state" in
+            draft)
+              verify_draft "$probe" "$release_id"
+              jq -e '((.assets|length) <= 64) and all(.assets[]; type == "object" and (.id|type == "number" and . > 0 and floor == .))' "$probe" >/dev/null
+              asset_ids="$RUNNER_TEMP/release-assets"
+              jq -r '.assets[]?.id // empty' "$probe" >"$asset_ids"
+              while IFS= read -r asset_id; do
+                test -z "$asset_id" || [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+                if test -n "$asset_id"; then
+                  verify_source
+                  bounded_gh "$RUNNER_TEMP/delete-$asset_id.json" api --hostname github.com --method DELETE --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                fi
+              done <"$asset_ids"
+              asset_name="${RELEASE_TAG}.tgz"
+              verify_source
+              bounded_gh "$RUNNER_TEMP/upload.json" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Content-Type: application/octet-stream' --input "$archive" "/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset_name"
+              record_name="${RELEASE_TAG}.integrity.json"
+              verify_source
+              bounded_gh "$RUNNER_TEMP/upload-record.json" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Content-Type: application/json' --input "$record" "/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$record_name"
+              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              verify_draft "$probe" "$release_id"
+              jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$probe" >/dev/null
+              expected_draft_asset_metadata="$(jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$probe")"
+              download_asset "$probe" "$RUNNER_TEMP/draft.tgz" "$asset_name"
+              download_asset "$probe" "$RUNNER_TEMP/draft.integrity.json" "$record_name"
+              # Revalidate the authoritative tag and current main immediately before the one publish mutation.
+              verify_source
+              revalidate_draft_for_publish "$probe" "$release_id"
+              bounded_gh "$RUNNER_TEMP/published.json" api --hostname github.com --method PATCH --header 'X-GitHub-Api-Version: 2026-03-10' --field draft=false "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              verify_published "$probe" "$release_id"
+              download_asset "$probe" "$RUNNER_TEMP/published.tgz" "$asset_name"
+              download_asset "$probe" "$RUNNER_TEMP/published.integrity.json" "$record_name"
+              ;;
+            published)
+              # Only an exact immutable Release is recoverable on a rerun after downstream failure.
+              test "${GITHUB_RUN_ATTEMPT:-1}" -gt 1
+              verify_published "$probe" "$release_id"
+              asset_name="${RELEASE_TAG}.tgz"
+              record_name="${RELEASE_TAG}.integrity.json"
+              download_asset "$probe" "$RUNNER_TEMP/published.tgz" "$asset_name"
+              download_asset "$probe" "$RUNNER_TEMP/published.integrity.json" "$record_name"
+              ;;
+            *)
+              echo "Release state is neither draft nor published" >&2
+              exit 1
+              ;;
+          esac
+          printf 'release_id=%s\n' "$release_id" >>"$GITHUB_OUTPUT"
 
-      # Pin a Trusted-Publishing-capable npm instead of relying on Node's bundled version.
-      - name: Ensure a trusted-publishing-capable npm
-        run: npm install -g npm@11.5.1 --no-fund
-
-      - name: Install dependencies
-        run: npm ci --no-fund
-
-      - name: Verify and build
+  publish:
+    needs: [build, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ github.sha }}
+      EXPECTED_RELEASE_ID: ${{ needs.release.outputs.release_id }}
+      EXPECTED_DIGEST: ${{ needs.build.outputs.archive_digest }}
+      EXPECTED_SIZE: ${{ needs.build.outputs.archive_size }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: storage-sdk-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: release
+      - uses: actions/setup-node@v7.0.0
+        with: {node-version: "22.23.2", registry-url: https://registry.npmjs.org}
+      - name: Verify the exact Trusted Publishing toolchain
+        shell: bash
         run: |
-          npm run lint
-          npm run test:unit
-          npm run build
-
-      - name: Publish (OIDC trusted publishing + provenance)
-        # The registry emits a token-policy notice even for OIDC publishing;
-        # warn level retains warnings and errors while hiding notice-level output.
-        run: npm publish --access public --provenance --loglevel=warn
+          set -euo pipefail
+          test "$(node --version)" = v22.23.2
+          # Keep the deterministic build on npm 10.9.8. Trusted Publishing with
+          # GitHub's OIDC exchange requires npm 11.5.1+, so upgrade only after
+          # the tested archive is immutable and ready for npm publish.
+          test "$(npm --version)" = 10.9.8
+          output="$RUNNER_TEMP/npm-upgrade.out"
+          error="$output.err"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm install --global npm@11.5.1 --ignore-scripts --no-fund --no-audit --loglevel=error
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288 -a ! -s "$error"
+          if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+          test "$(npm --version)" = 11.5.1
+      - name: Verify the immutable Release and publish the exact archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="release/${RELEASE_TAG}.tgz"
+          test "$(wc -c <"$archive")" = "$EXPECTED_SIZE"
+          test "sha256:$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_DIGEST"
+          repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          config_file="$RUNNER_TEMP/git-local-config"
+          set +e
+          git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
+          config_status="$?"
+          set -e
+          test "$config_status" = 0 -o "$config_status" = 1
+          while IFS= read -r key; do
+            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+          done <"$config_file"
+          rm -f "$config_file"
+          git remote set-url origin "$repo_url"
+          test "$(git remote get-url origin)" = "$repo_url"
+          verify_source() {
+            local d status release_commit
+            d="$(mktemp -d)"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+            status="$?"
+            set -e
+            test "$status" = 0
+            test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
+            test ! -s "$d/out" -a ! -s "$d/err"
+            test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
+            release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
+            test "$release_commit" = "$RELEASE_SHA"
+            test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+            test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
+            git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+            rm -rf "$d"
+          }
+          verify_archive() {
+            local file="$1" listing="$RUNNER_TEMP/sdk-publish-archive-list" status expected
+            expected='package/LICENSE
+          package/README.md
+          package/dist/TeleCryptIOStorage.d.ts
+          package/dist/TeleCryptIOStorage.js
+          package/dist/core/constants.d.ts
+          package/dist/core/constants.js
+          package/dist/core/errors.d.ts
+          package/dist/core/errors.js
+          package/dist/core/http.d.ts
+          package/dist/core/http.js
+          package/dist/core/index.d.ts
+          package/dist/core/index.js
+          package/dist/core/oidc.d.ts
+          package/dist/core/oidc.js
+          package/dist/core/operations.d.ts
+          package/dist/core/operations.js
+          package/dist/core/poll.d.ts
+          package/dist/core/poll.js
+          package/dist/core/types.d.ts
+          package/dist/core/types.js
+          package/dist/index.d.ts
+          package/dist/index.js
+          package/package.json'
+            set +e
+            python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
+            status="$?"
+            set -e
+            test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
+            test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
+            if rg -q '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
+            python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
+            cmp -s "$listing.license" LICENSE
+            test "$(wc -c <"$listing.license")" -le 65536
+            test "$(tar -xOf "$file" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
+          }
+          verify_record() {
+            local file="$1" version
+            version="$(printf '%s' "$RELEASE_TAG" | cut -c 2-)"
+            test "$(wc -c <"$file")" = "$EXPECTED_RECORD_SIZE"
+            test "sha256:$(sha256sum "$file" | awk '{print $1}')" = "$EXPECTED_RECORD_DIGEST"
+            jq -e --arg version "$version" --arg tag "$RELEASE_TAG" --arg commit "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" 'keys == ["commit","package","schema","tag","tarball_sha256","tarball_sha512","tarball_size","version"] and .schema == 1 and .package == "@telecrypt-io/storage" and .version == $version and .tag == $tag and .commit == $commit and .tarball_sha256 == $digest and (.tarball_sha512 | type == "string" and test("^sha512-[A-Za-z0-9+/]+=*$")) and .tarball_size == $size' "$file" >/dev/null
+          }
+          record="release/$RELEASE_TAG.integrity.json"
+          verify_record "$record"
+          json="$RUNNER_TEMP/release.json"
+          error="$json.err"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$json" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$json")" -le 131072 -a "$(wc -c <"$error")" -le 131072 -a ! -s "$error"
+          asset_name="$RELEASE_TAG.tgz"
+          record_name="$RELEASE_TAG.integrity.json"
+          jq -e --arg id "$EXPECTED_RELEASE_ID" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg name "$asset_name" --arg record_name "$record_name" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type)=="array" and (.assets|length)==2) and (any(.assets[]; .name==$name and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==$record_name and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+          asset_id="$(jq -er --arg name "$asset_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+          downloaded="$RUNNER_TEMP/downloaded.tgz"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$downloaded.stdout" --stderr "$downloaded.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' --output "$downloaded" "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$downloaded.err")" -le 131072 -a ! -s "$downloaded.err" -a ! -s "$downloaded.stdout"
+          test "$(wc -c <"$downloaded")" = "$EXPECTED_SIZE"
+          test "sha256:$(sha256sum "$downloaded" | awk '{print $1}')" = "$EXPECTED_DIGEST"
+          cmp -s "$archive" "$downloaded"
+          verify_archive "$downloaded"
+          record_id="$(jq -er --arg name "$record_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+          downloaded_record="$RUNNER_TEMP/downloaded.integrity.json"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$downloaded_record.stdout" --stderr "$downloaded_record.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' --output "$downloaded_record" "repos/$GITHUB_REPOSITORY/releases/assets/$record_id"
+          status="$?"
+          set -e
+          test "$status" = 0 -a "$(wc -c <"$downloaded_record.err")" -le 131072 -a ! -s "$downloaded_record.err" -a ! -s "$downloaded_record.stdout"
+          verify_record "$downloaded_record"
+          version="${RELEASE_TAG#v}"
+          registry_status="$RUNNER_TEMP/npm-registry.status"
+          registry_body="$RUNNER_TEMP/npm-registry.body"
+          registry_err="$registry_body.err"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$registry_status" --stderr "$registry_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --max-time 120s --connect-timeout 20s --max-filesize 131072 --output "$registry_body" --write-out '%{http_code}' "https://registry.npmjs.org/@telecrypt-io%2fstorage/$version"
+          registry_curl_status="$?"
+          set -e
+          test "$registry_curl_status" = 0
+          test "$(wc -c <"$registry_status")" = 3 -a "$(wc -c <"$registry_body")" -le 131072 -a "$(wc -c <"$registry_err")" -le 131072 -a ! -s "$registry_err"
+          http_status="$(cat "$registry_status")"
+          [[ "$http_status" =~ ^[0-9]{3}$ ]]
+          case "$http_status" in
+            404)
+            verify_source
+            publish_out="$RUNNER_TEMP/npm-publish.out"
+            publish_err="$publish_out.err"
+            set +e
+            python3 scripts/bounded-command.py --stdout "$publish_out" --stderr "$publish_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm publish "$archive" --access public --provenance --ignore-scripts --loglevel=error
+            publish_status="$?"
+            set -e
+            test "$publish_status" = 0
+            test "$(wc -c <"$publish_out")" -le 131072 -a "$(wc -c <"$publish_err")" -le 131072 -a ! -s "$publish_err"
+            if rg -qi '\bwarn(ing)?\b' "$publish_out" "$publish_err"; then exit 1; fi
+            ;;
+            200)
+            ;;
+            *)
+            echo "Unexpected npm registry status: $http_status" >&2
+            exit 1
+            ;;
+          esac
+      - name: Verify npm registry bytes, integrity, and provenance
+        env:
+          PACKAGE_NAME: "@telecrypt-io/storage"
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          package="$PACKAGE_NAME@$version"
+          archive="release/${RELEASE_TAG}.tgz"
+          record="release/$RELEASE_TAG.integrity.json"
+          d="$RUNNER_TEMP/npm-registry"
+          mkdir -p "$d"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$d/dist.json" --stderr "$d/dist.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm view "$package" dist --json --loglevel=error
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$d/dist.json")" -le 131072 -a "$(wc -c <"$d/dist.err")" -le 131072 -a ! -s "$d/dist.err"
+          if rg -qi '\bwarn(ing)?\b' "$d/dist.json" "$d/dist.err"; then exit 1; fi
+          node - "$d/dist.json" "$archive" <<'NODE'
+          const fs = require("node:fs"), crypto = require("node:crypto");
+          const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const bytes = fs.readFileSync(process.argv[3]);
+          if (typeof dist.tarball !== "string" || !/^https:\/\/registry\.npmjs\.org\//.test(dist.tarball)) process.exit(1);
+          if (typeof dist.integrity !== "string" || dist.integrity !== `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`) process.exit(1);
+          if (!dist.attestations || typeof dist.attestations.url !== "string" || !dist.attestations.url) process.exit(1);
+          NODE
+          set +e
+          python3 scripts/bounded-command.py --stdout "$d/githead.json" --stderr "$d/githead.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm view "$package" gitHead --json --loglevel=error
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$d/githead.json")" -le 131072 -a "$(wc -c <"$d/githead.err")" -le 131072 -a ! -s "$d/githead.err"
+          if rg -qi '\bwarn(ing)?\b' "$d/githead.json" "$d/githead.err"; then exit 1; fi
+          node - "$d/githead.json" "$RELEASE_SHA" <<'NODE'
+          const fs = require("node:fs");
+          const gitHead = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (typeof gitHead !== "string" || !/^[0-9a-f]{40}$/u.test(gitHead) || gitHead !== process.argv[3]) process.exit(1);
+          NODE
+          node - "$d/dist.json" "$archive" "$record" <<'NODE'
+          const fs = require("node:fs"), crypto = require("node:crypto");
+          const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const bytes = fs.readFileSync(process.argv[3]);
+          const record = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+          if (dist.integrity !== record.tarball_sha512 || record.tarball_sha256 !== "sha256:" + crypto.createHash("sha256").update(bytes).digest("hex")) process.exit(1);
+          NODE
+          set +e
+          python3 scripts/bounded-command.py --stdout "$d/pack.json" --stderr "$d/pack.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm pack "$package" --ignore-scripts --pack-destination "$d" --json --loglevel=error
+          status="$?"
+          set -e
+          test "$status" = 0
+          test "$(wc -c <"$d/pack.json")" -le 131072 -a "$(wc -c <"$d/pack.err")" -le 131072 -a ! -s "$d/pack.err"
+          if rg -qi '\bwarn(ing)?\b' "$d/pack.json" "$d/pack.err"; then exit 1; fi
+          mapfile -t packed < <(find "$d" -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#packed[@]}" = 1
+          cmp -s "$archive" "${packed[0]}"
+          audit="$RUNNER_TEMP/npm-signature-check"
+          mkdir -p "$audit"
+          helper="$PWD/scripts/bounded-command.py"
+          printf '{"name":"npm-signature-check","private":true,"dependencies":{"%s":"%s"}}\n' "$PACKAGE_NAME" "$version" >"$audit/package.json"
+          audit_install_out="$d/audit-install.out"
+          audit_install_err="$audit_install_out.err"
+          set +e
+          (cd "$audit" && python3 "$helper" --stdout "$audit_install_out" --stderr "$audit_install_err" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm install --ignore-scripts --no-fund --no-audit --loglevel=error)
+          status="$?"
+          set -e
+          test "$status" = 0 -a "$(wc -c <"$audit_install_out")" -le 524288 -a "$(wc -c <"$audit_install_err")" -le 524288 -a ! -s "$audit_install_err"
+          if rg -qi '\bwarn(ing)?\b' "$audit_install_out" "$audit_install_err"; then exit 1; fi
+          audit_out="$d/audit.out"
+          audit_err="$audit_out.err"
+          set +e
+          (cd "$audit" && python3 "$helper" --stdout "$audit_out" --stderr "$audit_err" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm audit signatures --loglevel=error)
+          status="$?"
+          set -e
+          test "$status" = 0 -a "$(wc -c <"$audit_out")" -le 524288 -a "$(wc -c <"$audit_err")" -le 524288 -a ! -s "$audit_err"
+          if rg -qi '\bwarn(ing)?\b' "$audit_out" "$audit_err"; then exit 1; fi
+          test -s "$audit_out"
+          rg -qi 'verified attestations?' "$audit_out"

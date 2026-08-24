@@ -11,6 +11,7 @@
 #
 #   ./up.sh          # start (generate config if missing)
 #   ./up.sh --fresh  # wipe data and regenerate from scratch
+#   ./down.sh --wipe # stop and remove all throwaway state
 #
 # Verify it is up:  curl http://localhost:8008/_matrix/client/versions
 #                   curl http://localhost:8008/auth/.well-known/openid-configuration
@@ -23,7 +24,7 @@ source ./fixture-common.sh
 SYN_IMG="ghcr.io/element-hq/synapse:v1.159.0"
 MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.23.0"
 PROXY_IMG="docker.io/library/caddy:2.11.4-alpine"
-PG_IMG="docker.io/library/postgres:16.4-alpine"
+PG_IMG="docker.io/library/postgres:17.11-bookworm"
 
 NET="throwaway-net"
 DB="throwaway-mas-db"
@@ -34,6 +35,19 @@ PGVOL="throwaway-mas-pgdata"
 
 DATA="$PWD/data"
 SECRET_FILE="$DATA/mas-shared-secret"
+
+if (( $# > 1 )); then
+  echo "ERROR: expected no option or --fresh; use ./down.sh --wipe for teardown" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+""|--fresh) ;;
+*)
+  echo "ERROR: unsupported option; use --fresh to reset or ./down.sh --wipe for teardown" >&2
+  exit 2
+  ;;
+esac
 
 if [[ "${1:-}" == "--fresh" ]]; then
   echo "==> --fresh: removing containers, network, volume, and data"
