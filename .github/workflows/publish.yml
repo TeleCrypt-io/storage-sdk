@@ -24,9 +24,6 @@ env:
   GIT_ALLOW_PROTOCOL: https
   GIT_PROTOCOL_FROM_USER: "0"
   GH_HOST: github.com
-  http_proxy: ""
-  https_proxy: ""
-  all_proxy: ""
   HTTP_PROXY: ""
   HTTPS_PROXY: ""
   ALL_PROXY: ""
