@@ -41,6 +41,7 @@ import {
   UndecryptableFileError,
 } from "./errors.js";
 import { waitForCondition } from "./poll.js";
+import { validateMatrixEventId } from "./constants.js";
 import { validateName } from "./validation.js";
 import type {
   DownloadedFile,
@@ -1476,8 +1477,13 @@ async function resolveFileVersions(
   const versions: FileVersionToDelete[] = [];
   for (const version of history) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
-    if (!version || typeof version.id !== "string" || version.id.length === 0) {
+    if (!version || typeof version.id !== "string") {
       throw new StorageError("file version history is invalid");
+    }
+    try {
+      validateMatrixEventId(version.id, "file version event ID");
+    } catch {
+      throw new StorageError("file version history contains an invalid event ID");
     }
     if (eventIds.has(version.id)) {
       throw new StorageError("file version history contains a cycle");

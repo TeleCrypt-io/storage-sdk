@@ -14,6 +14,7 @@ import {
 import {
   declineInvite,
   deleteFile,
+  deleteFolder,
   deleteVault,
   downloadFile as downloadCoreFile,
   joinVault,
@@ -118,6 +119,17 @@ describe("operation safety", () => {
     expect(fixture.client.redactEvent).not.toHaveBeenCalled();
   });
 
+  it("rejects malformed version event IDs before physical deletion", async () => {
+    const fixture = deletionFixture([{ id: "not-an-event-id", mediaId: "mxc://example.test/v1" }]);
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "not-an-event-id")).rejects.toThrow(
+      "file version history contains an invalid event ID",
+    );
+    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
+    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
+    expect(fixture.client.redactEvent).not.toHaveBeenCalled();
+  });
+
   it("reports typed partial state when event cleanup fails after media deletion", async () => {
     const fixture = deletionFixture([
       { id: "$v2", mediaId: "mxc://example.test/v2" },
@@ -132,6 +144,22 @@ describe("operation safety", () => {
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("includes fully cleaned versions in the typed partial result", async () => {
+    const fixture = deletionFixture([
+      { id: "$v2", mediaId: "mxc://example.test/v2" },
+      { id: "$v1", mediaId: "mxc://example.test/v1" },
+    ]);
+    fixture.client.redactEvent.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("redaction failed"));
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "delete file",
+      completedIds: ["$v2"],
+    });
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
+    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(2);
   });
 
   it("bounds the version chain before issuing a deletion request", async () => {
@@ -617,6 +645,36 @@ describe("operation safety", () => {
     await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).rejects.toMatchObject({
       code: "NON_EMPTY_TREE",
       treeId: root.id,
+    });
+    expect(forget).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit file deletion before deleting a folder", async () => {
+    const folder = makeTree("!file-bearing-folder:example.test", "WithFile", false);
+    folder.listAllFiles = () => [{ id: "$file", getName: () => "payload.bin" }] as never;
+    const room = {
+      roomId: folder.id,
+      getMyMembership: () => "join",
+      currentState: { getStateEvents: () => [] },
+    };
+    const forget = vi.fn();
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getRoom: () => room,
+      getRooms: () => [room],
+      unstableGetFileTreeSpace: () => folder,
+      leave: vi.fn(),
+      forget,
+      http: {
+        authedRequest: vi.fn(async (_method: string, path: string) =>
+          path.endsWith("/joined_rooms") ? { joined_rooms: [folder.id] } : path.endsWith("/members") ? { chunk: [] } : [],
+        ),
+      },
+    };
+
+    await expect(deleteFolder(new TeleCryptIOStorage(client as never), folder.id)).rejects.toMatchObject({
+      code: "NON_EMPTY_TREE",
+      treeId: folder.id,
     });
     expect(forget).not.toHaveBeenCalled();
   });

@@ -18,7 +18,10 @@ function branch() {
   } as never;
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("media safety bounds", () => {
   it("rejects remote cleartext homeservers before constructing a client", async () => {
@@ -48,6 +51,30 @@ describe("media safety bounds", () => {
     await expect(
       storage.uploadFile({} as never, "large.bin", new ArrayBuffer(MAX_MEDIA_FILE_BYTES + 1), "application/octet-stream"),
     ).rejects.toBeInstanceOf(FileTooLargeError);
+  });
+
+  it("keeps the exact 128 MiB media boundary independent of private limits", async () => {
+    const createFile = vi.fn().mockResolvedValue({ event_id: "$media-boundary" });
+    const storage = new TeleCryptIOStorage({} as never);
+    const tree = { createFile } as never;
+
+    expect(MAX_MEDIA_FILE_BYTES).toBe(134_217_728);
+    await expect(
+      storage.uploadFile(
+        tree,
+        "boundary.bin",
+        // The mocked encryptor only reads the size gate. Avoid allocating a
+        // 128 MiB fixture in every parallel unit worker.
+        { byteLength: MAX_MEDIA_FILE_BYTES } as never,
+        "application/octet-stream",
+      ),
+    ).resolves.toBe("$media-boundary");
+    expect(createFile).toHaveBeenCalledWith(
+      "boundary.bin",
+      expect.anything(),
+      expect.anything(),
+      { info: { mimetype: "application/octet-stream", size: MAX_MEDIA_FILE_BYTES } },
+    );
   });
 
   it("rejects unsafe file metadata before encryption or event creation", async () => {
