@@ -60,7 +60,7 @@ jobs:
             test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
             test "$status" = 0
             test ! -s "$error"
-            ! rg -qi '\bwarn(ing)?\b' "$output" "$error"
+            ! grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"
           }
           bounded_command "$RUNNER_TEMP/npm-ci.out" 600 npm ci --ignore-scripts --no-fund --no-audit --loglevel=error
           bounded_command "$RUNNER_TEMP/npm-lint.out" 300 npm run lint

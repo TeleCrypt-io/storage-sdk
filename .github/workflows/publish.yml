@@ -102,7 +102,7 @@ jobs:
             test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
             if test "$status" = 0; then
               test ! -s "$error"
-              if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+              if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
             fi
             return "$status"
           }
@@ -128,7 +128,7 @@ jobs:
             test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
             test "$status" = 0
             test ! -s "$error"
-            if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+            if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
           }
           bounded_command "$RUNNER_TEMP/npm-pack.out" npm pack --ignore-scripts --pack-destination release --loglevel=error
           mapfile -t archives < <(find release -maxdepth 1 -type f -name '*.tgz' -print)
@@ -159,7 +159,7 @@ jobs:
           package/dist/index.js
           package/package.json'
           test "$(tar -tzf "$archive" | sort)" = "$(printf '%b\n' "$expected" | sort)"
-          if tar -tzf "$archive" | rg -q '(^|/)node_modules(/|$)'; then exit 1; fi
+          if tar -tzf "$archive" | grep -Eq '(^|/)node_modules(/|$)'; then exit 1; fi
           test "$(tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
           size="$(wc -c <"$archive")"
           test "$size" -gt 0 -a "$size" -le 134217728
@@ -331,7 +331,7 @@ jobs:
             set -e
             test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
             test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
-            if rg -q '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
+            if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
             python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
             cmp -s "$listing.license" LICENSE
             test "$(wc -c <"$listing.license")" -le 65536
@@ -452,7 +452,7 @@ jobs:
           set -e
           test "$status" = 0
           test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288 -a ! -s "$error"
-          if rg -qi '\bwarn(ing)?\b' "$output" "$error"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
           test "$(npm --version)" = 11.5.1
       - name: Verify the immutable Release and publish the exact archive
         env:
@@ -525,7 +525,7 @@ jobs:
             set -e
             test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
             test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
-            if rg -q '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
+            if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
             python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
             cmp -s "$listing.license" LICENSE
             test "$(wc -c <"$listing.license")" -le 65536
@@ -594,7 +594,7 @@ jobs:
             set -e
             test "$publish_status" = 0
             test "$(wc -c <"$publish_out")" -le 131072 -a "$(wc -c <"$publish_err")" -le 131072 -a ! -s "$publish_err"
-            if rg -qi '\bwarn(ing)?\b' "$publish_out" "$publish_err"; then exit 1; fi
+            if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$publish_out" "$publish_err"; then exit 1; fi
             ;;
             200)
             ;;
@@ -621,7 +621,7 @@ jobs:
           set -e
           test "$status" = 0
           test "$(wc -c <"$d/dist.json")" -le 131072 -a "$(wc -c <"$d/dist.err")" -le 131072 -a ! -s "$d/dist.err"
-          if rg -qi '\bwarn(ing)?\b' "$d/dist.json" "$d/dist.err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/dist.json" "$d/dist.err"; then exit 1; fi
           node - "$d/dist.json" "$archive" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
           const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -636,7 +636,7 @@ jobs:
           set -e
           test "$status" = 0
           test "$(wc -c <"$d/githead.json")" -le 131072 -a "$(wc -c <"$d/githead.err")" -le 131072 -a ! -s "$d/githead.err"
-          if rg -qi '\bwarn(ing)?\b' "$d/githead.json" "$d/githead.err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/githead.json" "$d/githead.err"; then exit 1; fi
           node - "$d/githead.json" "$RELEASE_SHA" <<'NODE'
           const fs = require("node:fs");
           const gitHead = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -655,7 +655,7 @@ jobs:
           set -e
           test "$status" = 0
           test "$(wc -c <"$d/pack.json")" -le 131072 -a "$(wc -c <"$d/pack.err")" -le 131072 -a ! -s "$d/pack.err"
-          if rg -qi '\bwarn(ing)?\b' "$d/pack.json" "$d/pack.err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/pack.json" "$d/pack.err"; then exit 1; fi
           mapfile -t packed < <(find "$d" -maxdepth 1 -type f -name '*.tgz' -print)
           test "${#packed[@]}" = 1
           cmp -s "$archive" "${packed[0]}"
@@ -670,7 +670,7 @@ jobs:
           status="$?"
           set -e
           test "$status" = 0 -a "$(wc -c <"$audit_install_out")" -le 524288 -a "$(wc -c <"$audit_install_err")" -le 524288 -a ! -s "$audit_install_err"
-          if rg -qi '\bwarn(ing)?\b' "$audit_install_out" "$audit_install_err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_install_out" "$audit_install_err"; then exit 1; fi
           audit_out="$d/audit.out"
           audit_err="$audit_out.err"
           set +e
@@ -678,6 +678,6 @@ jobs:
           status="$?"
           set -e
           test "$status" = 0 -a "$(wc -c <"$audit_out")" -le 524288 -a "$(wc -c <"$audit_err")" -le 524288 -a ! -s "$audit_err"
-          if rg -qi '\bwarn(ing)?\b' "$audit_out" "$audit_err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_out" "$audit_err"; then exit 1; fi
           test -s "$audit_out"
-          rg -qi 'verified attestations?' "$audit_out"
+          grep -Eqi 'verified attestations?' "$audit_out"
