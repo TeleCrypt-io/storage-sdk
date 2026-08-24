@@ -15,7 +15,7 @@ is maintained in its own repository.
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.5.0
+npm install @telecrypt-io/storage@0.5.1
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
