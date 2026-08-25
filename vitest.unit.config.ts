@@ -13,6 +13,7 @@ export default defineConfig({
       "test/operations-safety.test.ts",
       "test/media-safety.test.ts",
       "test/users.test.ts",
+      "test/npm-provenance.test.ts",
     ],
   },
 });

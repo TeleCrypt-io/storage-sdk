@@ -659,18 +659,25 @@ jobs:
           if (typeof dist.integrity !== "string" || dist.integrity !== `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`) process.exit(1);
           if (!dist.attestations || typeof dist.attestations.url !== "string" || !dist.attestations.url) process.exit(1);
           NODE
+          attestations_url="$(node - "$d/dist.json" "$PACKAGE_NAME" "$version" <<'NODE'
+          const fs = require("node:fs");
+          const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const packageName = process.argv[3];
+          const version = process.argv[4];
+          const expected = `https://registry.npmjs.org/-/npm/v1/attestations/${packageName.replaceAll("/", "%2f")}@${version}`;
+          let parsed;
+          try { parsed = new URL(dist.attestations.url); } catch { process.exit(1); }
+          if (dist.attestations.url !== expected || parsed.protocol !== "https:" || parsed.hostname !== "registry.npmjs.org" || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) process.exit(1);
+          process.stdout.write(parsed.toString());
+          NODE
+          )"
           set +e
-          python3 scripts/bounded-command.py --stdout "$d/githead.json" --stderr "$d/githead.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm view "$package" gitHead --json --loglevel=error
+          python3 scripts/bounded-command.py --stdout "$d/attestations.json" --stderr "$d/attestations.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
           status="$?"
           set -e
           test "$status" = 0
-          test "$(wc -c <"$d/githead.json")" -le 131072 -a "$(wc -c <"$d/githead.err")" -le 131072 -a ! -s "$d/githead.err"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/githead.json" "$d/githead.err"; then exit 1; fi
-          node - "$d/githead.json" "$RELEASE_SHA" <<'NODE'
-          const fs = require("node:fs");
-          const gitHead = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (typeof gitHead !== "string" || !/^[0-9a-f]{40}$/u.test(gitHead) || gitHead !== process.argv[3]) process.exit(1);
-          NODE
+          test "$(wc -c <"$d/attestations.json")" -le 131072 -a "$(wc -c <"$d/attestations.err")" -le 131072 -a ! -s "$d/attestations.err"
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/attestations.json" "$d/attestations.err"; then exit 1; fi
           node - "$d/dist.json" "$archive" "$record" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
           const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -710,3 +717,12 @@ jobs:
           if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_out" "$audit_err"; then exit 1; fi
           test -s "$audit_out"
           grep -Eqi 'verified attestations?' "$audit_out"
+          verify_out="$d/provenance.out"
+          verify_err="$verify_out.err"
+          set +e
+          python3 scripts/bounded-command.py --stdout "$verify_out" --stderr "$verify_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$d/attestations.json" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"
+          status="$?"
+          set -e
+          test "$status" = 0 -a "$(wc -c <"$verify_out")" -le 131072 -a "$(wc -c <"$verify_err")" -le 131072 -a ! -s "$verify_err"
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$verify_out" "$verify_err"; then exit 1; fi
+          grep -Fq 'verified npm provenance' "$verify_out"

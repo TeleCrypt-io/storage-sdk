@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "license": "BUSL-1.1",
   "type": "module",
   "packageManager": "npm@10.9.8",

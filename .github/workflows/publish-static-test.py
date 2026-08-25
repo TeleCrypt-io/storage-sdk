@@ -181,20 +181,23 @@ def check_state_machine() -> None:
         raise ContractError("accepted a published Release on the initial attempt")
 
 
-def check_registry_git_head() -> None:
-    expected = "a" * 40
-
-    def verify(value: object) -> None:
-        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value != expected:
-            raise ContractError("npm registry gitHead is not the exact release commit")
-
-    verify(expected)
-    for invalid in (None, "", "main", "b" * 40, 123):
-        try:
-            verify(invalid)
-        except ContractError:
-            continue
-        raise ContractError("invalid npm registry gitHead was accepted")
+def check_provenance_verifier() -> None:
+    verifier = (ROOT / "scripts/verify-npm-provenance.mjs").read_text(encoding="utf-8")
+    test_file = (ROOT / "test/npm-provenance.test.ts").read_text(encoding="utf-8")
+    for fragment in (
+        "verifyNpmProvenance",
+        "SLSA_PREDICATE",
+        "NPM_PUBLISH_PREDICATE",
+        "resolvedDependencies",
+        "GITHUB_HOSTED_BUILDER",
+        "sha512Hex",
+        "expectedAttestationsUrl",
+    ):
+        if fragment not in verifier:
+            raise ContractError(f"npm provenance verifier is missing {fragment}")
+    for fragment in ("accepts the exact npm and SLSA statements", "rejects a mutation", "duplicate or missing"):
+        if fragment not in test_file:
+            raise ContractError(f"npm provenance adversarial coverage is missing {fragment}")
 
 
 def check_workflow_operations() -> None:
@@ -288,9 +291,22 @@ def check_workflow_operations() -> None:
         raise ContractError("the publish job must establish npm 10.9.8 before its trusted-publishing upgrade")
     if publish.index('test "$(npm --version)" = 11.5.1') < publish.index("npm install --global npm@11.5.1"):
         raise ContractError("the publish job must verify npm 11.5.1 after its upgrade")
-    for fragment in ('npm view "$package" gitHead --json', 'githead.json', 'gitHead', 'process.argv[3]'):
+    for fragment in (
+        "attestations_url=",
+        "attestations.json",
+        "scripts/verify-npm-provenance.mjs",
+        "--attestations",
+        "--package",
+        "--version",
+        "--tag",
+        "--commit",
+    ):
         if fragment not in publish:
-            raise ContractError(f"npm registry gitHead binding is missing {fragment}")
+            raise ContractError(f"npm attestation binding is missing {fragment}")
+    if "gitHead" in publish or "githead.json" in publish:
+        raise ContractError("npm registry gitHead binding remains; provenance is authoritative")
+    if publish.index("npm audit signatures") > publish.index("scripts/verify-npm-provenance.mjs"):
+        raise ContractError("cryptographic npm signature verification must precede payload binding")
     if '"$d/audit.txt"' in publish:
         raise ContractError("npm audit output still references a nonexistent file")
     if "curl" not in publish or "https://registry.npmjs.org/@telecrypt-io%2fstorage/" not in publish:
@@ -311,7 +327,7 @@ def check_workflow_operations() -> None:
 
 
 check_state_machine()
-check_registry_git_head()
+check_provenance_verifier()
 check_workflow_operations()
 if ".github/workflows/publish-static-test.py" not in VERIFY:
     raise ContractError("verify workflow must run the semantic release check")
