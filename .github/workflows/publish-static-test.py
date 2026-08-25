@@ -277,6 +277,9 @@ def check_workflow_operations() -> None:
     for fragment in ("npm publish", "--provenance", "npm install --global npm@11.5.1", "npm audit signatures"):
         if fragment not in publish:
             raise ContractError(f"npm trust boundary is missing {fragment}")
+    for fragment in ('cat "$publish_out" >&2', 'exit "$publish_status"'):
+        if fragment not in publish:
+            raise ContractError(f"npm publish failure output is missing {fragment}")
     if "Keep the deterministic build on npm 10.9.8" not in publish or "Trusted Publishing with" not in publish or "requires npm 11.5.1+" not in publish:
         raise ContractError("the exact npm build/publish split is not documented")
     if "npm install --global npm@11.5.1" in build:

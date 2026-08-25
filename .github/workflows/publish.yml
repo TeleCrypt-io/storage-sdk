@@ -616,8 +616,11 @@ jobs:
             python3 scripts/bounded-command.py --stdout "$publish_out" --stderr "$publish_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm publish "$archive" --access public --provenance --ignore-scripts --loglevel=error
             publish_status="$?"
             set -e
-            test "$publish_status" = 0
             test "$(wc -c <"$publish_out")" -le 131072 -a "$(wc -c <"$publish_err")" -le 131072 -a ! -s "$publish_err"
+            if test "$publish_status" != 0; then
+              cat "$publish_out" >&2
+              exit "$publish_status"
+            fi
             if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$publish_out" "$publish_err"; then exit 1; fi
             ;;
             200)
