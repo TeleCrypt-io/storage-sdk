@@ -274,7 +274,7 @@ def check_workflow_operations() -> None:
     for fragment in ("EXPECTED_RECORD_DIGEST:", "EXPECTED_RECORD_SIZE:"):
         if fragment not in publish_job:
             raise ContractError(f"publish job is missing {fragment}")
-    for fragment in ("npm publish", "--provenance", "npm install --global npm@11.5.1", "npm audit signatures"):
+    for fragment in ('npm publish "./$archive"', "--provenance", "npm install --global npm@11.5.1", "npm audit signatures"):
         if fragment not in publish:
             raise ContractError(f"npm trust boundary is missing {fragment}")
     for fragment in ('cat "$publish_out" >&2', 'cat "$publish_err" >&2', 'exit "$publish_status"'):
