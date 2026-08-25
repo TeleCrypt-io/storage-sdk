@@ -104,6 +104,34 @@ describe("operation safety", () => {
     expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
   });
 
+  it("accepts exactly 128 unique media IDs in one deletion request", async () => {
+    const fixture = deletionFixture(
+      Array.from({ length: 128 }, (_, index) => ({
+        id: `$v${index}`,
+        mediaId: `mxc://example.test/v${index}`,
+      })),
+    );
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v0")).resolves.toEqual({
+      id: "$v0",
+      deleted: true,
+    });
+
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
+    const body = fixture.client.http.authedRequest.mock.calls[0]?.[3] as {
+      media_ids?: unknown;
+    } | undefined;
+    expect(body?.media_ids).toEqual(
+      Array.from({ length: 128 }, (_, index) => `mxc://example.test/v${index}`),
+    );
+    expect(new Set(body?.media_ids as unknown[]).size).toBe(128);
+    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(128);
+    expect(fixture.client.redactEvent).toHaveBeenCalledTimes(128);
+    expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
+      fixture.client.sendStateEvent.mock.invocationCallOrder[0],
+    );
+  });
+
   it("rejects a cyclic version chain before any media or event mutation", async () => {
     const fixture = deletionFixture([{ id: "$v2", mediaId: "mxc://example.test/v2" }]);
     fixture.versions[0].getVersionHistory.mockResolvedValue([
