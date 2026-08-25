@@ -93,6 +93,8 @@ export interface FileBranch {
 export interface CreateTeleCryptIOStorageOptions {
   /** Matrix homeserver base URL, e.g. "https://matrix.example.com". */
   baseUrl: string;
+  /** Independently trusted Matrix server name for this deployment. */
+  serverName: string;
   userId: string;
   accessToken: string;
   deviceId: string;
@@ -141,6 +143,8 @@ export interface CreateTeleCryptIOStorageOptions {
  */
 export interface CreateFromOidcOptions {
   baseUrl: string;
+  /** Independently trusted Matrix server name for this deployment. */
+  serverName: string;
   userId: string;
   accessToken: string;
   deviceId: string;
@@ -774,7 +778,7 @@ export class TeleCryptIOStorage {
   */
   static async create(opts: CreateTeleCryptIOStorageOptions): Promise<TeleCryptIOStorage> {
     const baseUrl = validateHomeserverUrl(opts.baseUrl).toString();
-    validateCanonicalMatrixUserId(opts.userId, new URL(baseUrl));
+    validateCanonicalMatrixUserId(opts.userId, opts.serverName);
     validateMatrixDeviceId(opts.deviceId);
     validateMatrixToken(opts.accessToken);
     TeleCryptIOStorage.throwIfAborted(opts.signal);
@@ -801,7 +805,7 @@ export class TeleCryptIOStorage {
   */
   static async createFromOidc(opts: CreateFromOidcOptions): Promise<TeleCryptIOStorage> {
     const baseUrl = validateHomeserverUrl(opts.baseUrl).toString();
-    validateCanonicalMatrixUserId(opts.userId, new URL(baseUrl));
+    validateCanonicalMatrixUserId(opts.userId, opts.serverName);
     validateMatrixDeviceId(opts.deviceId);
     validateMatrixToken(opts.accessToken);
     if (opts.refreshToken !== undefined) validateMatrixToken(opts.refreshToken);

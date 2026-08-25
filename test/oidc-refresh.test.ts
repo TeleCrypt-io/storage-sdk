@@ -772,7 +772,7 @@ describe("Matrix 42 OAuth migration", () => {
 
     let caught: unknown;
     try {
-      await whoAmI("https://homeserver.example.test", "access-token");
+      await whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test");
     } catch (error) {
       caught = error;
     }
@@ -791,7 +791,7 @@ describe("Matrix 42 OAuth migration", () => {
       ),
     );
     await expect(
-      whoAmI("https://homeserver.example.test", "access-token"),
+      whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test"),
     ).rejects.toThrow("foreign user ID");
 
     vi.stubGlobal(
@@ -801,7 +801,7 @@ describe("Matrix 42 OAuth migration", () => {
       ),
     );
     await expect(
-      whoAmI("https://homeserver.example.test", "access-token"),
+      whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test"),
     ).rejects.toThrow("invalid device ID");
 
     vi.stubGlobal(
@@ -811,7 +811,7 @@ describe("Matrix 42 OAuth migration", () => {
       ),
     );
     await expect(
-      whoAmI("https://homeserver.example.test", "access-token"),
+      whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test"),
     ).resolves.toEqual({ userId: "@alice:homeserver.example.test", deviceId: "DEVICE123" });
 
     vi.stubGlobal(
@@ -821,7 +821,7 @@ describe("Matrix 42 OAuth migration", () => {
       ),
     );
     await expect(
-      whoAmI("https://homeserver.example.test", "access-token"),
+      whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test"),
     ).resolves.toMatchObject({ userId: "@alice+storage:homeserver.example.test" });
 
     vi.stubGlobal(
@@ -831,8 +831,22 @@ describe("Matrix 42 OAuth migration", () => {
       ),
     );
     await expect(
-      whoAmI("https://homeserver.example.test:8448", "access-token"),
+      whoAmI("https://homeserver.example.test:8448", "access-token", "homeserver.example.test:8448"),
     ).rejects.toThrow("foreign user ID");
+  });
+
+  it.each([
+    ["https://backend.telecrypt.io", "telecrypt.io", "@alice:telecrypt.io"],
+    ["https://backend.stage.telecrypt.io", "stage.telecrypt.io", "@alice:stage.telecrypt.io"],
+  ])("accepts the explicit %s Matrix server name", async (homeserver, serverName, userId) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(response({ user_id: userId, device_id: "DEVICE123" })),
+    );
+    await expect(whoAmI(homeserver, "access-token", serverName)).resolves.toEqual({
+      userId,
+      deviceId: "DEVICE123",
+    });
   });
 
   it("rejects a homeserver identity redirect without following it", async () => {
@@ -841,7 +855,7 @@ describe("Matrix 42 OAuth migration", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(whoAmI("https://homeserver.example.test", "access-token")).rejects.toThrow(
+    await expect(whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test")).rejects.toThrow(
       "OIDC identity confirmation failed",
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -859,7 +873,7 @@ describe("Matrix 42 OAuth migration", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const pending = whoAmI("https://homeserver.example.test", "access-token", controller.signal);
+    const pending = whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test", controller.signal);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     controller.abort();
     await expect(pending).rejects.toThrow("OIDC identity confirmation cancelled");
@@ -886,7 +900,7 @@ describe("Matrix 42 OAuth migration", () => {
     } as unknown as Response);
     vi.stubGlobal("fetch", fetchMock);
 
-    const pending = whoAmI("https://homeserver.example.test", "access-token", controller.signal);
+    const pending = whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test", controller.signal);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     controller.abort();
 

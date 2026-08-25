@@ -110,7 +110,7 @@ async function loginViaDeviceCode(
     throw new Error(`device-code login failed (${result.error}): ${result.error_description ?? "no description"}`);
   }
 
-  const identity = await whoAmI(HOMESERVER, result.access_token);
+  const identity = await whoAmI(HOMESERVER, result.access_token, "localhost:8008");
   if (identity.deviceId !== deviceId) {
     throw new Error(
       `device-code login returned device ${identity.deviceId ?? "none"}, expected ${deviceId}`,

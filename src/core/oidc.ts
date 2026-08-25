@@ -1210,9 +1210,9 @@ export function extractDeviceIdFromScope(scope: string): string | null {
   return DEVICE_ID_PATTERN.test(deviceId) ? deviceId : null;
 }
 
-function validateMatrixUserId(userId: unknown, homeserver: URL): string {
+function validateMatrixUserId(userId: unknown, serverName: string): string {
   try {
-    return validateCanonicalMatrixUserId(userId, homeserver);
+    return validateCanonicalMatrixUserId(userId, serverName);
   } catch {
     throw new StorageError("OIDC identity confirmation returned an invalid or foreign user ID");
   }
@@ -1225,6 +1225,7 @@ function validateMatrixUserId(userId: unknown, homeserver: URL): string {
 export async function whoAmI(
   homeserverUrl: string,
   accessToken: string,
+  serverName: string,
   signal?: AbortSignal,
 ): Promise<{ userId: string; deviceId: string | null }> {
   try {
@@ -1238,7 +1239,7 @@ export async function whoAmI(
       fetchFn: boundedMatrixFetch("identity confirmation", signal),
     });
     const res = await client.whoami();
-    const userId = validateMatrixUserId(res?.user_id, homeserver);
+    const userId = validateMatrixUserId(res?.user_id, serverName);
     if (res.device_id !== undefined && res.device_id !== null) {
       try {
         validateMatrixDeviceId(res.device_id);

@@ -21,6 +21,7 @@ async function createStorage(user: {
 }): Promise<TeleCryptIOStorage> {
   return TeleCryptIOStorage.create({
     baseUrl: BASE_URL,
+    serverName: "localhost:8008",
     userId: user.userId,
     accessToken: user.accessToken,
     deviceId: user.deviceId,

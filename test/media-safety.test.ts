@@ -9,7 +9,7 @@ vi.mock("matrix-encrypt-attachment", () => ({
 
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { FileTooLargeError } from "../src/core/errors.js";
-import { MAX_MEDIA_FILE_BYTES } from "../src/core/constants.js";
+import { MAX_MEDIA_FILE_BYTES, validateCanonicalMatrixUserId } from "../src/core/constants.js";
 
 function branch() {
   return {
@@ -24,10 +24,25 @@ afterEach(() => {
 });
 
 describe("media safety bounds", () => {
+  it.each([
+    ["https://backend.telecrypt.io", "telecrypt.io", "@alice:telecrypt.io"],
+    ["https://backend.stage.telecrypt.io", "stage.telecrypt.io", "@alice:stage.telecrypt.io"],
+  ])("binds %s identities to an explicit Matrix server name", (homeserver, serverName, userId) => {
+    expect(new URL(homeserver).hostname).not.toBe(serverName);
+    expect(validateCanonicalMatrixUserId(userId, serverName)).toBe(userId);
+  });
+
+  it("does not infer the Matrix server name from the backend hostname", () => {
+    expect(() => validateCanonicalMatrixUserId("@alice:telecrypt.io", "backend.telecrypt.io")).toThrow(
+      "invalid Matrix user ID for this homeserver",
+    );
+  });
+
   it("rejects remote cleartext homeservers before constructing a client", async () => {
     await expect(
       TeleCryptIOStorage.create({
         baseUrl: "http://matrix.example.test",
+        serverName: "example.test",
         userId: "@alice:example.test",
         accessToken: "access-token",
         deviceId: "DEVICE123",
@@ -39,6 +54,7 @@ describe("media safety bounds", () => {
     await expect(
       TeleCryptIOStorage.create({
         baseUrl: "https://matrix.example.test",
+        serverName: "example.test",
         userId: "@alice:example.test\n",
         accessToken: "access-token",
         deviceId: "DEVICE123",

@@ -81,12 +81,13 @@ describe("OIDC/MAS login", () => {
       expect(result.access_token).toBeTruthy();
       expect(result.refresh_token).toBeTruthy();
 
-      const who = await oidc.whoAmI(HOMESERVER, result.access_token);
+      const who = await oidc.whoAmI(HOMESERVER, result.access_token, "localhost:8008");
       expect(who.userId).toBe(`@${user.localpart}:localhost:8008`);
       expect(who.deviceId).toBe(deviceId);
 
       const storage = await TeleCryptIOStorage.createFromOidc({
         baseUrl: HOMESERVER,
+        serverName: "localhost:8008",
         userId: who.userId,
         accessToken: result.access_token,
         deviceId,
@@ -137,7 +138,7 @@ describe("OIDC/MAS login", () => {
       // Prove the REFRESHED token is genuinely independently usable — not
       // just "the endpoint returned a string" — by driving a real storage
       // operation with it, same bar as O.1.
-      const who = await oidc.whoAmI(HOMESERVER, refreshed.accessToken);
+      const who = await oidc.whoAmI(HOMESERVER, refreshed.accessToken, "localhost:8008");
       expect(who.userId).toBe(`@${user.localpart}:localhost:8008`);
 
       // Also exercise `buildTokenRefreshFunction`'s persistence-hook wiring
@@ -161,6 +162,7 @@ describe("OIDC/MAS login", () => {
 
       const storage = await TeleCryptIOStorage.createFromOidc({
         baseUrl: HOMESERVER,
+        serverName: "localhost:8008",
         userId: who.userId,
         accessToken: refreshed.accessToken,
         deviceId,

@@ -33,7 +33,7 @@ async function loginWithDeviceId(username: string, password: string, deviceId: s
   if (isDeviceAccessTokenError(result)) {
     throw new Error(`MAS rejected: ${result.error_description ?? result.error}`);
   }
-  const identity = await whoAmI(BASE_URL, result.access_token);
+  const identity = await whoAmI(BASE_URL, result.access_token, "localhost:8008");
   return { deviceId: identity.deviceId, accessToken: result.access_token };
 }
 
@@ -48,8 +48,8 @@ describe("MAS device_id reuse", () => {
     expect(second.deviceId).toBe(STABLE);
 
     // Both tokens must be valid (same device, two sessions).
-    const who1 = await whoAmI(BASE_URL, first.accessToken);
-    const who2 = await whoAmI(BASE_URL, second.accessToken);
+    const who1 = await whoAmI(BASE_URL, first.accessToken, "localhost:8008");
+    const who2 = await whoAmI(BASE_URL, second.accessToken, "localhost:8008");
     expect(who1.deviceId).toBe(STABLE);
     expect(who2.deviceId).toBe(STABLE);
   });
