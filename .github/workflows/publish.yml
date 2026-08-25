@@ -647,7 +647,8 @@ jobs:
           bounded_registry_retry() {
             local output="$1" error="$2" status attempt
             shift 2
-            for attempt in 1 2 3 4 5 6; do
+            # npm may expose package metadata before its attestation index; retry only these safe reads.
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
               : >"$output"
               : >"$error"
               set +e
@@ -659,7 +660,7 @@ jobs:
                 test ! -s "$error"
                 return 0
               fi
-              if test "$attempt" = 6; then
+              if test "$attempt" = 12; then
                 cat "$output" >&2
                 cat "$error" >&2
                 return "$status"

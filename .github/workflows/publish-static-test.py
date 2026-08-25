@@ -295,7 +295,7 @@ def check_workflow_operations() -> None:
         "attestations_url=",
         "attestations.json",
         "bounded_registry_retry",
-        "for attempt in 1 2 3 4 5 6",
+        "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12",
         "sleep 10",
         "scripts/verify-npm-provenance.mjs",
         "--attestations",
