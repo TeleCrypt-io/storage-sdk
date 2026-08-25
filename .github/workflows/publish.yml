@@ -446,6 +446,8 @@ jobs:
       EXPECTED_RELEASE_ID: ${{ needs.release.outputs.release_id }}
       EXPECTED_DIGEST: ${{ needs.build.outputs.archive_digest }}
       EXPECTED_SIZE: ${{ needs.build.outputs.archive_size }}
+      EXPECTED_RECORD_DIGEST: ${{ needs.build.outputs.record_digest }}
+      EXPECTED_RECORD_SIZE: ${{ needs.build.outputs.record_size }}
     steps:
       - uses: actions/checkout@v7.0.1
         with: {fetch-depth: 0, persist-credentials: false}

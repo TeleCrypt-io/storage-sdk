@@ -199,7 +199,8 @@ def check_registry_git_head() -> None:
 
 def check_workflow_operations() -> None:
     release = job("release")
-    publish = job("publish")
+    publish_job = job("publish")
+    publish = publish_job
     build = job("build")
     release_shell = step(release, "Create or reuse the exact draft Release")
     required = (
@@ -260,8 +261,19 @@ def check_workflow_operations() -> None:
         raise ContractError("every SDK job must use a credential-free full checkout")
     if "publish:\n    needs: [build, release]" not in WORKFLOW:
         raise ContractError("publish job is not downstream of the immutable Release")
-    if "needs.build.outputs.archive_digest" not in WORKFLOW or "needs.build.outputs.archive_size" not in WORKFLOW or "needs.build.outputs.record_digest" not in WORKFLOW:
+    if any(
+        fragment not in WORKFLOW
+        for fragment in (
+            "needs.build.outputs.archive_digest",
+            "needs.build.outputs.archive_size",
+            "needs.build.outputs.record_digest",
+            "needs.build.outputs.record_size",
+        )
+    ):
         raise ContractError("archive expectations are not sourced from the build")
+    for fragment in ("EXPECTED_RECORD_DIGEST:", "EXPECTED_RECORD_SIZE:"):
+        if fragment not in publish_job:
+            raise ContractError(f"publish job is missing {fragment}")
     for fragment in ("npm publish", "--provenance", "npm install --global npm@11.5.1", "npm audit signatures"):
         if fragment not in publish:
             raise ContractError(f"npm trust boundary is missing {fragment}")
