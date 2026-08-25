@@ -294,6 +294,9 @@ def check_workflow_operations() -> None:
     for fragment in (
         "attestations_url=",
         "attestations.json",
+        "bounded_registry_retry",
+        "for attempt in 1 2 3 4 5 6",
+        "sleep 10",
         "scripts/verify-npm-provenance.mjs",
         "--attestations",
         "--package",

@@ -644,12 +644,30 @@ jobs:
           record="release/$RELEASE_TAG.integrity.json"
           d="$RUNNER_TEMP/npm-registry"
           mkdir -p "$d"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$d/dist.json" --stderr "$d/dist.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm view "$package" dist --json --loglevel=error
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$d/dist.json")" -le 131072 -a "$(wc -c <"$d/dist.err")" -le 131072 -a ! -s "$d/dist.err"
+          bounded_registry_retry() {
+            local output="$1" error="$2" status attempt
+            shift 2
+            for attempt in 1 2 3 4 5 6; do
+              : >"$output"
+              : >"$error"
+              set +e
+              python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- "$@"
+              status="$?"
+              set -e
+              test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
+              if test "$status" = 0; then
+                test ! -s "$error"
+                return 0
+              fi
+              if test "$attempt" = 6; then
+                cat "$output" >&2
+                cat "$error" >&2
+                return "$status"
+              fi
+              sleep 10
+            done
+          }
+          bounded_registry_retry "$d/dist.json" "$d/dist.err" npm view "$package" dist --json --loglevel=error
           if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/dist.json" "$d/dist.err"; then exit 1; fi
           node - "$d/dist.json" "$archive" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
@@ -671,12 +689,7 @@ jobs:
           process.stdout.write(parsed.toString());
           NODE
           )"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$d/attestations.json" --stderr "$d/attestations.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$d/attestations.json")" -le 131072 -a "$(wc -c <"$d/attestations.err")" -le 131072 -a ! -s "$d/attestations.err"
+          bounded_registry_retry "$d/attestations.json" "$d/attestations.err" curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
           if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/attestations.json" "$d/attestations.err"; then exit 1; fi
           node - "$d/dist.json" "$archive" "$record" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
