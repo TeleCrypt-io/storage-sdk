@@ -79,13 +79,13 @@ jobs:
           git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
           rm -rf "$d"
       - uses: actions/setup-node@v7.0.0
-        with: {node-version: "22.23.2", cache: npm}
+        with: {node-version: "24.20.0", cache: npm}
       - name: Verify toolchain and package version
         shell: bash
         run: |
           set -euo pipefail
-          test "$(node --version)" = v22.23.2
-          test "$(npm --version)" = 10.9.8
+          test "$(node --version)" = v24.20.0
+          test "$(npm --version)" = 11.19.0
           expected="${RELEASE_TAG#v}"
           EXPECTED="$expected" node -e 'const f=require("fs"),p=JSON.parse(f.readFileSync("package.json")),l=JSON.parse(f.readFileSync("package-lock.json")); if(p.name!=="@telecrypt-io/storage"||p.version!==process.env.EXPECTED||l.name!==p.name||l.lockfileVersion!==3||l.packages?.[""].version!==process.env.EXPECTED)process.exit(1)'
       - name: Test and build the release source
@@ -456,26 +456,13 @@ jobs:
           name: storage-sdk-${{ github.run_id }}-${{ github.sha }}
           path: release
       - uses: actions/setup-node@v7.0.0
-        with: {node-version: "22.23.2", registry-url: https://registry.npmjs.org}
+        with: {node-version: "24.20.0", registry-url: https://registry.npmjs.org}
       - name: Verify the exact Trusted Publishing toolchain
         shell: bash
         run: |
           set -euo pipefail
-          test "$(node --version)" = v22.23.2
-          # Keep the deterministic build on npm 10.9.8. Trusted Publishing with
-          # GitHub's OIDC exchange requires npm 11.5.1+, so upgrade only after
-          # the tested archive is immutable and ready for npm publish.
-          test "$(npm --version)" = 10.9.8
-          output="$RUNNER_TEMP/npm-upgrade.out"
-          error="$output.err"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm install --global npm@11.5.1 --ignore-scripts --no-fund --no-audit --loglevel=error
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288 -a ! -s "$error"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
-          test "$(npm --version)" = 11.5.1
+          test "$(node --version)" = v24.20.0
+          test "$(npm --version)" = 11.19.0
       - name: Verify the immutable Release and publish the exact archive
         env:
           GH_TOKEN: ${{ github.token }}

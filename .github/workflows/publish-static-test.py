@@ -16,6 +16,8 @@ ROOT = Path(__file__).parents[2]
 WORKFLOW = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
 VERIFY = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
 PACKAGE = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+PACKAGE_LOCK = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
+NODE_VERSION = (ROOT / ".node-version").read_text(encoding="utf-8").strip()
 
 
 class ContractError(AssertionError):
@@ -277,20 +279,16 @@ def check_workflow_operations() -> None:
     for fragment in ("EXPECTED_RECORD_DIGEST:", "EXPECTED_RECORD_SIZE:"):
         if fragment not in publish_job:
             raise ContractError(f"publish job is missing {fragment}")
-    for fragment in ('npm publish "./$archive"', "--provenance", "npm install --global npm@11.5.1", "npm audit signatures"):
+    for fragment in ('npm publish "./$archive"', "--provenance", "npm audit signatures"):
         if fragment not in publish:
             raise ContractError(f"npm trust boundary is missing {fragment}")
     for fragment in ('cat "$publish_out" >&2', 'cat "$publish_err" >&2', 'exit "$publish_status"'):
         if fragment not in publish:
             raise ContractError(f"npm publish failure output is missing {fragment}")
-    if "Keep the deterministic build on npm 10.9.8" not in publish or "Trusted Publishing with" not in publish or "requires npm 11.5.1+" not in publish:
-        raise ContractError("the exact npm build/publish split is not documented")
-    if "npm install --global npm@11.5.1" in build:
-        raise ContractError("the build job must not change the exact npm toolchain")
-    if publish.index('test "$(npm --version)" = 10.9.8') > publish.index("npm install --global npm@11.5.1"):
-        raise ContractError("the publish job must establish npm 10.9.8 before its trusted-publishing upgrade")
-    if publish.index('test "$(npm --version)" = 11.5.1') < publish.index("npm install --global npm@11.5.1"):
-        raise ContractError("the publish job must verify npm 11.5.1 after its upgrade")
+    if 'test "$(node --version)" = v24.20.0' not in publish or 'test "$(npm --version)" = 11.19.0' not in publish:
+        raise ContractError("the publish job does not verify the exact Trusted Publishing toolchain")
+    if "npm install --global npm@" in WORKFLOW:
+        raise ContractError("the workflow must not replace the exact bundled npm toolchain")
     for fragment in (
         "attestations_url=",
         "attestations.json",
@@ -318,8 +316,14 @@ def check_workflow_operations() -> None:
         raise ContractError("npm existence check is not a machine-confirmed registry status")
     if '--output "$downloaded"' in publish or '--output "$downloaded_record"' in publish or "--max-time 120s" in publish:
         raise ContractError("binary release readback or curl timeout uses an unsupported option")
-    if PACKAGE.get("packageManager") != "npm@10.9.8" or PACKAGE.get("engines", {}).get("node") != "22.23.2":
+    if PACKAGE.get("packageManager") != "npm@11.19.0" or PACKAGE.get("engines", {}).get("node") != "24.20.0":
         raise ContractError("package.json does not declare the exact toolchain")
+    if NODE_VERSION != "24.20.0" or PACKAGE_LOCK.get("packages", {}).get("", {}).get("engines", {}).get("node") != NODE_VERSION:
+        raise ContractError("the Node.js declarations do not match the exact release toolchain")
+    if WORKFLOW.count('node-version: "24.20.0"') != 2 or VERIFY.count('node-version: "24.20.0"') != 1:
+        raise ContractError("the hosted jobs do not all select the exact release toolchain")
+    if VERIFY.count('test "$(npm --version)" = "11.19.0"') != 1:
+        raise ContractError("the verification job does not verify the exact bundled npm toolchain")
     if "npm ci --ignore-scripts --no-fund --no-audit" not in build:
         raise ContractError("release build must install without lifecycle scripts or audit network access")
     if "revalidate_draft_for_publish" not in release_shell:

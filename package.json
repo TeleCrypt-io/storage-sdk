@@ -1,9 +1,9 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "license": "BUSL-1.1",
   "type": "module",
-  "packageManager": "npm@10.9.8",
+  "packageManager": "npm@11.19.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -22,7 +22,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": "22.23.2"
+    "node": "24.20.0"
   },
   "publishConfig": {
     "access": "public",
@@ -44,7 +44,7 @@
     "matrix-js-sdk": "42.2.0"
   },
   "devDependencies": {
-    "@types/node": "22.20.1",
+    "@types/node": "24.13.3",
     "@typescript-eslint/eslint-plugin": "8.67.0",
     "@typescript-eslint/parser": "8.67.0",
     "eslint": "10.9.0",
