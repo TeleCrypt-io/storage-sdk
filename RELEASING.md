@@ -6,9 +6,9 @@ rotate. The workflow (`.github/workflows/publish.yml`) authenticates to npm by p
 specific GitHub Actions run's OIDC identity, and npm only accepts that identity because a human
 has explicitly told npmjs.com to trust it.
 
-The build job uses the tested exact Node.js `22.23.2` LTS runner and its bundled npm `10.9.8`,
-matching the `packageManager` declaration in `package.json`. The publication job first verifies
-that toolchain, then deliberately installs and verifies npm `11.5.1` for Trusted Publishing.
+The build and publication jobs use the tested exact Node.js `24.20.0` LTS runner and its bundled
+npm `11.19.0`, matching the `packageManager` declaration in `package.json`. That npm version
+supports Trusted Publishing without a second mutable toolchain installation.
 Dependency installation is always exact-lock and lifecycle-disabled, with funding and audit network
 calls disabled; changing either Node or npm toolchain requires a fresh release-workflow verification.
 
