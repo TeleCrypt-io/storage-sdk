@@ -363,17 +363,13 @@ jobs:
           probe_status="$?"
           set -e
           if test "$probe_status" != 0; then
-            test ! -s "$probe"
+            # gh api returns the JSON error body on stdout even when it exits nonzero.
+            # Accept only GitHub's exact missing-Release response; transport and other
+            # API failures must remain fatal and must never be mistaken for a new Release.
+            test -s "$probe"
             test -s "$probe.err"
             test "$(wc -c <"$probe.err")" -le 131072
-            status_probe="$RUNNER_TEMP/release-status"
-            set +e
-            bounded_gh "$status_probe" api --include --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
-            status_probe_exit="$?"
-            set -e
-            test "$status_probe_exit" != 0
-            status_line="$(awk '/^HTTP\/[0-9.]+[[:space:]]/{print; exit}' "$status_probe")"
-            [[ "$status_line" =~ ^HTTP/[0-9.]+[[:space:]]+404([[:space:]]|$) ]]
+            jq -e 'type == "object" and .message == "Not Found" and .documentation_url == "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name" and .status == "404"' "$probe" >/dev/null
             create="$RUNNER_TEMP/release-create.json"
             verify_source
             bounded_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"

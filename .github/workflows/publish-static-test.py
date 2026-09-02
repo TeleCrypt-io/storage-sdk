@@ -87,6 +87,26 @@ def publication_action(probe: dict | None, run_attempt: int, tag: str = "v1.2.3"
     raise ContractError("unknown Release state")
 
 
+def missing_release_probe(exit_status: int, stdout: str, stderr: str) -> str:
+    """Model gh api's nonzero 404 behavior: the JSON body is still on stdout."""
+
+    if exit_status == 0:
+        raise ContractError("a successful probe cannot be treated as a missing Release")
+    if not stdout or not stderr:
+        raise ContractError("a failed probe without both bounded outputs is not confirmed")
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ContractError("failed probe did not return a JSON response") from error
+    if response != {
+        "message": "Not Found",
+        "documentation_url": "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name",
+        "status": "404",
+    }:
+        raise ContractError("failed probe is not GitHub's exact missing-Release response")
+    return "create-draft"
+
+
 def final_publish_recheck(probe: dict, tag: str = "v1.2.3") -> None:
     """Model the final remote read that must precede the draft->published PATCH."""
     publication_action(probe, 1, tag)
@@ -106,6 +126,27 @@ def final_publish_recheck(probe: dict, tag: str = "v1.2.3") -> None:
 
 def check_state_machine() -> None:
     tag = "v1.2.3"
+    missing = json.dumps(
+        {
+            "message": "Not Found",
+            "documentation_url": "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name",
+            "status": "404",
+        }
+    )
+    assert missing_release_probe(1, missing, "gh: Not Found (HTTP 404)\n") == "create-draft"
+    for bad_probe in (
+        (1, "", "gh: Not Found (HTTP 404)\n"),
+        (1, missing, ""),
+        (1, json.dumps({"message": "Not Found", "status": "500"}), "gh: Internal Server Error\n"),
+        (1, "not json", "gh: Not Found (HTTP 404)\n"),
+        (0, missing, ""),
+    ):
+        try:
+            missing_release_probe(*bad_probe)
+        except ContractError:
+            pass
+        else:
+            raise ContractError(f"accepted an invalid missing-Release probe: {bad_probe}")
     assert publication_action(None, 1, tag) == "create-draft"
     assert publication_action({"id": 42, "tag_name": tag, "name": tag, "body": f"Release {tag}", "target_commitish": "a" * 40, "created_at": "2026-08-24T00:00:00Z", "published_at": None, "draft": True, "prerelease": False, "assets": []}, 1, tag) == "reuse-draft"
     assert publication_action(exact_asset(tag), 2, tag) == "reuse-published"
@@ -227,8 +268,6 @@ def check_workflow_operations() -> None:
         "HTTPS_PROXY",
         "GH_HOST: github.com",
         "scripts/bounded-command.py",
-        "--include",
-        "status_line",
         "--method POST",
         "--field draft=true",
         "--method DELETE",
@@ -262,6 +301,10 @@ def check_workflow_operations() -> None:
         raise ContractError("one-shot Release creation remains")
     if "--includes=false" in WORKFLOW or "releases?per_page=" in WORKFLOW:
         raise ContractError("unsafe or obsolete recovery machinery remains")
+    if "status_probe" in release_shell or 'test ! -s "$probe"' in release_shell:
+        raise ContractError("missing-Release handling must not discard gh's JSON error body or issue a redundant probe")
+    if 'test -s "$probe"' not in release_shell or '.documentation_url == "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name"' not in release_shell:
+        raise ContractError("missing-Release handling does not verify gh's exact 404 response")
     if WORKFLOW.count("uses: actions/checkout@v7.0.1") != 3 or WORKFLOW.count("persist-credentials: false") != 3:
         raise ContractError("every SDK job must use a credential-free full checkout")
     if "publish:\n    needs: [build, release]" not in WORKFLOW:
