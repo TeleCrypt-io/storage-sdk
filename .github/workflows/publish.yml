@@ -261,10 +261,11 @@ jobs:
             local output="$1" error status
             shift
             error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh "$@"
-            status="$?"
-            set -e
+            if python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh "$@"; then
+              status=0
+            else
+              status="$?"
+            fi
             test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
             if test "$status" = 0; then test ! -s "$error"; fi
             return "$status"
@@ -357,36 +358,28 @@ jobs:
             test "$(wc -c <"$listing.license")" -le 65536
             test "$(tar -xOf "$file" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
           }
-          status_probe="$RUNNER_TEMP/release-status"
-          set +e
-          bounded_gh "$status_probe" api --include --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
-          status_probe_exit="$?"
-          set -e
-          test -s "$status_probe"
-          test "$(wc -c <"$status_probe")" -le 131072 -a "$(wc -c <"$status_probe.err")" -le 131072
-          status_line_count="$(grep -Ec '^HTTP/[0-9.]+[[:space:]]+[0-9]{3}([[:space:]]|$)' "$status_probe" || true)"
-          test "$status_line_count" = 1
-          status_line="$(awk '/^HTTP\/[0-9.]+[[:space:]]+[0-9]{3}([[:space:]]|$)/{print; exit}' "$status_probe")"
-          test "$(awk 'NR == 1 {print; exit}' "$status_probe")" = "$status_line"
-          [[ "$status_line" =~ ^HTTP/[0-9.]+[[:space:]]+([0-9]{3})([[:space:]]|$) ]]
-          status_code="${BASH_REMATCH[1]}"
+          release_list="$RUNNER_TEMP/release-list.jsonl"
+          bounded_gh "$release_list" api --paginate --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --jq '.[] | {id,tag_name,draft}' "/repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          jq -e -s 'all(.[]; type == "object" and ((keys | sort) == ["draft", "id", "tag_name"]) and (.id | type == "number" and . > 0 and floor == .) and (.tag_name | type == "string" and length > 0) and (.draft | type == "boolean"))' "$release_list" >/dev/null
+          release_matches="$RUNNER_TEMP/release-matches.json"
+          jq -e -s --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' "$release_list" >"$release_matches"
+          match_count="$(jq -er 'length' "$release_matches")"
+          test "$match_count" = 0 -o "$match_count" = 1
           probe="$RUNNER_TEMP/release-probe.json"
-          case "$status_code" in
-            404)
-              test "$status_probe_exit" = 1
+          case "$match_count" in
+            0)
               create="$RUNNER_TEMP/release-create.json"
               verify_source
               bounded_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"
               release_id="$(jq -er '.id | select(type=="number" and .>0 and floor==.)' "$create")"
               bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               ;;
-            200)
-              test "$status_probe_exit" = 0
-              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
-              release_id="$(jq -er '.id | select(type=="number" and .>0 and floor==.)' "$probe")"
+            1)
+              release_id="$(jq -er '.[0].id | select(type=="number" and .>0 and floor==.)' "$release_matches")"
+              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               ;;
             *)
-              echo "Release status probe returned unexpected HTTP status" >&2
+              echo "Release catalog contains multiple entries for the exact tag" >&2
               exit 1
               ;;
           esac

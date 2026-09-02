@@ -87,24 +87,44 @@ def publication_action(probe: dict | None, run_attempt: int, tag: str = "v1.2.3"
     raise ContractError("unknown Release state")
 
 
-def status_probe_action(exit_status: int, stdout: str) -> str:
-    """Model one bounded gh --include probe and its exact 404/200 transitions."""
+def release_catalog_action(entries: list[object], tag: str = "v1.2.3") -> tuple[str, int | None]:
+    """Model the validated minimal Release catalog before any GitHub mutation."""
 
-    status_lines = re.findall(r"^HTTP/[0-9.]+[ \t]+([0-9]{3})(?:[ \t].*)?$", stdout, re.MULTILINE)
-    first_line = stdout.splitlines()[0] if stdout.splitlines() else ""
-    first_status = re.match(r"^HTTP/[0-9.]+[ \t]+([0-9]{3})(?:[ \t].*)?$", first_line)
-    if len(status_lines) != 1 or first_status is None:
-        raise ContractError("status probe must contain exactly one HTTP status line first")
-    status = int(status_lines[0])
-    if status == 404:
-        if exit_status != 1:
-            raise ContractError("a 404 status must have gh's exact API-error exit status")
-        return "create-draft"
-    if status == 200:
-        if exit_status != 0:
-            raise ContractError("a 200 status must have a zero gh exit status")
-        return "fetch-release"
-    raise ContractError(f"unexpected HTTP status: {status}")
+    expected_keys = {"id", "tag_name", "draft"}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != expected_keys:
+            raise ContractError("Release catalog entry is not the exact projected object")
+        release_id = entry.get("id")
+        if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+            raise ContractError("Release catalog ID is not a positive integer")
+        if not isinstance(entry.get("tag_name"), str) or not entry["tag_name"]:
+            raise ContractError("Release catalog tag is not a non-empty string")
+        if not isinstance(entry.get("draft"), bool):
+            raise ContractError("Release catalog draft flag is not boolean")
+    matches = [entry for entry in entries if entry["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ContractError("Release catalog contains duplicate exact tags")
+    if not matches:
+        return "create-draft", None
+    return "fetch-release", matches[0]["id"]
+
+
+def release_catalog_output_action(exit_status: int, stdout: str, tag: str = "v1.2.3") -> tuple[str, int | None]:
+    """Model one bounded successful newline-delimited catalog projection."""
+
+    if exit_status != 0:
+        raise ContractError("catalog transport or API failures are not recoverable")
+    if len(stdout.encode("utf-8")) > 131072:
+        raise ContractError("catalog output exceeds the bounded capture")
+    entries = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            raise ContractError("catalog output contains malformed JSON") from error
+    return release_catalog_action(entries, tag)
 
 
 def final_publish_recheck(probe: dict, tag: str = "v1.2.3") -> None:
@@ -126,25 +146,39 @@ def final_publish_recheck(probe: dict, tag: str = "v1.2.3") -> None:
 
 def check_state_machine() -> None:
     tag = "v1.2.3"
-    assert status_probe_action(1, "HTTP/2.0 404 Not Found\r\n\r\n{}\n") == "create-draft"
-    assert status_probe_action(0, "HTTP/2.0 200 OK\r\n\r\n{}\n") == "fetch-release"
-    for bad_probe in (
-        (1, ""),
-        (1, "not an HTTP status\n"),
-        (1, "not an HTTP status\nHTTP/2.0 404 Not Found\n"),
-        (1, "HTTP/2.0 404 Not Found\nHTTP/2.0 200 OK\n"),
-        (0, "HTTP/2.0 404 Not Found\n"),
-        (2, "HTTP/2.0 404 Not Found\n"),
-        (1, "HTTP/2.0 200 OK\n"),
-        (0, "HTTP/2.0 500 Internal Server Error\n"),
-        (1, "HTTP/2.0 503 Service Unavailable\n"),
+    assert release_catalog_action([], tag) == ("create-draft", None)
+    assert release_catalog_action([{"id": 41, "tag_name": "v1.2.2", "draft": False}], tag) == ("create-draft", None)
+    assert release_catalog_action([{"id": 42, "tag_name": tag, "draft": True}], tag) == ("fetch-release", 42)
+    assert release_catalog_output_action(0, '{"id":42,"tag_name":"v1.2.3","draft":true}\n', tag) == ("fetch-release", 42)
+    assert release_catalog_output_action(0, "", tag) == ("create-draft", None)
+    for bad_catalog in (
+        [{"id": 42, "tag_name": tag, "draft": True}, {"id": 43, "tag_name": tag, "draft": False}],
+        [{"id": 42, "tag_name": tag}],
+        [{"id": 42, "tag_name": tag, "draft": True, "extra": False}],
+        [{"id": True, "tag_name": tag, "draft": True}],
+        [{"id": 0, "tag_name": tag, "draft": True}],
+        [{"id": 42, "tag_name": 7, "draft": True}],
+        [{"id": 42, "tag_name": tag, "draft": "true"}],
     ):
         try:
-            status_probe_action(*bad_probe)
+            release_catalog_action(bad_catalog, tag)
         except ContractError:
             pass
         else:
-            raise ContractError(f"accepted an invalid status probe: {bad_probe}")
+            raise ContractError(f"accepted an invalid Release catalog: {bad_catalog}")
+    for bad_output in (
+        (1, ""),
+        (1, '{"id":42,"tag_name":"v1.2.3","draft":true}\n'),
+        (0, '{"id":42,"tag_name":"v1.2.3","draft":true}\nnot-json\n'),
+        (0, '{"id":42,"tag_name":"v1.2.3"}\n'),
+        (0, "x" * 131073),
+    ):
+        try:
+            release_catalog_output_action(*bad_output, tag)
+        except ContractError:
+            pass
+        else:
+            raise ContractError(f"accepted invalid Release catalog output: {bad_output[:1]}")
     assert publication_action(None, 1, tag) == "create-draft"
     assert publication_action({"id": 42, "tag_name": tag, "name": tag, "body": f"Release {tag}", "target_commitish": "a" * 40, "created_at": "2026-08-24T00:00:00Z", "published_at": None, "draft": True, "prerelease": False, "assets": []}, 1, tag) == "reuse-draft"
     assert publication_action(exact_asset(tag), 2, tag) == "reuse-published"
@@ -266,6 +300,14 @@ def check_workflow_operations() -> None:
         "HTTPS_PROXY",
         "GH_HOST: github.com",
         "scripts/bounded-command.py",
+        "--paginate",
+        "--jq '.[] | {id,tag_name,draft}'",
+        "releases?per_page=100",
+        "jq -e -s",
+        "release_matches",
+        "match_count",
+        "jq -er '.[0].id",
+        "releases/$release_id",
         "--method POST",
         "--field draft=true",
         "--method DELETE",
@@ -297,25 +339,25 @@ def check_workflow_operations() -> None:
         raise ContractError("publication must follow draft upload")
     if "release create" in WORKFLOW or "gh release create" in WORKFLOW or "--draft" in WORKFLOW:
         raise ContractError("one-shot Release creation remains")
-    if "--includes=false" in WORKFLOW or "releases?per_page=" in WORKFLOW:
+    if "--includes=false" in WORKFLOW:
         raise ContractError("unsafe or obsolete recovery machinery remains")
-    if 'bounded_gh "$status_probe" api --include' not in release_shell:
-        raise ContractError("release handling must use one bounded HTTP status probe")
     for fragment in (
-        'status_line_count="$(grep -Ec',
-        'test "$status_line_count" = 1',
-        'status_line="$(awk',
-        'status_code="${BASH_REMATCH[1]}"',
-        'test "$status_probe_exit" = 1',
-        'test "$status_probe_exit" = 0',
-        'case "$status_code" in',
-        '404)',
-        '200)',
+        "status_probe",
+        "status_line",
+        "status_code",
+        "missing_release_probe",
+        ".documentation_url",
+        '"/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"',
+        "--include",
     ):
-        if fragment not in release_shell:
-            raise ContractError(f"status probe contract is missing {fragment}")
-    if "missing_release_probe" in WORKFLOW or ".documentation_url" in WORKFLOW or 'test -s "$probe.err"' in release_shell:
-        raise ContractError("obsolete missing-release body/error probe machinery remains")
+        if fragment in release_shell:
+            raise ContractError(f"obsolete Release status probe machinery remains: {fragment}")
+    if release_shell.count('bounded_gh "$release_list" api --paginate') != 1:
+        raise ContractError("Release catalog must use exactly one bounded paginated request")
+    if release_shell.count("--jq '.[] | {id,tag_name,draft}'") != 1:
+        raise ContractError("Release catalog must use exactly one minimal projection")
+    if release_shell.index("jq -e -s") < release_shell.index('bounded_gh "$release_list"'):
+        raise ContractError("Release catalog must be validated after the bounded request")
     if WORKFLOW.count("uses: actions/checkout@v7.0.1") != 3 or WORKFLOW.count("persist-credentials: false") != 3:
         raise ContractError("every SDK job must use a credential-free full checkout")
     if "publish:\n    needs: [build, release]" not in WORKFLOW:
