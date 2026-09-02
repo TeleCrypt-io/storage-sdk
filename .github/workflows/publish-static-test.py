@@ -39,6 +39,17 @@ def jq_accepts(expression: str, value: object) -> bool:
     return result.returncode == 0
 
 
+def provenance_retry_action(statement_counts: list[int], max_attempts: int = 12) -> int:
+    """Model retrying one statement until the verifier sees the complete pair."""
+
+    for attempt, statement_count in enumerate(statement_counts[:max_attempts], start=1):
+        if statement_count == 2:
+            return attempt
+        if statement_count != 1:
+            raise ContractError(f"invalid attestation count is not retryable: {statement_count}")
+    raise ContractError("the attestation remained incomplete through the bounded retry limit")
+
+
 def job(name: str) -> str:
     match = re.search(rf"^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", WORKFLOW, re.MULTILINE | re.DOTALL)
     if not match:
@@ -292,6 +303,23 @@ def check_revalidate_jq_predicate() -> None:
             raise ContractError(f"the draft asset ID predicate accepted invalid data: {invalid}")
 
 
+def check_provenance_retry_model() -> None:
+    """Exercise eventual-consistency recovery and bounded failure behavior."""
+
+    assert provenance_retry_action([1, 2]) == 2
+    for bad_results in (
+        [1] * 12,
+        [0, 2],
+        [3, 2],
+    ):
+        try:
+            provenance_retry_action(bad_results)
+        except ContractError:
+            pass
+        else:
+            raise ContractError(f"accepted an invalid provenance retry sequence: {bad_results}")
+
+
 def check_provenance_verifier() -> None:
     verifier = (ROOT / "scripts/verify-npm-provenance.mjs").read_text(encoding="utf-8")
     test_file = (ROOT / "test/npm-provenance.test.ts").read_text(encoding="utf-8")
@@ -432,6 +460,9 @@ def check_workflow_operations() -> None:
         "attestations_url=",
         "attestations.json",
         "bounded_registry_retry",
+        "--verify-provenance",
+        "attestations document must contain exactly two statements",
+        "scripts/verify-npm-provenance.mjs",
         "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12",
         "sleep 10",
         "scripts/verify-npm-provenance.mjs",
@@ -445,8 +476,15 @@ def check_workflow_operations() -> None:
             raise ContractError(f"npm attestation binding is missing {fragment}")
     if "gitHead" in publish or "githead.json" in publish:
         raise ContractError("npm registry gitHead binding remains; provenance is authoritative")
-    if publish.index("npm audit signatures") > publish.index("scripts/verify-npm-provenance.mjs"):
+    if publish.index("npm audit signatures") > publish.rindex("scripts/verify-npm-provenance.mjs"):
         raise ContractError("cryptographic npm signature verification must precede payload binding")
+    if publish.count("bounded_registry_retry --verify-provenance") != 1:
+        raise ContractError("attestation retrieval must have exactly one semantic verifier retry path")
+    retry_start = publish.index("bounded_registry_retry()")
+    retry_end = publish.index("bounded_registry_retry --verify-provenance")
+    retry_function = publish[retry_start:retry_end]
+    if "scripts/verify-npm-provenance.mjs" not in retry_function or "attestations document must contain exactly two statements" not in retry_function:
+        raise ContractError("attestation retry does not reuse the bounded provenance verifier")
     if '"$d/audit.txt"' in publish:
         raise ContractError("npm audit output still references a nonexistent file")
     if "curl" not in publish or "https://registry.npmjs.org/@telecrypt-io%2fstorage/" not in publish:
@@ -474,6 +512,7 @@ def check_workflow_operations() -> None:
 
 check_state_machine()
 check_revalidate_jq_predicate()
+check_provenance_retry_model()
 check_provenance_verifier()
 check_workflow_operations()
 if ".github/workflows/publish-static-test.py" not in VERIFY:

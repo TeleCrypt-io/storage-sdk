@@ -633,10 +633,19 @@ jobs:
           d="$RUNNER_TEMP/npm-registry"
           mkdir -p "$d"
           bounded_registry_retry() {
-            local output="$1" error="$2" status attempt
+            local semantic_verify=false output error status attempt semantic_out semantic_err semantic_status
+            if test "$1" = "--verify-provenance"; then
+              semantic_verify=true
+              shift
+            fi
+            output="$1"
+            error="$2"
             shift 2
             # npm may expose package metadata before its attestation index; retry only these safe reads.
             for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              semantic_out=""
+              semantic_err=""
+              semantic_status=""
               : >"$output"
               : >"$error"
               set +e
@@ -646,11 +655,32 @@ jobs:
               test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
               if test "$status" = 0; then
                 test ! -s "$error"
-                return 0
+                if test "$semantic_verify" = true; then
+                  semantic_out="$output.verify"
+                  semantic_err="$semantic_out.err"
+                  set +e
+                  python3 scripts/bounded-command.py --stdout "$semantic_out" --stderr "$semantic_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$output" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"
+                  semantic_status="$?"
+                  set -e
+                  test "$(wc -c <"$semantic_out")" -le 131072 -a "$(wc -c <"$semantic_err")" -le 131072
+                  if test "$semantic_status" = 0; then return 0; fi
+                  if ! grep -Fq 'attestations document must contain exactly two statements' "$semantic_err"; then
+                    cat "$semantic_out" >&2
+                    cat "$semantic_err" >&2
+                    return "$semantic_status"
+                  fi
+                else
+                  return 0
+                fi
               fi
               if test "$attempt" = 12; then
                 cat "$output" >&2
                 cat "$error" >&2
+                if test "$semantic_verify" = true && test -n "$semantic_status"; then
+                  cat "$semantic_out" >&2
+                  cat "$semantic_err" >&2
+                  return "$semantic_status"
+                fi
                 return "$status"
               fi
               sleep 10
@@ -678,7 +708,7 @@ jobs:
           process.stdout.write(parsed.toString());
           NODE
           )"
-          bounded_registry_retry "$d/attestations.json" "$d/attestations.err" curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
+          bounded_registry_retry --verify-provenance "$d/attestations.json" "$d/attestations.err" curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
           if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/attestations.json" "$d/attestations.err"; then exit 1; fi
           node - "$d/dist.json" "$archive" "$record" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
