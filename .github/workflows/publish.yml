@@ -294,7 +294,7 @@ jobs:
             bounded_gh "$json" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$id"
             verify_draft "$json" "$id"
             test "$(jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$json")" = "$expected_draft_asset_metadata"
-            jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|type)=="array" and (.assets|length)==2) and all(.assets[]; type=="object" and (.id|type=="number" and .id>0 and floor==.) and .state=="uploaded") and (any(.assets[]; .name==($tag+".tgz") and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+            jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|type)=="array" and (.assets|length)==2) and all(.assets[]; type=="object" and (.id|type=="number" and . > 0 and floor==.) and .state=="uploaded") and (any(.assets[]; .name==($tag+".tgz") and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
           }
           verify_published() {
             local json="$1" id="$2"
