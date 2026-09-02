@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { FetchHttpApi } from "matrix-js-sdk/lib/http-api/fetch.js";
 import {
   EventType,
   MatrixError,
@@ -97,7 +98,7 @@ describe("operation safety", () => {
       { media_ids: ["mxc://example.test/v2", "mxc://example.test/v1"] },
       {
         prefix: "/_matrix/client/unstable",
-        json: false,
+        rawResponseBody: true,
         abortSignal: expect.any(AbortSignal),
       },
     );
@@ -112,6 +113,32 @@ describe("operation safety", () => {
       "$v2",
     );
     expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
+  });
+
+  it("serializes media deletion as JSON and accepts an empty 204 response", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      return new Response(null, { status: 204 });
+    });
+    const http = new FetchHttpApi({ emit: vi.fn() } as never, {
+      baseUrl: "https://matrix.example.test",
+      prefix: "/_matrix/client/v3",
+      onlyData: true,
+      fetchFn: fetchMock as unknown as typeof fetch,
+    });
+    const fixture = deletionFixture([{ id: "$v1", mediaId: "mxc://example.test/v1" }]);
+    (fixture.client as unknown as { http: typeof http }).http = http;
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
+      deleted: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, request] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toEqual(new URL("https://matrix.example.test/_matrix/client/unstable/io.telecrypt.storage/delete_media"));
+    expect(request?.method).toBe("POST");
+    expect(new Headers(request?.headers).get("content-type")).toBe("application/json");
+    expect(request?.body).toBe(JSON.stringify({ media_ids: ["mxc://example.test/v1"] }));
   });
 
   it("reconciles the inactive file state before reporting deletion success", async () => {

@@ -1446,7 +1446,7 @@ interface FileDeletionHttpTransport {
     path: string,
     query?: undefined,
     body?: unknown,
-    options?: { prefix?: string; json?: boolean; abortSignal?: AbortSignal },
+    options?: { prefix?: string; rawResponseBody?: boolean; abortSignal?: AbortSignal },
   ) => Promise<T>;
 }
 
@@ -1536,7 +1536,7 @@ async function deleteFileMedia(
               "/io.telecrypt.storage/delete_media",
               undefined,
               { media_ids: [...mediaIds] },
-              { prefix: ClientPrefix.Unstable, json: false, abortSignal: signal },
+              { prefix: ClientPrefix.Unstable, rawResponseBody: true, abortSignal: signal },
             ),
           signal,
           "delete file media",
