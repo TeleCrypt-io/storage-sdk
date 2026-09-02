@@ -633,7 +633,7 @@ jobs:
           d="$RUNNER_TEMP/npm-registry"
           mkdir -p "$d"
           bounded_registry_retry() {
-            local semantic_verify=false output error status attempt semantic_out semantic_err semantic_status
+            local semantic_verify=false output error status semantic_out semantic_err semantic_status retry_window_seconds retry_interval_seconds retry_deadline
             if test "$1" = "--verify-provenance"; then
               semantic_verify=true
               shift
@@ -642,7 +642,10 @@ jobs:
             error="$2"
             shift 2
             # npm may expose package metadata before its attestation index; retry only these safe reads.
-            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            retry_window_seconds=300
+            retry_interval_seconds=10
+            retry_deadline=$((SECONDS + retry_window_seconds))
+            while :; do
               semantic_out=""
               semantic_err=""
               semantic_status=""
@@ -673,7 +676,7 @@ jobs:
                   return 0
                 fi
               fi
-              if test "$attempt" = 12; then
+              if (( SECONDS >= retry_deadline )); then
                 cat "$output" >&2
                 cat "$error" >&2
                 if test "$semantic_verify" = true && test -n "$semantic_status"; then
@@ -683,7 +686,7 @@ jobs:
                 fi
                 return "$status"
               fi
-              sleep 10
+              sleep "$retry_interval_seconds"
             done
           }
           bounded_registry_retry "$d/dist.json" "$d/dist.err" npm view "$package" dist --json --loglevel=error
