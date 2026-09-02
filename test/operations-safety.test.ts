@@ -95,7 +95,11 @@ describe("operation safety", () => {
       "/io.telecrypt.storage/delete_media",
       undefined,
       { media_ids: ["mxc://example.test/v2", "mxc://example.test/v1"] },
-      expect.objectContaining({ prefix: "/_matrix/client/unstable" }),
+      {
+        prefix: "/_matrix/client/unstable",
+        json: false,
+        abortSignal: expect.any(AbortSignal),
+      },
     );
     expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
       fixture.client.sendStateEvent.mock.invocationCallOrder[0],
