@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -22,6 +23,20 @@ NODE_VERSION = (ROOT / ".node-version").read_text(encoding="utf-8").strip()
 
 class ContractError(AssertionError):
     pass
+
+
+REVALIDATE_ASSET_ID_EXPRESSION = 'all(.assets[]; type=="object" and (.id|type=="number" and . > 0 and floor==.) and .state=="uploaded")'
+
+
+def jq_accepts(expression: str, value: object) -> bool:
+    result = subprocess.run(
+        ["jq", "-e", expression],
+        input=json.dumps(value),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def job(name: str) -> str:
@@ -256,6 +271,27 @@ def check_state_machine() -> None:
         raise ContractError("accepted a published Release on the initial attempt")
 
 
+def check_revalidate_jq_predicate() -> None:
+    """Execute the draft asset predicate so object/numeric jq context stays tested."""
+
+    valid = {
+        "assets": [
+            {"id": 42, "state": "uploaded"},
+            {"id": 43, "state": "uploaded"},
+        ]
+    }
+    if not jq_accepts(REVALIDATE_ASSET_ID_EXPRESSION, valid):
+        raise ContractError("the draft asset ID predicate rejected valid numeric object fields")
+    for invalid in (
+        {"assets": [{"id": "42", "state": "uploaded"}]},
+        {"assets": [{"id": 0, "state": "uploaded"}]},
+        {"assets": [{"id": 42.5, "state": "uploaded"}]},
+        {"assets": [{"id": 42, "state": "pending"}]},
+    ):
+        if jq_accepts(REVALIDATE_ASSET_ID_EXPRESSION, invalid):
+            raise ContractError(f"the draft asset ID predicate accepted invalid data: {invalid}")
+
+
 def check_provenance_verifier() -> None:
     verifier = (ROOT / "scripts/verify-npm-provenance.mjs").read_text(encoding="utf-8")
     test_file = (ROOT / "test/npm-provenance.test.ts").read_text(encoding="utf-8")
@@ -358,6 +394,13 @@ def check_workflow_operations() -> None:
         raise ContractError("Release catalog must use exactly one minimal projection")
     if release_shell.index("jq -e -s") < release_shell.index('bounded_gh "$release_list"'):
         raise ContractError("Release catalog must be validated after the bounded request")
+    revalidate_start = release_shell.index("revalidate_draft_for_publish()")
+    revalidate_end = release_shell.index("verify_published()", revalidate_start)
+    revalidate = release_shell[revalidate_start:revalidate_end]
+    if REVALIDATE_ASSET_ID_EXPRESSION not in revalidate:
+        raise ContractError("draft revalidation does not use the tested numeric object ID predicate")
+    if '.id|type=="number" and .id>0' in revalidate:
+        raise ContractError("draft revalidation dereferences an ID after piping into its numeric value")
     if WORKFLOW.count("uses: actions/checkout@v7.0.1") != 3 or WORKFLOW.count("persist-credentials: false") != 3:
         raise ContractError("every SDK job must use a credential-free full checkout")
     if "publish:\n    needs: [build, release]" not in WORKFLOW:
@@ -430,6 +473,7 @@ def check_workflow_operations() -> None:
 
 
 check_state_machine()
+check_revalidate_jq_predicate()
 check_provenance_verifier()
 check_workflow_operations()
 if ".github/workflows/publish-static-test.py" not in VERIFY:
