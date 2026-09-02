@@ -26,6 +26,10 @@ class ContractError(AssertionError):
 
 
 REVALIDATE_ASSET_ID_EXPRESSION = 'all(.assets[]; type=="object" and (.id|type=="number" and . > 0 and floor==.) and .state=="uploaded")'
+RETRY_WINDOW_SECONDS = 300
+RETRY_INTERVAL_SECONDS = 10
+SAFE_READ_TIMEOUT_SECONDS = 120
+PUBLISH_JOB_TIMEOUT_SECONDS = 25 * 60
 
 
 def jq_accepts(expression: str, value: object) -> bool:
@@ -39,14 +43,34 @@ def jq_accepts(expression: str, value: object) -> bool:
     return result.returncode == 0
 
 
-def provenance_retry_action(statement_counts: list[int], max_attempts: int = 12) -> int:
-    """Model retrying one statement until the verifier sees the complete pair."""
+def provenance_retry_action(
+    statement_counts: list[int],
+    durations: list[int] | None = None,
+    retry_window_seconds: int = RETRY_WINDOW_SECONDS,
+    retry_interval_seconds: int = RETRY_INTERVAL_SECONDS,
+) -> int:
+    """Model retrying one statement within a bounded propagation window."""
 
-    for attempt, statement_count in enumerate(statement_counts[:max_attempts], start=1):
+    if retry_window_seconds <= 0 or retry_interval_seconds <= 0:
+        raise ContractError("retry timing bounds must be positive")
+    if durations is None:
+        durations = [0] * len(statement_counts)
+    if len(durations) != len(statement_counts):
+        raise ContractError("retry durations must match attestation observations")
+    elapsed = 0
+    for attempt, (statement_count, duration) in enumerate(zip(statement_counts, durations), start=1):
+        if elapsed >= retry_window_seconds:
+            break
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 0 <= duration <= SAFE_READ_TIMEOUT_SECONDS:
+            raise ContractError(f"safe-read duration exceeds its bound: {duration}")
+        elapsed += duration
         if statement_count == 2:
             return attempt
         if statement_count != 1:
             raise ContractError(f"invalid attestation count is not retryable: {statement_count}")
+        if elapsed >= retry_window_seconds:
+            break
+        elapsed += retry_interval_seconds
     raise ContractError("the attestation remained incomplete through the bounded retry limit")
 
 
@@ -307,8 +331,11 @@ def check_provenance_retry_model() -> None:
     """Exercise eventual-consistency recovery and bounded failure behavior."""
 
     assert provenance_retry_action([1, 2]) == 2
+    assert provenance_retry_action([1, 2], durations=[120, 0]) == 2
+    assert provenance_retry_action([1] * 29 + [2]) == 30
     for bad_results in (
-        [1] * 12,
+        [1] * 30,
+        [1] * 30 + [2],
         [0, 2],
         [3, 2],
     ):
@@ -318,6 +345,13 @@ def check_provenance_retry_model() -> None:
             pass
         else:
             raise ContractError(f"accepted an invalid provenance retry sequence: {bad_results}")
+    for bad_durations in ([121], [-1], [True]):
+        try:
+            provenance_retry_action([1], durations=bad_durations)
+        except ContractError:
+            pass
+        else:
+            raise ContractError(f"accepted an unsafe retry duration: {bad_durations}")
 
 
 def check_provenance_verifier() -> None:
@@ -463,8 +497,6 @@ def check_workflow_operations() -> None:
         "--verify-provenance",
         "attestations document must contain exactly two statements",
         "scripts/verify-npm-provenance.mjs",
-        "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12",
-        "sleep 10",
         "scripts/verify-npm-provenance.mjs",
         "--attestations",
         "--package",
@@ -485,6 +517,24 @@ def check_workflow_operations() -> None:
     retry_function = publish[retry_start:retry_end]
     if "scripts/verify-npm-provenance.mjs" not in retry_function or "attestations document must contain exactly two statements" not in retry_function:
         raise ContractError("attestation retry does not reuse the bounded provenance verifier")
+    for fragment in (
+        "retry_window_seconds=300",
+        "retry_interval_seconds=10",
+        "retry_deadline=$((SECONDS + retry_window_seconds))",
+        "while :; do",
+        "if (( SECONDS >= retry_deadline )); then",
+        'sleep "$retry_interval_seconds"',
+    ):
+        if fragment not in retry_function:
+            raise ContractError(f"bounded npm read is missing {fragment}")
+    if "for attempt in" in retry_function or "attempt =" in retry_function:
+        raise ContractError("bounded npm read still uses an unbounded attempt-count model")
+    if "timeout-minutes: 25" not in publish_job:
+        raise ContractError("publish job timeout must remain 25 minutes")
+    if RETRY_WINDOW_SECONDS != 300 or RETRY_INTERVAL_SECONDS != 10 or SAFE_READ_TIMEOUT_SECONDS != 120:
+        raise ContractError("retry timing model is not the exact bounded npm-read contract")
+    if RETRY_WINDOW_SECONDS >= PUBLISH_JOB_TIMEOUT_SECONDS:
+        raise ContractError("npm propagation window cannot consume the whole publish job budget")
     if '"$d/audit.txt"' in publish:
         raise ContractError("npm audit output still references a nonexistent file")
     if "curl" not in publish or "https://registry.npmjs.org/@telecrypt-io%2fstorage/" not in publish:
