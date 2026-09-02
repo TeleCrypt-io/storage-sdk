@@ -1195,6 +1195,7 @@ export async function listSubfolders(
 ): Promise<FolderInfo[]> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, parentId, signal);
+    await storage.refreshRoomState(parentId, { signal });
     ensureOperationActive(signal);
     const directories = tree.getDirectories();
     if (directories.length > MAX_LIST_ITEMS) throw new StorageError("folder list is too large");
@@ -1604,6 +1605,21 @@ export async function deleteFile(
         "media was deleted but Matrix event cleanup stopped",
       );
     }
+    try {
+      await waitForCondition(
+        async () => {
+          await storage.refreshRoomState(tree.id, { signal });
+          ensureOperationActive(signal);
+          const current = tree.getFile(fileId);
+          return !current || !current.isActive ? true : null;
+        },
+        { timeoutMs: 15000, signal },
+      );
+    } catch (error) {
+      if (error instanceof MutationOutcomeUnknownError) throw error;
+      const detail = "Matrix deletion completed but the inactive file state could not be verified";
+      throw new MutationPartialError("delete file", completedIds, detail);
+    }
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
   }, "mutation");
@@ -1628,6 +1644,30 @@ export async function uploadFile(
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("upload failed");
     });
+    // The create-file request is acknowledged before the event necessarily
+    // arrives in this client's sync timeline. A caller can otherwise report a
+    // successful folder upload and immediately list a missing nested file.
+    try {
+      await waitForCondition(
+        async () => {
+          // Refresh the joined room's authoritative state before checking the
+          // local tree. The sync loop carries timeline file events, while this
+          // refresh closes the state lag for the room being uploaded into.
+          await storage.refreshRoomState(tree.id, { signal });
+          ensureOperationActive(signal);
+          const file = tree.getFile(fileId);
+          return file?.isActive ? file : null;
+        },
+        { timeoutMs: 15000, signal },
+      );
+    } catch (error) {
+      if (error instanceof MutationOutcomeUnknownError) throw error;
+      throw new MutationPartialError(
+        "upload file",
+        [fileId],
+        "upload completed but the file could not be observed locally",
+      );
+    }
     ensureOperationActive(signal);
     return { id: fileId, name, mimetype };
   }, "mutation");

@@ -21,6 +21,7 @@ import {
   listFiles,
   listPendingInvites,
   listSubfolders,
+  uploadFile,
   renameFolder,
   shareVault,
   unshareVault,
@@ -57,6 +58,7 @@ describe("operation safety", () => {
   function deletionFixture(history: Array<{ id: string; mediaId: string }>) {
     const versions = history.map(({ id, mediaId }) => ({
       id,
+      isActive: true,
       getFileInfo: vi.fn().mockResolvedValue({ info: { url: mediaId }, httpUrl: "https://matrix.invalid" }),
     }));
     versions[0].getVersionHistory = vi.fn().mockResolvedValue(versions);
@@ -67,11 +69,15 @@ describe("operation safety", () => {
       sendStateEvent: vi.fn().mockResolvedValue({}),
       redactEvent: vi.fn().mockResolvedValue({}),
     };
+    const refreshRoomState = vi.fn().mockImplementation(async () => {
+      versions[0]!.isActive = false;
+    });
     const storage = {
       getTree: () => tree,
       getClient: () => client,
+      refreshRoomState,
     } as unknown as TeleCryptIOStorage;
-    return { client, storage, tree, versions };
+    return { client, storage, tree, versions, refreshRoomState };
   }
 
   it("deletes every version's media before redacting its Matrix events", async () => {
@@ -102,6 +108,24 @@ describe("operation safety", () => {
       "$v2",
     );
     expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
+  });
+
+  it("reconciles the inactive file state before reporting deletion success", async () => {
+    const fixture = deletionFixture([{ id: "$v1", mediaId: "mxc://example.test/v1" }]);
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
+      deleted: true,
+    });
+
+    expect(fixture.refreshRoomState).toHaveBeenCalledWith(
+      fixture.tree.id,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(fixture.refreshRoomState.mock.invocationCallOrder[0]).toBeGreaterThan(
+      Math.max(...fixture.client.redactEvent.mock.invocationCallOrder),
+    );
+    expect(fixture.versions[0]!.isActive).toBe(false);
   });
 
   it("accepts exactly 128 unique media IDs in one deletion request", async () => {
@@ -231,6 +255,90 @@ describe("operation safety", () => {
 
     await expect(listFiles(storage, tree.id)).rejects.toThrow("file list is too large");
     await expect(listSubfolders(storage, tree.id)).rejects.toThrow("folder list is too large");
+  });
+
+  it("refreshes the parent room before listing subfolders", async () => {
+    const tree = makeTree("!folders:example.test", "Folders", true);
+    const getDirectories = vi.fn().mockReturnValue([
+      { id: "!child:example.test", room: { name: "Child" } },
+    ]);
+    tree.getDirectories = getDirectories;
+    const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+    const storage = {
+      getTree: () => tree,
+      refreshRoomState,
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(listSubfolders(storage, tree.id)).resolves.toEqual([
+      { id: "!child:example.test", name: "Child" },
+    ]);
+    expect(refreshRoomState).toHaveBeenCalledWith(
+      tree.id,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(
+      getDirectories.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("waits until an uploaded file is active before reporting success", async () => {
+    const tree = makeTree("!upload:example.test", "Upload", true);
+    const file = { id: "$uploaded", isActive: true, getName: () => "nested.txt" };
+    let visible = false;
+    const getFile = vi.fn(() => (visible ? file : null));
+    tree.getFile = getFile as never;
+    const refreshRoomState = vi.fn().mockImplementation(async () => {
+      visible = true;
+    });
+    const storage = {
+      getTree: () => tree,
+      uploadFile: vi.fn().mockResolvedValue(file.id),
+      refreshRoomState,
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(
+      uploadFile(storage, tree.id, "nested.txt", new Uint8Array([1]), "text/plain"),
+    ).resolves.toEqual({ id: file.id, name: "nested.txt", mimetype: "text/plain" });
+    expect(refreshRoomState).toHaveBeenCalledWith(
+      tree.id,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(getFile.mock.invocationCallOrder[0]!);
+  });
+
+  it("reports a partial upload when the committed file never becomes observable", async () => {
+    vi.useFakeTimers();
+    try {
+      const tree = makeTree("!upload-timeout:example.test", "Upload timeout", true);
+      tree.getFile = vi.fn().mockReturnValue(null) as never;
+      const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+      const storage = {
+        getTree: () => tree,
+        uploadFile: vi.fn().mockResolvedValue("$unobserved"),
+        refreshRoomState,
+      } as unknown as TeleCryptIOStorage;
+      const pending = uploadFile(
+        storage,
+        tree.id,
+        "unobserved.txt",
+        new Uint8Array([1]),
+        "text/plain",
+      );
+      const assertion = expect(pending).rejects.toMatchObject({
+        code: "MUTATION_PARTIAL",
+        operation: "upload file",
+        completedIds: ["$unobserved"],
+      });
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await assertion;
+      expect(refreshRoomState).toHaveBeenCalledWith(
+        tree.id,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("removes the mutation abort listener when the operation throws synchronously", async () => {
