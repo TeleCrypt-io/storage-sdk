@@ -367,7 +367,6 @@ jobs:
             # Accept only GitHub's exact missing-Release response; transport and other
             # API failures must remain fatal and must never be mistaken for a new Release.
             test -s "$probe"
-            test -s "$probe.err"
             test "$(wc -c <"$probe.err")" -le 131072
             jq -e 'type == "object" and .message == "Not Found" and .documentation_url == "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name" and .status == "404"' "$probe" >/dev/null
             create="$RUNNER_TEMP/release-create.json"

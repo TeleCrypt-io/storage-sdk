@@ -92,8 +92,8 @@ def missing_release_probe(exit_status: int, stdout: str, stderr: str) -> str:
 
     if exit_status == 0:
         raise ContractError("a successful probe cannot be treated as a missing Release")
-    if not stdout or not stderr:
-        raise ContractError("a failed probe without both bounded outputs is not confirmed")
+    if not stdout:
+        raise ContractError("a failed probe without a JSON response is not confirmed")
     try:
         response = json.loads(stdout)
     except json.JSONDecodeError as error:
@@ -134,11 +134,13 @@ def check_state_machine() -> None:
         }
     )
     assert missing_release_probe(1, missing, "gh: Not Found (HTTP 404)\n") == "create-draft"
+    assert missing_release_probe(1, missing, "") == "create-draft"
     for bad_probe in (
         (1, "", "gh: Not Found (HTTP 404)\n"),
-        (1, missing, ""),
-        (1, json.dumps({"message": "Not Found", "status": "500"}), "gh: Internal Server Error\n"),
-        (1, "not json", "gh: Not Found (HTTP 404)\n"),
+        (1, json.dumps({"message": "Not Found", "status": "500"}), ""),
+        (1, json.dumps({"message": "Not Found", "documentation_url": "https://example.invalid", "status": "404"}), ""),
+        (1, json.dumps({"message": "Forbidden", "documentation_url": "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name", "status": "404"}), ""),
+        (1, "not json", ""),
         (0, missing, ""),
     ):
         try:
