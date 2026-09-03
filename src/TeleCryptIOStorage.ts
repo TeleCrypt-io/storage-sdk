@@ -43,6 +43,7 @@ import {
 import { raceWithAbort, readBoundedResponseBody } from "./core/http.js";
 import { validateName } from "./core/validation.js";
 import type { RecoveryStatus } from "./core/types.js";
+import { isTreeDeleted } from "./deletion-markers.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -1661,6 +1662,7 @@ export class TeleCryptIOStorage {
     const trees: TreeSpace[] = [];
     for (const room of rooms) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
+      if (isTreeDeleted(this.client, room.roomId)) continue;
       const tree = this.client.unstableGetFileTreeSpace(
         room.roomId,
       ) as unknown as TreeSpace | null;
@@ -1848,6 +1850,7 @@ export class TeleCryptIOStorage {
   }
 
   getTree(roomId: string): TreeSpace | null {
+    if (isTreeDeleted(this.client, roomId)) return null;
     const tree = this.client.unstableGetFileTreeSpace(
       roomId,
     ) as unknown as TreeSpace | null;

@@ -30,6 +30,7 @@ import {
 } from "../src/core/operations.js";
 import { MutationPartialError, UndecryptableFileError } from "../src/core/errors.js";
 import { waitForCondition } from "../src/core/poll.js";
+import { isFileDeleted, isTreeDeleted } from "../src/deletion-markers.js";
 
 function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
   return {
@@ -138,6 +139,8 @@ describe("operation safety", () => {
       "$v2",
     );
     expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(true);
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(true);
   });
 
   it("serializes media deletion as JSON and accepts an empty 204 response", async () => {
@@ -284,6 +287,8 @@ describe("operation safety", () => {
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(false);
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
   });
 
   it("includes fully cleaned versions in the typed partial result", async () => {
@@ -300,6 +305,8 @@ describe("operation safety", () => {
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(2);
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(false);
+    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
   });
 
   it("bounds the version chain before issuing a deletion request", async () => {
@@ -721,6 +728,7 @@ describe("operation safety", () => {
     expect(fixture.client.kick).not.toHaveBeenCalled();
     expect(fixture.client.leave).not.toHaveBeenCalled();
     expect(fixture.client.forget).not.toHaveBeenCalled();
+    expect(isTreeDeleted(fixture.client as never, fixture.root.id)).toBe(false);
   });
 
   it("fails closed on a room refresh error without starting deletion", async () => {
@@ -735,6 +743,7 @@ describe("operation safety", () => {
     expect(fixture.client.kick).not.toHaveBeenCalled();
     expect(fixture.client.leave).not.toHaveBeenCalled();
     expect(fixture.client.forget).not.toHaveBeenCalled();
+    expect(isTreeDeleted(fixture.client as never, fixture.root.id)).toBe(false);
   });
 
   it("does not issue a join when authoritative membership is already joined", async () => {
@@ -1267,10 +1276,12 @@ describe("operation safety", () => {
       { userId: member.userId, membership: "leave" },
     ]);
 
-    await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).resolves.toEqual({
+    const storage = new TeleCryptIOStorage(client as never);
+    await expect(deleteVault(storage, root.id)).resolves.toEqual({
       id: root.id,
       deleted: true,
     });
+    expect(isTreeDeleted(client as never, root.id)).toBe(true);
   });
 
   it("suppresses only typed M_FORBIDDEN after authoritative membership confirms the target", async () => {

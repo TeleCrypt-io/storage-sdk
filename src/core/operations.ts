@@ -43,6 +43,13 @@ import {
 import { waitForCondition } from "./poll.js";
 import { validateMatrixEventId } from "./constants.js";
 import { validateName } from "./validation.js";
+import {
+  getDeletedTreeIds,
+  isFileDeleted,
+  isTreeDeleted,
+  markFileDeleted,
+  markTreeDeleted,
+} from "../deletion-markers.js";
 import type {
   DownloadedFile,
   FolderDetails,
@@ -241,12 +248,38 @@ async function resolveTree(
   }
 }
 
+function isMarkedTreeDeleted(storage: TeleCryptIOStorage, treeId: string): boolean {
+  if (typeof storage.getClient !== "function") return false;
+  return isTreeDeleted(storage.getClient(), treeId);
+}
+
+function isMarkedFileDeleted(
+  storage: TeleCryptIOStorage,
+  treeId: string,
+  fileId: string,
+): boolean {
+  if (typeof storage.getClient !== "function") return false;
+  return isFileDeleted(storage.getClient(), treeId, fileId);
+}
+
 /** As `resolveTree`, but for a specific file within an already-resolved
  * vault or folder — covers the same settling window for a file another
  * process/session just uploaded. */
-async function resolveFile(tree: TreeSpace, fileId: string, signal?: AbortSignal): Promise<FileBranch> {
+async function resolveFile(
+  storage: TeleCryptIOStorage,
+  tree: TreeSpace,
+  fileId: string,
+  signal?: AbortSignal,
+): Promise<FileBranch> {
+  if (signal?.aborted) throw new StorageError("operation cancelled");
+  if (isMarkedFileDeleted(storage, tree.id, fileId)) {
+    throw new StorageError("file not found");
+  }
   try {
-    return await waitForCondition(() => tree.getFile(fileId), { timeoutMs: 15000, signal });
+    return await waitForCondition(
+      () => (isMarkedFileDeleted(storage, tree.id, fileId) ? null : tree.getFile(fileId)),
+      { timeoutMs: 15000, signal },
+    );
   } catch {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     throw new StorageError("file not found");
@@ -290,11 +323,17 @@ function snapshotTreeSpaces(
  * observe each result before removing their containing room.  This also
  * prevents a folder/vault delete from silently deleting a nested shared tree.
  */
-function assertTreeEmptyForDeletion(tree: TreeSpace, spaces: readonly TreeSpace[]): void {
+function assertTreeEmptyForDeletion(
+  storage: TeleCryptIOStorage,
+  tree: TreeSpace,
+  spaces: readonly TreeSpace[],
+): void {
   if (spaces.length !== 1) throw new NonEmptyTreeError(tree.id);
   let files: FileBranch[];
   try {
-    files = tree.listAllFiles();
+    files = tree
+      .listAllFiles()
+      .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
   } catch {
     throw new StorageError("could not enumerate storage files safely");
   }
@@ -417,7 +456,7 @@ function validateDeletionGraph(
   client: MatrixClient,
   root: TreeSpace,
   ids: Set<string>,
-  deletedRooms: Set<string>,
+  deletedRooms: ReadonlySet<string>,
 ): ValidatedDeletionGraph {
   const edges = new Set<string>();
   const externalParents: string[] = [];
@@ -594,9 +633,6 @@ async function relinkExternalParents(
   }
 }
 
-const deletedTreeIds = new WeakMap<MatrixClient, Set<string>>();
-const deletedRoomIds = new WeakMap<MatrixClient, Set<string>>();
-
 function isGoneError(error: unknown): boolean {
   return (
     error instanceof MatrixError &&
@@ -663,12 +699,7 @@ async function deleteRoomDeterministically(
     if (!isGoneError(error)) throw error;
   }
   removeRoomFromLocalStore(client, roomId);
-  let deleted = deletedRoomIds.get(client);
-  if (!deleted) {
-    deleted = new Set();
-    deletedRoomIds.set(client, deleted);
-  }
-  deleted.add(roomId);
+  markTreeDeleted(client, roomId);
 }
 
 /**
@@ -848,29 +879,30 @@ export async function listPendingInvites(
 
     for (const room of rooms) {
       ensureOperationActive(signal);
-    if (room.getMyMembership() !== "invite") continue;
-    if (hasActiveSpaceParent(room)) continue;
+      if (isMarkedTreeDeleted(storage, room.roomId)) continue;
+      if (room.getMyMembership() !== "invite") continue;
+      if (hasActiveSpaceParent(room)) continue;
 
-    const tree = storage.getTree(room.roomId);
-    if (tree) {
-      if (tree.isTopLevel) {
+      const tree = storage.getTree(room.roomId);
+      if (tree) {
+        if (tree.isTopLevel) {
+          invites.push({
+            id: tree.id,
+            name: roomDisplayName(storage, room.roomId, tree.room.name),
+          });
+        }
+        continue;
+      }
+
+      // Invite state may not have MSC3089 tree metadata yet — accept rooms whose
+      // create event marks them as a file tree space.
+      if (isReviewedStorageTreeRoom(room)) {
         invites.push({
-          id: tree.id,
-          name: roomDisplayName(storage, room.roomId, tree.room.name),
+          id: room.roomId,
+          name: roomDisplayName(storage, room.roomId),
         });
       }
-      continue;
     }
-
-    // Invite state may not have MSC3089 tree metadata yet — accept rooms whose
-    // create event marks them as a file tree space.
-    if (isReviewedStorageTreeRoom(room)) {
-      invites.push({
-        id: room.roomId,
-        name: roomDisplayName(storage, room.roomId),
-      });
-    }
-  }
 
     return invites;
   });
@@ -1196,7 +1228,9 @@ export async function listFiles(
     try {
       await storage.refreshRoomState(treeId, { signal });
       ensureOperationActive(signal);
-      const files = tree.listFiles();
+      const files = tree
+        .listFiles()
+        .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
       if (files.length > MAX_LIST_ITEMS) throw new StorageError("file list is too large");
       return files.map((f) => ({ id: f.id, name: f.getName() }));
     } catch (error) {
@@ -1217,7 +1251,9 @@ export async function listSubfolders(
     const tree = await resolveTree(storage, parentId, signal);
     await storage.refreshRoomState(parentId, { signal });
     ensureOperationActive(signal);
-    const directories = tree.getDirectories();
+    const directories = tree
+      .getDirectories()
+      .filter((directory) => !isMarkedTreeDeleted(storage, directory.id));
     if (directories.length > MAX_LIST_ITEMS) throw new StorageError("folder list is too large");
     return directories.map((d) => ({ id: d.id, name: d.room.name }));
   });
@@ -1319,21 +1355,16 @@ async function deleteTree(
 ): Promise<DeleteResult> {
   const operation = createOperationDeadline(options);
   const client = storage.getClient();
-  let deleted = deletedTreeIds.get(client);
-  if (!deleted) {
-    deleted = new Set();
-    deletedTreeIds.set(client, deleted);
-  }
   try {
     ensureOperationActive(operation.signal);
     const pending = withTreeMutation(client, async () => {
-      if (deleted!.has(treeId)) return { id: treeId, deleted: true };
+      if (isTreeDeleted(client, treeId)) return { id: treeId, deleted: true };
 
       const tree = await resolveTree(storage, treeId, operation.signal);
       // Read reconciliation state after this operation reaches the single
       // client queue; a preceding delete may have populated the set while we
       // were waiting for its turn.
-      const removedRooms = deletedRoomIds.get(client) ?? new Set<string>();
+      const removedRooms = getDeletedTreeIds(client);
       let graph: ValidatedDeletionGraph;
       try {
         // Re-read every locally visible room before taking the immutable graph
@@ -1341,16 +1372,17 @@ async function deleteTree(
         // session; deleting from that stale view can orphan shared descendants.
         await refreshDeletionRooms(storage, operation.signal);
         const spaces = snapshotTreeSpaces(tree, "delete graph is too large");
-        const activeSpaces = spaces.filter((space) => !removedRooms.has(space.id));
+        const activeSpaces = spaces.filter(
+          (space) => !removedRooms.has(space.id),
+        );
         const ids = new Set(activeSpaces.map((space) => space.id));
         if (!ids.has(tree.id)) {
           if (removedRooms.has(tree.id)) {
-            deleted!.add(treeId);
             return { id: treeId, deleted: true };
           }
           throw new StorageError("delete graph is unsafe");
         }
-        assertTreeEmptyForDeletion(tree, activeSpaces);
+        assertTreeEmptyForDeletion(storage, tree, activeSpaces);
         graph = validateDeletionGraph(client, tree, ids, removedRooms);
       } catch (error) {
         if (
@@ -1391,7 +1423,6 @@ async function deleteTree(
         if (error instanceof StorageError && error.message === "operation cancelled") throw error;
         throw new StorageError("delete failed");
       }
-      deleted!.add(treeId);
       return { id: treeId, deleted: true };
     }, operation.signal);
     return await raceOperationDeadline(operation, pending, "mutation");
@@ -1428,7 +1459,7 @@ export async function renameFile(
   validateName(name, "file name");
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(tree, fileId, signal);
+    const branch = await resolveFile(storage, tree, fileId, signal);
     try {
       const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
       await withRateLimitRetry(
@@ -1578,7 +1609,7 @@ export async function deleteFile(
 ): Promise<DeleteResult> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(tree, fileId, signal);
+    const branch = await resolveFile(storage, tree, fileId, signal);
     const versions = await resolveFileVersions(branch, signal);
     const mediaIds = [...new Set(versions.map(({ mediaId }) => mediaId))];
     await deleteFileMedia(storage, mediaIds, signal);
@@ -1639,6 +1670,9 @@ export async function deleteFile(
       if (error instanceof MutationOutcomeUnknownError) throw error;
       const detail = "Matrix deletion completed but the inactive file state could not be verified";
       throw new MutationPartialError("delete file", completedIds, detail);
+    }
+    for (const { branch: version } of versions) {
+      markFileDeleted(storage.getClient(), tree.id, version.id);
     }
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
@@ -1701,7 +1735,7 @@ export async function downloadFile(
 ): Promise<DownloadedFile> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(tree, fileId, signal);
+    const branch = await resolveFile(storage, tree, fileId, signal);
     let result;
     try {
       result = await storage.downloadFile(branch, signal);
@@ -1750,7 +1784,7 @@ export async function getFileDetails(
 ): Promise<FileDetails> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(tree, fileId, signal);
+    const branch = await resolveFile(storage, tree, fileId, signal);
     const name = branch.getName();
     let mimetype: string | null = null;
     let size: number | null = null;
