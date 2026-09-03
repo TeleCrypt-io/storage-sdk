@@ -81,6 +81,7 @@ const RATE_LIMIT_DEFAULT_DELAY_MS = 15_000;
 const RATE_LIMIT_MAX_DELAY_MS = 30_000;
 const RATE_LIMIT_MAX_TOTAL_DELAY_MS = 90_000;
 const MAX_DELETION_ROOMS = 4096;
+const DELETION_REFRESH_CONCURRENCY = 8;
 const MAX_DELETION_DEPTH = 128;
 const MAX_FILE_VERSION_CHAIN = 128;
 const MAX_LIST_ITEMS = 10000;
@@ -314,6 +315,7 @@ async function refreshDeletionRooms(
   const roomIds = await storage.listJoinedRoomIds({ signal });
   if (roomIds.length > MAX_DELETION_ROOMS) throw new StorageError("delete graph is too large");
   const joined = new Set(roomIds);
+  const roomIdsToRefresh: string[] = [];
   // Matrix has no bounded endpoint that enumerates every invited/non-joined
   // room carrying a space relation. Refresh every locally visible room and
   // fail closed for an invite/knock/unknown membership; a joined external
@@ -322,13 +324,31 @@ async function refreshDeletionRooms(
     if (!joined.has(room.roomId)) {
       const membership = (room as unknown as { getMyMembership?: () => string | null }).getMyMembership?.();
       if (membership !== "join") throw new StorageError("delete graph inventory is incomplete");
-      await storage.refreshRoomState(room.roomId, { signal });
+      roomIdsToRefresh.push(room.roomId);
     }
   }
-  for (const roomId of roomIds) {
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    await storage.refreshRoomState(roomId, { signal });
-  }
+  roomIdsToRefresh.push(...roomIds);
+
+  let nextRoom = 0;
+  let failed = false;
+  let firstError: unknown;
+  const refreshWorker = async (): Promise<void> => {
+    while (!failed && !signal?.aborted) {
+      const roomId = roomIdsToRefresh[nextRoom++];
+      if (roomId === undefined) return;
+      try {
+        await storage.refreshRoomState(roomId, { signal });
+      } catch (error) {
+        failed = true;
+        firstError = error;
+        return;
+      }
+    }
+  };
+  const workerCount = Math.min(DELETION_REFRESH_CONCURRENCY, roomIdsToRefresh.length);
+  await Promise.all(Array.from({ length: workerCount }, () => refreshWorker()));
+  if (signal?.aborted) throw new StorageError("operation cancelled");
+  if (failed) throw firstError;
 }
 
 async function refreshTreeSpaces(

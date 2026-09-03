@@ -82,6 +82,30 @@ describe("operation safety", () => {
     return { client, storage, tree, versions, refreshRoomState };
   }
 
+  function deletionRefreshFixture(
+    roomCount: number,
+    refreshRoomState: (roomId: string, options?: { signal?: AbortSignal }) => Promise<void>,
+  ) {
+    const roomIds = Array.from({ length: roomCount }, (_, index) => `!delete-room-${index}:example.test`);
+    const root = makeTree(roomIds[0]!, "Delete room", true);
+    root.listAllFiles = () => [{ id: "$remaining", getName: () => "remaining.txt" }] as never;
+    const rooms = roomIds.map((roomId) => ({ roomId, getMyMembership: () => "join" }));
+    const client = {
+      http: { authedRequest: vi.fn() },
+      getRooms: () => rooms,
+      kick: vi.fn(),
+      leave: vi.fn(),
+      forget: vi.fn(),
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: () => root,
+      listJoinedRoomIds: vi.fn().mockResolvedValue(roomIds),
+      refreshRoomState,
+    } as unknown as TeleCryptIOStorage;
+    return { client, root, roomIds, storage };
+  }
+
   it("deletes every version's media before redacting its Matrix events", async () => {
     const fixture = deletionFixture([
       { id: "$v2", mediaId: "mxc://example.test/v2" },
@@ -674,6 +698,43 @@ describe("operation safety", () => {
       undefined,
       { prefix: "/_matrix/client/v3", localTimeoutMs: 1234, abortSignal: undefined },
     );
+  });
+
+  it("refreshes deletion rooms with bounded concurrency before any mutation", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const refreshRoomState = vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      inFlight -= 1;
+    });
+    const fixture = deletionRefreshFixture(20, refreshRoomState);
+
+    await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toMatchObject({
+      code: "NON_EMPTY_TREE",
+      treeId: fixture.root.id,
+    });
+    expect(refreshRoomState).toHaveBeenCalledTimes(fixture.roomIds.length);
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(8);
+    expect(fixture.client.kick).not.toHaveBeenCalled();
+    expect(fixture.client.leave).not.toHaveBeenCalled();
+    expect(fixture.client.forget).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a room refresh error without starting deletion", async () => {
+    const refreshRoomState = vi.fn((roomId: string): Promise<void> => {
+      if (roomId.endsWith("-2:example.test")) throw new Error("room refresh failed");
+      return Promise.resolve();
+    });
+    const fixture = deletionRefreshFixture(12, refreshRoomState);
+
+    await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toThrow("delete failed");
+    expect(refreshRoomState.mock.calls.length).toBeLessThanOrEqual(8);
+    expect(fixture.client.kick).not.toHaveBeenCalled();
+    expect(fixture.client.leave).not.toHaveBeenCalled();
+    expect(fixture.client.forget).not.toHaveBeenCalled();
   });
 
   it("does not issue a join when authoritative membership is already joined", async () => {
