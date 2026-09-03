@@ -333,7 +333,11 @@ function assertTreeEmptyForDeletion(
   try {
     files = tree
       .listAllFiles()
-      .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
+      .filter(
+        (file) =>
+          !isMarkedFileDeleted(storage, tree.id, file.id) &&
+          !isConfirmedDeletedFile(storage.getClient(), tree.id, file),
+      );
   } catch {
     throw new StorageError("could not enumerate storage files safely");
   }
@@ -439,6 +443,30 @@ function isActiveRelationEvent(event: RelationEvent): boolean {
     content !== null &&
     !Array.isArray(content) &&
     Object.keys(content).length > 0
+  );
+}
+
+/**
+ * A deleted MSC3089 branch is represented by an authoritative empty state
+ * event. Inactive branches with metadata are historical versions, and a
+ * missing or malformed state cannot prove that the file was deleted.
+ */
+function isConfirmedDeletedFile(
+  client: MatrixClient,
+  treeId: string,
+  file: FileBranch,
+): boolean {
+  if (file.isActive) return false;
+  const stateEvents = readRelationEvents(client, treeId, UNSTABLE_MSC3089_BRANCH.name, file.id);
+  if (!stateEvents || stateEvents.length !== 1) return false;
+  const stateEvent = stateEvents[0];
+  if (relationStateKey(stateEvent) !== file.id) return false;
+  const content = stateEvent.getContent?.();
+  return (
+    typeof content === "object" &&
+    content !== null &&
+    !Array.isArray(content) &&
+    Object.keys(content).length === 0
   );
 }
 
