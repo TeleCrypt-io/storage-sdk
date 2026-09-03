@@ -8,6 +8,7 @@ import {
   UNSTABLE_MSC3089_TREE_SUBTYPE,
 } from "matrix-js-sdk";
 import {
+  boundedMatrixFetch,
   TeleCryptIOStorage,
   type TreeSpace,
   withMatrixMutationAbort,
@@ -139,6 +140,38 @@ describe("operation safety", () => {
     expect(request?.method).toBe("POST");
     expect(new Headers(request?.headers).get("content-type")).toBe("application/json");
     expect(request?.body).toBe(JSON.stringify({ media_ids: ["mxc://example.test/v1"] }));
+  });
+
+  it("accepts a browser 204 that exposes a non-null empty response stream", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      redirected: false,
+      type: "basic",
+      status: 204,
+      statusText: "No Content",
+      headers: new Headers(),
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      }),
+    } as unknown as Response);
+    const http = new FetchHttpApi({ emit: vi.fn() } as never, {
+      baseUrl: "https://matrix.example.test",
+      prefix: "/_matrix/client/v3",
+      onlyData: true,
+      fetchFn: boundedMatrixFetch(fetchMock as unknown as typeof fetch),
+    });
+
+    const response = await http.authedRequest<Blob>(
+      "POST",
+      "/io.telecrypt.storage/delete_media",
+      undefined,
+      { media_ids: ["mxc://example.test/v1"] },
+      { prefix: "/_matrix/client/unstable", rawResponseBody: true },
+    );
+    expect(response).toBeInstanceOf(Blob);
+    expect(response.size).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("reconciles the inactive file state before reporting deletion success", async () => {

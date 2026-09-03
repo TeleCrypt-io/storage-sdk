@@ -247,6 +247,23 @@ async function readBoundedMatrixResponse(
   });
   if (body.truncated) throw new Error("Matrix response body is too large");
   if (!response.body) return response;
+  // Fetch forbids a response body for 204, 205, and 304 responses. Some
+  // browser implementations nevertheless expose an empty response stream for
+  // a 204 from a proxy. Reconstructing that response with even an empty
+  // Uint8Array then throws before matrix-js-sdk can accept the successful
+  // response. Preserve the bodyless status after boundedly consuming the
+  // stream so callers such as FetchHttpApi can still read an empty Blob.
+  const bodylessStatus = response.status === 204 || response.status === 205 || response.status === 304;
+  if (bodylessStatus) {
+    if (body.bytes.byteLength !== 0) {
+      throw new Error("Matrix response body is invalid for a bodyless status");
+    }
+    return new Response(null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
   return new Response(body.bytes, {
     status: response.status,
     statusText: response.statusText,
@@ -264,7 +281,7 @@ function isMatrixStateOrMembershipUrl(input: RequestInfo | URL): boolean {
   return /\/rooms\/[^/]+\/(?:state|members)(?:\/|$)/.test(url.pathname);
 }
 
-function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
+export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
   const wrapped = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const pending = (async (): Promise<Response> => {
       const controller = new AbortController();
