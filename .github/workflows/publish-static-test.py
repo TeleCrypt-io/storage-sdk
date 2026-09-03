@@ -19,6 +19,7 @@ VERIFY = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
 PACKAGE = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
 PACKAGE_LOCK = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
 NODE_VERSION = (ROOT / ".node-version").read_text(encoding="utf-8").strip()
+PACKAGE_FILES_MANIFEST = ROOT / ".github/package-files.txt"
 
 
 class ContractError(AssertionError):
@@ -373,6 +374,32 @@ def check_provenance_verifier() -> None:
             raise ContractError(f"npm provenance adversarial coverage is missing {fragment}")
 
 
+def check_package_file_manifest() -> None:
+    if not PACKAGE_FILES_MANIFEST.is_file():
+        raise ContractError("package-file manifest is missing")
+    entries = PACKAGE_FILES_MANIFEST.read_text(encoding="utf-8").splitlines()
+    if not entries or any(not entry or entry != entry.strip() for entry in entries):
+        raise ContractError("package-file manifest contains blank or whitespace-padded entries")
+    if len(entries) != len(set(entries)):
+        raise ContractError("package-file manifest contains duplicate entries")
+    if entries != sorted(entries):
+        raise ContractError("package-file manifest must be sorted")
+    for required in (
+        "package/dist/deletion-markers.d.ts",
+        "package/dist/deletion-markers.js",
+    ):
+        if required not in entries:
+            raise ContractError(f"package-file manifest is missing {required}")
+    if WORKFLOW.count('package_files=".github/package-files.txt"') != 3:
+        raise ContractError("all three archive checks must read the package-file manifest")
+    if WORKFLOW.count('test -f "$package_files"') != 3 or WORKFLOW.count('sort "$package_files"') != 3:
+        raise ContractError("all three archive checks must validate against the package-file manifest")
+    if "expected='package/" in WORKFLOW or "printf '%b\\n' \"$expected\"" in WORKFLOW:
+        raise ContractError("duplicated inline package-file allowlist remains in publish workflow")
+    if "package/dist/" in WORKFLOW:
+        raise ContractError("publish workflow contains an inline dist package-file allowlist")
+
+
 def check_workflow_operations() -> None:
     release = job("release")
     publish_job = job("publish")
@@ -564,6 +591,7 @@ check_state_machine()
 check_revalidate_jq_predicate()
 check_provenance_retry_model()
 check_provenance_verifier()
+check_package_file_manifest()
 check_workflow_operations()
 if ".github/workflows/publish-static-test.py" not in VERIFY:
     raise ContractError("verify workflow must run the semantic release check")

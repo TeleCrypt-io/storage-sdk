@@ -135,32 +135,9 @@ jobs:
           test "${#archives[@]}" = 1
           archive="release/${RELEASE_TAG}.tgz"
           mv "${archives[0]}" "$archive"
-          expected='package/LICENSE
-          package/README.md
-          package/dist/TeleCryptIOStorage.d.ts
-          package/dist/TeleCryptIOStorage.js
-          package/dist/core/constants.d.ts
-          package/dist/core/constants.js
-          package/dist/core/errors.d.ts
-          package/dist/core/errors.js
-          package/dist/core/http.d.ts
-          package/dist/core/http.js
-          package/dist/core/index.d.ts
-          package/dist/core/index.js
-          package/dist/core/oidc.d.ts
-          package/dist/core/oidc.js
-          package/dist/core/operations.d.ts
-          package/dist/core/operations.js
-          package/dist/core/poll.d.ts
-          package/dist/core/poll.js
-          package/dist/core/types.d.ts
-          package/dist/core/types.js
-          package/dist/core/validation.d.ts
-          package/dist/core/validation.js
-          package/dist/index.d.ts
-          package/dist/index.js
-          package/package.json'
-          test "$(tar -tzf "$archive" | sort)" = "$(printf '%b\n' "$expected" | sort)"
+          package_files=".github/package-files.txt"
+          test -f "$package_files"
+          test "$(tar -tzf "$archive" | sort)" = "$(sort "$package_files")"
           if tar -tzf "$archive" | grep -Eq '(^|/)node_modules(/|$)'; then exit 1; fi
           test "$(tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
           size="$(wc -c <"$archive")"
@@ -320,38 +297,15 @@ jobs:
             fi
           }
           verify_archive() {
-            local file="$1" listing="$RUNNER_TEMP/sdk-archive-list" status expected
-            expected='package/LICENSE
-          package/README.md
-          package/dist/TeleCryptIOStorage.d.ts
-          package/dist/TeleCryptIOStorage.js
-          package/dist/core/constants.d.ts
-          package/dist/core/constants.js
-          package/dist/core/errors.d.ts
-          package/dist/core/errors.js
-          package/dist/core/http.d.ts
-          package/dist/core/http.js
-          package/dist/core/index.d.ts
-          package/dist/core/index.js
-          package/dist/core/oidc.d.ts
-          package/dist/core/oidc.js
-          package/dist/core/operations.d.ts
-          package/dist/core/operations.js
-          package/dist/core/poll.d.ts
-          package/dist/core/poll.js
-          package/dist/core/types.d.ts
-          package/dist/core/types.js
-          package/dist/core/validation.d.ts
-          package/dist/core/validation.js
-          package/dist/index.d.ts
-          package/dist/index.js
-          package/package.json'
+            local file="$1" listing="$RUNNER_TEMP/sdk-archive-list" status
+            local package_files=".github/package-files.txt"
+            test -f "$package_files"
             set +e
             python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
             status="$?"
             set -e
             test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
-            test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
+            test "$(sort "$listing")" = "$(sort "$package_files")"
             if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
             python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
             cmp -s "$listing.license" LICENSE
@@ -505,38 +459,15 @@ jobs:
             rm -rf "$d"
           }
           verify_archive() {
-            local file="$1" listing="$RUNNER_TEMP/sdk-publish-archive-list" status expected
-            expected='package/LICENSE
-          package/README.md
-          package/dist/TeleCryptIOStorage.d.ts
-          package/dist/TeleCryptIOStorage.js
-          package/dist/core/constants.d.ts
-          package/dist/core/constants.js
-          package/dist/core/errors.d.ts
-          package/dist/core/errors.js
-          package/dist/core/http.d.ts
-          package/dist/core/http.js
-          package/dist/core/index.d.ts
-          package/dist/core/index.js
-          package/dist/core/oidc.d.ts
-          package/dist/core/oidc.js
-          package/dist/core/operations.d.ts
-          package/dist/core/operations.js
-          package/dist/core/poll.d.ts
-          package/dist/core/poll.js
-          package/dist/core/types.d.ts
-          package/dist/core/types.js
-          package/dist/core/validation.d.ts
-          package/dist/core/validation.js
-          package/dist/index.d.ts
-          package/dist/index.js
-          package/package.json'
+            local file="$1" listing="$RUNNER_TEMP/sdk-publish-archive-list" status
+            local package_files=".github/package-files.txt"
+            test -f "$package_files"
             set +e
             python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
             status="$?"
             set -e
             test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
-            test "$(sort "$listing")" = "$(printf '%b\n' "$expected" | sort)"
+            test "$(sort "$listing")" = "$(sort "$package_files")"
             if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
             python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
             cmp -s "$listing.license" LICENSE
