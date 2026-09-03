@@ -11,6 +11,7 @@ export default defineConfig({
       "test/bootstrap-recovery.test.ts",
       "test/tree-mutations.test.ts",
       "test/operations-safety.test.ts",
+      "test/projection-race.test.ts",
       "test/media-safety.test.ts",
       "test/users.test.ts",
       "test/npm-provenance.test.ts",
