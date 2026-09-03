@@ -12,6 +12,7 @@ export default defineConfig({
       "test/tree-mutations.test.ts",
       "test/operations-safety.test.ts",
       "test/projection-race.test.ts",
+      "test/cross-client-delete.test.ts",
       "test/media-safety.test.ts",
       "test/users.test.ts",
       "test/npm-provenance.test.ts",
