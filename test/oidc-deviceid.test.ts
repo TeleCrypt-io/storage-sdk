@@ -119,6 +119,13 @@ describe("extractDeviceIdFromScope", () => {
     expect(extractDeviceIdFromScope(scope)).toBe(expected);
   });
 
+  it("extracts device IDs from the current MSC2967 scope", () => {
+    const scope =
+      "openid urn:matrix:org.matrix.msc2967.client:api:* " +
+      "urn:matrix:org.matrix.msc2967.client:device:CURRENT12345";
+    expect(extractDeviceIdFromScope(scope)).toBe("CURRENT12345");
+  });
+
   it("rejects a scope without a device grant", () => {
     expect(extractDeviceIdFromScope("openid urn:matrix:client:api:*")).toBeNull();
   });
@@ -186,6 +193,32 @@ describe("authorization context replay and tamper protection", () => {
       /missing or expired/,
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts the current MSC2967 scope returned by MAS", async () => {
+    const storage = new MemoryStorage();
+    const { state } = await beginForCallback(storage);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            token_type: "Bearer",
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            scope:
+              "openid urn:matrix:org.matrix.msc2967.client:api:* " +
+              "urn:matrix:org.matrix.msc2967.client:device:CALLBACK123",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).resolves.toMatchObject({
+      homeserverUrl: "https://mas.test/",
+      oidcClientSettings: { clientId: "test-client", issuer: "https://mas.test" },
+    });
   });
 
   it("bounds an oversized authorization-code exchange response", async () => {

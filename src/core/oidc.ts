@@ -87,6 +87,9 @@ const MAX_OIDC_TOKEN_LENGTH = 8192;
 const MAX_OIDC_SCOPE_LENGTH = 4096;
 const MAX_OIDC_CONTACTS = 16;
 const MAX_OIDC_REDIRECT_URIS = 8;
+const LEGACY_MATRIX_SCOPE_PREFIX = "urn:matrix:client:";
+const MSC2967_MATRIX_SCOPE_PREFIX = "urn:matrix:org.matrix.msc2967.client:";
+const MATRIX_SCOPE_PREFIXES = [LEGACY_MATRIX_SCOPE_PREFIX, MSC2967_MATRIX_SCOPE_PREFIX] as const;
 // MAS advertises a 20-minute device-code lifetime. Keep that provider window
 // as the hard upper bound while retaining a finite polling budget.
 const MAX_DEVICE_EXPIRES_IN_SECONDS = 20 * 60;
@@ -996,7 +999,11 @@ export async function waitForDeviceCodeLogin(
       );
       if (response.ok && isValidDeviceAccessTokenResponse(body)) {
         const tokenResponse = validateDeviceAccessTokenResponse(body);
-        if (!requestedDeviceId || tokenResponse.scope !== generateScope(requestedDeviceId)) {
+        if (
+          !requestedDeviceId ||
+          typeof tokenResponse.scope !== "string" ||
+          !scopeMatchesDevice(tokenResponse.scope, requestedDeviceId)
+        ) {
           throw new OidcValidationError("OIDC device authorization returned an unexpected granted scope");
         }
         ensureOidcNotCancelled(signal, "device authorization");
@@ -1167,9 +1174,8 @@ export async function completeAuthorizationCodeFlow(
     validateBearerTokenResponse(body);
     validateTokenBounds(body, "authorization code exchange");
     const normalized = normalizeBearerTokenResponseTokenType(body);
-    const expectedScope = generateScope(context.deviceId);
     const grantedScope = normalized.scope;
-    if (typeof grantedScope !== "string" || grantedScope !== expectedScope) {
+    if (typeof grantedScope !== "string" || !scopeMatchesDevice(grantedScope, context.deviceId)) {
       throw new StorageError("OIDC authorization code exchange returned an unexpected granted scope");
     }
     const tokenResponse: BearerTokenResponse = {
@@ -1204,10 +1210,55 @@ export function extractDeviceIdFromScope(scope: string): string | null {
     return null;
   }
   const tokens = scope.split(/\s+/);
-  const deviceTokens = tokens.filter((token) => token.startsWith("urn:matrix:client:device:"));
+  const deviceTokens = tokens.filter((token) =>
+    MATRIX_SCOPE_PREFIXES.some((prefix) => token.startsWith(`${prefix}device:`)),
+  );
   if (deviceTokens.length !== 1) return null;
-  const deviceId = deviceTokens[0].slice("urn:matrix:client:device:".length);
+  const deviceToken = deviceTokens[0];
+  const prefix = MATRIX_SCOPE_PREFIXES.find((candidate) => deviceToken.startsWith(`${candidate}device:`));
+  if (!prefix) return null;
+  const deviceId = deviceToken.slice(`${prefix}device:`.length);
   return DEVICE_ID_PATTERN.test(deviceId) ? deviceId : null;
+}
+
+/**
+ * Accepts the legacy Matrix OAuth scope and the current MSC2967 namespace
+ * returned by MAS. The provider may add the standard `openid` scope, but the
+ * API and device grants must remain one exact namespace pair bound to the
+ * device that this client requested.
+ */
+function scopeMatchesDevice(scope: string, expectedDeviceId: string): boolean {
+  if (
+    typeof scope !== "string" ||
+    typeof expectedDeviceId !== "string" ||
+    !DEVICE_ID_PATTERN.test(expectedDeviceId) ||
+    scope.length === 0 ||
+    scope.length > MAX_OIDC_SCOPE_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(scope) ||
+    scope.trim() !== scope ||
+    /\s{2,}/.test(scope)
+  ) {
+    return false;
+  }
+  const tokens = scope.split(/\s+/);
+  if (new Set(tokens).size !== tokens.length) return false;
+  return MATRIX_SCOPE_PREFIXES.some((prefix) => {
+    const expected = new Set([
+      `${prefix}api:*`,
+      `${prefix}device:${expectedDeviceId}`,
+      "openid",
+    ]);
+    const required = new Set([
+      `${prefix}api:*`,
+      `${prefix}device:${expectedDeviceId}`,
+    ]);
+    return (
+      tokens.length >= required.size &&
+      tokens.length <= expected.size &&
+      tokens.every((token) => expected.has(token)) &&
+      [...required].every((token) => tokens.includes(token))
+    );
+  });
 }
 
 function validateMatrixUserId(userId: unknown, serverName: string): string {
@@ -1361,10 +1412,7 @@ async function refreshOidcToken(
       } catch {
         throw new StorageError("OIDC token refresh returned an invalid scope");
       }
-      if (
-        extractDeviceIdFromScope(grantedScope) === null ||
-        grantedScope !== generateScope(expectedDeviceId)
-      ) {
+      if (!scopeMatchesDevice(grantedScope, expectedDeviceId)) {
         throw new StorageError("OIDC token refresh returned an unexpected granted scope");
       }
     } else {

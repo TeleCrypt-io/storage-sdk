@@ -67,6 +67,25 @@ describe("OIDC token refresh response validation", () => {
     });
   });
 
+  it("accepts the current MSC2967 scope returned by MAS", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        response({
+          access_token: "next-access",
+          token_type: "Bearer",
+          scope:
+            "openid urn:matrix:org.matrix.msc2967.client:api:* " +
+            "urn:matrix:org.matrix.msc2967.client:device:DEVICE123",
+        }),
+      ),
+    );
+    await expect(refreshWithNoopPersistence()("prior-refresh")).resolves.toMatchObject({
+      accessToken: "next-access",
+      refreshToken: "prior-refresh",
+    });
+  });
+
   it("rejects a refresh scope bound to a different Matrix device", async () => {
     vi.stubGlobal(
       "fetch",
@@ -644,6 +663,30 @@ describe("Matrix 42 OAuth migration", () => {
     await expect(waitForDeviceCodeLogin(OAUTH_METADATA, "client-id", session)).rejects.toThrow(
       "unexpected granted scope",
     );
+  });
+
+  it("accepts the current MSC2967 scope for a device token", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({
+        device_code: "device-code",
+        user_code: "ABCD",
+        verification_uri: "https://auth.example.test/device",
+        expires_in: 60,
+        interval: 1,
+      }))
+      .mockResolvedValueOnce(response({
+        access_token: "access",
+        token_type: "Bearer",
+        scope:
+          "openid urn:matrix:org.matrix.msc2967.client:api:* " +
+          "urn:matrix:org.matrix.msc2967.client:device:DEVICE123",
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const session = await startDeviceCodeLogin(OAUTH_METADATA, "client-id", "DEVICE123");
+    await expect(waitForDeviceCodeLogin(OAUTH_METADATA, "client-id", session)).resolves.toMatchObject({
+      access_token: "access",
+      scope: expect.stringContaining("urn:matrix:org.matrix.msc2967.client:device:DEVICE123"),
+    });
   });
 
   it("rejects an oversized device session before polling", async () => {
