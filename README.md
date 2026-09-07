@@ -4,6 +4,10 @@
 
 End-to-end encrypted file storage and sharing, built on Matrix.
 
+The current public TeleCrypt architecture, responsibilities, and product limits are authoritative at
+[telecrypt.io/llms.txt](https://telecrypt.io/llms.txt). This README documents this SDK's package API
+and development workflow.
+
 Files are encrypted on the client before upload. The server stores only opaque ciphertext and
 never holds the decryption keys. Shared vaults let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
@@ -15,7 +19,7 @@ is maintained in its own repository.
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.5.10
+npm install @telecrypt-io/storage@0.5.28
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.

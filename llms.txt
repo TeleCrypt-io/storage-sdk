@@ -1,10 +1,6 @@
-# TeleCrypt.io Storage SDK
+# TeleCrypt.io
 
-Library-only end-to-end encrypted file storage and sharing on Matrix. The canonical installation,
-API, encryption, sharing, Recovery Key, and development guidance is in [README.md](./README.md);
-the guarded exact-tag publication procedure is in [RELEASING.md](./RELEASING.md).
+The sole public authority for current TeleCrypt project facts, architecture, responsibilities,
+principles, limits, and user-visible behavior is https://telecrypt.io/llms.txt.
 
-Current package: `@telecrypt-io/storage@0.5.0`. Consumers must pin an exact version. The package
-exports the `TeleCryptIOStorage` library and the browser-safe `@telecrypt-io/storage/core` API; it
-does not provide a command-line executable. The CLI and static web application are separate
-repositories and release artifacts.
+Repository-specific SDK usage and development instructions remain in README.md and RELEASING.md.

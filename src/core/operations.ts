@@ -88,7 +88,6 @@ const RATE_LIMIT_DEFAULT_DELAY_MS = 15_000;
 const RATE_LIMIT_MAX_DELAY_MS = 30_000;
 const RATE_LIMIT_MAX_TOTAL_DELAY_MS = 90_000;
 const MAX_DELETION_ROOMS = 4096;
-const DELETION_REFRESH_CONCURRENCY = 8;
 const MAX_DELETION_DEPTH = 128;
 const MAX_FILE_VERSION_CHAIN = 128;
 const MAX_LIST_ITEMS = 10000;
@@ -346,6 +345,7 @@ function assertTreeEmptyForDeletion(
 
 async function refreshDeletionRooms(
   storage: TeleCryptIOStorage,
+  rootId: string,
   signal?: AbortSignal,
 ): Promise<void> {
   const client = storage.getClient();
@@ -355,43 +355,24 @@ async function refreshDeletionRooms(
   if (typeof http?.authedRequest !== "function") {
     throw new StorageError("delete graph refresh is unavailable");
   }
-  const roomIds = await storage.listJoinedRoomIds({ signal });
-  if (roomIds.length > MAX_DELETION_ROOMS) throw new StorageError("delete graph is too large");
-  const joined = new Set(roomIds);
-  const roomIdsToRefresh: string[] = [];
-  // Matrix has no bounded endpoint that enumerates every invited/non-joined
-  // room carrying a space relation. Refresh every locally visible room and
-  // fail closed for an invite/knock/unknown membership; a joined external
-  // parent remains inspectable and is validated by validateDeletionGraph.
-  for (const room of client.getRooms()) {
-    if (!joined.has(room.roomId)) {
-      const membership = (room as unknown as { getMyMembership?: () => string | null }).getMyMembership?.();
-      if (membership !== "join") throw new StorageError("delete graph inventory is incomplete");
-      roomIdsToRefresh.push(room.roomId);
-    }
-  }
-  roomIdsToRefresh.push(...roomIds);
-
-  let nextRoom = 0;
-  let failed = false;
-  let firstError: unknown;
-  const refreshWorker = async (): Promise<void> => {
-    while (!failed && !signal?.aborted) {
-      const roomId = roomIdsToRefresh[nextRoom++];
-      if (roomId === undefined) return;
-      try {
-        await storage.refreshRoomState(roomId, { signal });
-      } catch (error) {
-        failed = true;
-        firstError = error;
-        return;
-      }
-    }
-  };
-  const workerCount = Math.min(DELETION_REFRESH_CONCURRENCY, roomIdsToRefresh.length);
-  await Promise.all(Array.from({ length: workerCount }, () => refreshWorker()));
+  await storage.refreshRoomState(rootId, { signal });
   if (signal?.aborted) throw new StorageError("operation cancelled");
-  if (failed) throw firstError;
+
+  // The refreshed root owns its parent relation. Verify its one supported
+  // external parent directly; unrelated local rooms are outside this deletion.
+  const parentEvents = readRelationEvents(client, rootId, EventType.SpaceParent);
+  if (parentEvents === null) throw new StorageError("delete graph is unsafe");
+  const parentIds = new Set<string>();
+  for (const event of parentEvents) {
+    if (!isActiveRelationEvent(event)) continue;
+    const parentId = relationStateKey(event);
+    if (!parentId) throw new StorageError("delete graph is unsafe");
+    if (parentId !== rootId) parentIds.add(parentId);
+  }
+  if (parentIds.size > 1) throw new StorageError("delete graph is unsafe");
+  const parentId = parentIds.values().next().value;
+  if (parentId) await storage.refreshRoomState(parentId, { signal });
+  if (signal?.aborted) throw new StorageError("operation cancelled");
 }
 
 async function refreshTreeSpaces(
@@ -544,27 +525,15 @@ function validateDeletionGraph(
         if (id !== root.id || externalParents.includes(parentId)) {
           throw new StorageError("delete graph is unsafe");
         }
-        externalParents.push(parentId);
-      }
-    }
-  }
-
-  const rooms = client.getRooms();
-  if (rooms.length > MAX_DELETION_ROOMS) throw new StorageError("delete graph is too large");
-  for (const room of rooms) {
-    const parentId = room.roomId;
-    const childEvents = readRelationEvents(client, parentId, EventType.SpaceChild);
-    if (childEvents === null) throw new StorageError("delete graph is unsafe");
-    for (const event of childEvents) {
-      if (!isActiveRelationEvent(event)) continue;
-      const childId = relationStateKey(event);
-      if (!childId) throw new StorageError("delete graph is unsafe");
-      if (ids.has(childId) && !ids.has(parentId)) {
-        if (childId === root.id) {
-          if (!externalParents.includes(parentId)) externalParents.push(parentId);
-          continue;
+        const childLink = readRelationEvents(client, parentId, EventType.SpaceChild, id);
+        if (
+          !childLink?.some(
+            (candidate) => isActiveRelationEvent(candidate) && relationStateKey(candidate, id) === id,
+          )
+        ) {
+          throw new StorageError("delete graph is unsafe");
         }
-        throw new StorageError("delete graph is unsafe");
+        externalParents.push(parentId);
       }
     }
   }
@@ -673,61 +642,76 @@ async function deleteRoomDeterministically(
   roomId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const client = storage.getClient();
-  const tree = storage.getTree(roomId);
-  if (!tree) throw new StorageError("delete graph is unsafe");
-  const self = client.getUserId();
-  if (!self) throw new StorageError("delete graph is unsafe");
-  const members = await storage.listMembers(tree, { signal });
-  if (members.some((member) => member.userId !== self && member.role === "owner" &&
-      (member.membership === "join" || member.membership === "invite" || member.membership === "knock"))) {
-    throw new StorageError("delete will not kick another room owner");
-  }
-  for (const member of members) {
-    const membership = member.membership;
-    if (
-      member.userId === self ||
-      (membership !== "join" && membership !== "invite" && membership !== "knock")
-    ) {
-      continue;
+  const completedRoomIds: string[] = [];
+  const markRoomMutationComplete = (): void => {
+    if (!completedRoomIds.includes(roomId)) completedRoomIds.push(roomId);
+  };
+  try {
+    const client = storage.getClient();
+    const tree = storage.getTree(roomId);
+    if (!tree) throw new StorageError("delete graph is unsafe");
+    const self = client.getUserId();
+    if (!self) throw new StorageError("delete graph is unsafe");
+    const members = await storage.listMembers(tree, { signal });
+    if (members.some((member) => member.userId !== self && member.role === "owner" &&
+        (member.membership === "join" || member.membership === "invite" || member.membership === "knock"))) {
+      throw new StorageError("delete will not kick another room owner");
     }
-    try {
-      await withRateLimitRetry(
-        () => withMatrixMutationAbort(client, () => client.kick(roomId, member.userId, "Room deleted"), signal),
-        signal,
-      );
-    } catch (error) {
-      if (isGoneError(error)) continue;
-      if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
-        const currentMembership = await storage.getRoomMembership(roomId, member.userId, { signal });
-        if (
-          currentMembership === "leave" ||
-          currentMembership === "ban" ||
-          !currentMembership
-        ) {
-          continue;
-        }
+    for (const member of members) {
+      const membership = member.membership;
+      if (
+        member.userId === self ||
+        (membership !== "join" && membership !== "invite" && membership !== "knock")
+      ) {
+        continue;
       }
-      throw error;
+      try {
+        await withRateLimitRetry(
+          () => withMatrixMutationAbort(client, () => client.kick(roomId, member.userId, "Room deleted"), signal),
+          signal,
+        );
+        markRoomMutationComplete();
+      } catch (error) {
+        if (isGoneError(error)) continue;
+        if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
+          const currentMembership = await storage.getRoomMembership(roomId, member.userId, { signal });
+          if (
+            currentMembership === "leave" ||
+            currentMembership === "ban" ||
+            !currentMembership
+          ) {
+            continue;
+          }
+        }
+        throw error;
+      }
     }
-  }
 
-  const ownMembership = await storage.getRoomMembership(roomId, undefined, { signal });
-  if (ownMembership === "join" || ownMembership === "invite" || ownMembership === "knock") {
+    const ownMembership = await storage.getRoomMembership(roomId, undefined, { signal });
+    if (ownMembership === "join" || ownMembership === "invite" || ownMembership === "knock") {
+      try {
+        await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.leave(roomId), signal), signal);
+        markRoomMutationComplete();
+      } catch (error) {
+        if (!isGoneError(error)) throw error;
+      }
+    }
+
     try {
-      await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.leave(roomId), signal), signal);
+      await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.forget(roomId), signal), signal);
+      markRoomMutationComplete();
     } catch (error) {
       if (!isGoneError(error)) throw error;
     }
-  }
-
-  try {
-    await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.forget(roomId), signal), signal);
+    removeRoomFromLocalStore(client, roomId);
+    markTreeDeleted(client, roomId);
   } catch (error) {
-    if (!isGoneError(error)) throw error;
+    if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
+    if (completedRoomIds.length > 0) {
+      throw new MutationPartialError("delete", completedRoomIds, "room cleanup stopped");
+    }
+    throw error;
   }
-  removeRoomFromLocalStore(client, roomId);
-  markTreeDeleted(client, roomId);
 }
 
 /**
@@ -1395,10 +1379,11 @@ async function deleteTree(
       const removedRooms = getDeletedTreeIds(client);
       let graph: ValidatedDeletionGraph;
       try {
-        // Re-read every locally visible room before taking the immutable graph
-        // snapshot. Local MSC3089 relations and memberships can lag another
-        // session; deleting from that stale view can orphan shared descendants.
-        await refreshDeletionRooms(storage, operation.signal);
+        // Re-read the candidate graph and any external parents it identifies
+        // before taking the immutable graph snapshot. Unrelated rooms are not
+        // part of this operation and must not block deletion merely because
+        // their membership is not joined.
+        await refreshDeletionRooms(storage, tree.id, operation.signal);
         const spaces = snapshotTreeSpaces(tree, "delete graph is too large");
         const activeSpaces = spaces.filter(
           (space) => !removedRooms.has(space.id),
@@ -1418,7 +1403,7 @@ async function deleteTree(
           error instanceof MutationPartialError ||
           error instanceof NonEmptyTreeError
         ) throw error;
-        if (error instanceof StorageError && error.message === "operation cancelled") throw error;
+        if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed");
       }
 
@@ -1432,7 +1417,7 @@ async function deleteTree(
         if (error instanceof StorageError && error.message === "delete graph unlink cleanup is incomplete") {
           throw error;
         }
-        if (error instanceof StorageError && error.message === "operation cancelled") throw error;
+        if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed");
       }
       try {
@@ -1448,7 +1433,7 @@ async function deleteTree(
         }
         if (error instanceof MutationOutcomeUnknownError) throw error;
         if (error instanceof MutationPartialError) throw error;
-        if (error instanceof StorageError && error.message === "operation cancelled") throw error;
+        if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed");
       }
       return { id: treeId, deleted: true };

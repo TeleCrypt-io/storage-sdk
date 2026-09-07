@@ -90,10 +90,15 @@ describe("operation safety", () => {
     const roomIds = Array.from({ length: roomCount }, (_, index) => `!delete-room-${index}:example.test`);
     const root = makeTree(roomIds[0]!, "Delete room", true);
     root.listAllFiles = () => [{ id: "$remaining", getName: () => "remaining.txt" }] as never;
-    const rooms = roomIds.map((roomId) => ({ roomId, getMyMembership: () => "join" }));
+    const rooms = roomIds.map((roomId) => ({
+      roomId,
+      getMyMembership: () => "join",
+      currentState: { getStateEvents: () => [] },
+    }));
     const client = {
       http: { authedRequest: vi.fn() },
       getRooms: () => rooms,
+      getRoom: (roomId: string) => rooms.find((room) => room.roomId === roomId) ?? null,
       kick: vi.fn(),
       leave: vi.fn(),
       forget: vi.fn(),
@@ -101,7 +106,6 @@ describe("operation safety", () => {
     const storage = {
       getClient: () => client,
       getTree: () => root,
-      listJoinedRoomIds: vi.fn().mockResolvedValue(roomIds),
       refreshRoomState,
     } as unknown as TeleCryptIOStorage;
     return { client, root, roomIds, storage };
@@ -692,29 +696,9 @@ describe("operation safety", () => {
     expect(authedRequest).toHaveBeenCalledTimes(2);
   });
 
-  it("uses the authoritative joined-room inventory for deletion refreshes", async () => {
-    const authedRequest = vi.fn().mockResolvedValue({ joined_rooms: ["!authoritative:example.test"] });
-    const storage = new TeleCryptIOStorage({ http: { authedRequest } } as never);
-    await expect(storage.listJoinedRoomIds({ timeoutMs: 1234 })).resolves.toEqual([
-      "!authoritative:example.test",
-    ]);
-    expect(authedRequest).toHaveBeenCalledWith(
-      "GET",
-      "/joined_rooms",
-      undefined,
-      undefined,
-      { prefix: "/_matrix/client/v3", localTimeoutMs: 1234, abortSignal: undefined },
-    );
-  });
-
-  it("refreshes deletion rooms with bounded concurrency before any mutation", async () => {
-    let inFlight = 0;
-    let maxInFlight = 0;
+  it("refreshes only deletion-graph rooms before any mutation", async () => {
     const refreshRoomState = vi.fn(async () => {
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
       await new Promise<void>((resolve) => setTimeout(resolve, 2));
-      inFlight -= 1;
     });
     const fixture = deletionRefreshFixture(20, refreshRoomState);
 
@@ -722,24 +706,42 @@ describe("operation safety", () => {
       code: "NON_EMPTY_TREE",
       treeId: fixture.root.id,
     });
-    expect(refreshRoomState).toHaveBeenCalledTimes(fixture.roomIds.length);
-    expect(maxInFlight).toBeGreaterThan(1);
-    expect(maxInFlight).toBeLessThanOrEqual(8);
+    expect(refreshRoomState).toHaveBeenCalledTimes(1);
+    expect(refreshRoomState).toHaveBeenCalledWith(fixture.root.id, expect.anything());
     expect(fixture.client.kick).not.toHaveBeenCalled();
     expect(fixture.client.leave).not.toHaveBeenCalled();
     expect(fixture.client.forget).not.toHaveBeenCalled();
     expect(isTreeDeleted(fixture.client as never, fixture.root.id)).toBe(false);
   });
 
+  it("does not let an unrelated invite block deletion graph refresh", async () => {
+    const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+    const fixture = deletionRefreshFixture(1, refreshRoomState);
+    const unrelated = {
+      roomId: "!unrelated-invite:example.test",
+      getMyMembership: () => "invite",
+      currentState: { getStateEvents: () => [] },
+    };
+    const graphRooms = fixture.client.getRooms;
+    fixture.client.getRooms = () => [...graphRooms(), unrelated];
+
+    await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toMatchObject({
+      code: "NON_EMPTY_TREE",
+      treeId: fixture.root.id,
+    });
+    expect(refreshRoomState).toHaveBeenCalledTimes(1);
+    expect(refreshRoomState).toHaveBeenCalledWith(fixture.root.id, expect.anything());
+  });
+
   it("fails closed on a room refresh error without starting deletion", async () => {
     const refreshRoomState = vi.fn((roomId: string): Promise<void> => {
-      if (roomId.endsWith("-2:example.test")) throw new Error("room refresh failed");
+      if (roomId.endsWith("-0:example.test")) throw new Error("room refresh failed");
       return Promise.resolve();
     });
     const fixture = deletionRefreshFixture(12, refreshRoomState);
 
     await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toThrow("delete failed");
-    expect(refreshRoomState.mock.calls.length).toBeLessThanOrEqual(8);
+    expect(refreshRoomState.mock.calls.length).toBe(1);
     expect(fixture.client.kick).not.toHaveBeenCalled();
     expect(fixture.client.leave).not.toHaveBeenCalled();
     expect(fixture.client.forget).not.toHaveBeenCalled();
@@ -1247,7 +1249,9 @@ describe("operation safety", () => {
     const client = {
       getUserId: () => "@owner:example.test",
       getRoom: () => room,
-      getRooms: () => [room],
+      // An unrelated, incomplete local room is not part of this deletion and
+      // must not become a speculative precondition for it.
+      getRooms: () => [room, { roomId: "!unrelated:example.test" }],
       unstableGetFileTreeSpace: () => root,
       kick: vi.fn().mockImplementation(async () => {
         member.membership = "leave";
@@ -1282,6 +1286,49 @@ describe("operation safety", () => {
       deleted: true,
     });
     expect(isTreeDeleted(client as never, root.id)).toBe(true);
+  });
+
+  it("reports room deletion as partial after an earlier member kick succeeds", async () => {
+    const root = makeTree("!delete-partial:example.test", "Partial", true);
+    const room = {
+      roomId: root.id,
+      currentState: { getStateEvents: () => [] },
+    };
+    const kick = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("second kick failed"));
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getDomain: () => "example.test",
+      getRoom: () => room,
+      getRooms: () => [room],
+      unstableGetFileTreeSpace: () => root,
+      kick,
+      leave: vi.fn(),
+      forget: vi.fn(),
+      http: { authedRequest: vi.fn() },
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: () => root,
+      listMembers: vi.fn().mockResolvedValue([
+        { userId: "@owner:example.test", role: "owner", membership: "join" },
+        { userId: "@first:example.test", role: "viewer", membership: "join" },
+        { userId: "@second:example.test", role: "viewer", membership: "join" },
+      ]),
+      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(deleteVault(storage, root.id)).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "delete",
+      completedIds: [root.id],
+    });
+    expect(kick).toHaveBeenCalledTimes(2);
+    expect(client.leave).not.toHaveBeenCalled();
+    expect(client.forget).not.toHaveBeenCalled();
   });
 
   it("suppresses only typed M_FORBIDDEN after authoritative membership confirms the target", async () => {

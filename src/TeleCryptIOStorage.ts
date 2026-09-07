@@ -638,23 +638,6 @@ function parseMatrixPowerLevels(value: unknown): MatrixPowerLevels {
   return value as MatrixPowerLevels;
 }
 
-function parseJoinedRoomsResponse(value: unknown): string[] {
-  if (
-    !isRecord(value) ||
-    !Array.isArray(value.joined_rooms) ||
-    value.joined_rooms.length > MAX_MATRIX_JOINED_ROOMS
-  ) {
-    throw new Error("invalid Matrix joined-room response");
-  }
-  return value.joined_rooms.map((roomId): string => {
-    try {
-      return validateMatrixRoomId(roomId, "joined-room response");
-    } catch {
-      throw new Error("invalid Matrix joined-room response");
-    }
-  });
-}
-
 function isGoneRoomError(error: unknown): boolean {
   return (
     error instanceof MatrixError &&
@@ -1925,26 +1908,6 @@ export class TeleCryptIOStorage {
         membership: e.content.membership as string,
         role: roleFor(e.state_key),
       }));
-  }
-
-  /**
-   * Returns the homeserver's complete joined-room inventory. Local sync room
-   * lists can be truncated by initialSyncLimit and are not an authoritative
-   * basis for deletion safety.
-   */
-  async listJoinedRoomIds(options?: MatrixRequestOptions): Promise<string[]> {
-    const body = await requireMatrixHttpTransport(this.client).authedRequest<{ joined_rooms: unknown }>(
-      Method.Get,
-      "/joined_rooms",
-      undefined,
-      undefined,
-      {
-        prefix: ClientPrefix.V3,
-        localTimeoutMs: matrixRequestTimeout(options),
-        abortSignal: matrixRequestSignal(options),
-      },
-    );
-    return parseJoinedRoomsResponse(body);
   }
 
   /** Reads one room membership from the homeserver, not the lagging local sync store. */
