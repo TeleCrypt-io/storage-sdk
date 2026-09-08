@@ -56,28 +56,21 @@ jobs:
           git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
           config_status="$?"
           set -e
+          if test "$config_status" != 0 -a "$config_status" != 1; then cat "$config_file"; exit "$config_status"; fi
           test "$config_status" = 0 -o "$config_status" = 1
           while IFS= read -r key; do
-            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+            test -z "$key" || git config --local --no-includes --unset-all "$key"
           done <"$config_file"
           rm -f "$config_file"
           git remote set-url origin "$repo_url"
           test "$(git remote get-url origin)" = "$repo_url"
-          d="$(mktemp -d)"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
-          test ! -s "$d/out" -a ! -s "$d/err"
+          timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
           test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
           release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
           test "$release_commit" = "$RELEASE_SHA"
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
           git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
-          rm -rf "$d"
       - uses: actions/setup-node@v7.0.0
         with: {node-version: "24.20.0", cache: npm}
       - name: Verify toolchain and package version
@@ -91,25 +84,10 @@ jobs:
       - name: Test and build the release source
         run: |
           set -euo pipefail
-          bounded_command() {
-            local output="$1" seconds="$2" status error
-            shift 2
-            error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds "$seconds" --kill-after-seconds 5 -- "$@"
-            status="$?"
-            set -e
-            test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
-            if test "$status" = 0; then
-              test ! -s "$error"
-              if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
-            fi
-            return "$status"
-          }
-          bounded_command "$RUNNER_TEMP/npm-ci.out" 600 npm ci --ignore-scripts --no-fund --no-audit --loglevel=error
-          bounded_command "$RUNNER_TEMP/npm-lint.out" 300 npm run lint
-          bounded_command "$RUNNER_TEMP/npm-test-unit.out" 600 npm run test:unit
-          bounded_command "$RUNNER_TEMP/npm-build.out" 300 npm run build
+          timeout --signal=TERM --kill-after=5s 600s npm ci --ignore-scripts --no-fund --no-audit
+          timeout --signal=TERM --kill-after=5s 300s npm run lint
+          timeout --signal=TERM --kill-after=5s 600s npm run test:unit
+          timeout --signal=TERM --kill-after=5s 300s npm run build
       - name: Package the exact tested archive
         id: package
         shell: bash
@@ -117,20 +95,7 @@ jobs:
           # shellcheck disable=SC2097,SC2098,SC2016
           set -euo pipefail
           mkdir -p release
-          bounded_command() {
-            local output="$1" status error
-            shift
-            error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- "$@"
-            status="$?"
-            set -e
-            test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
-            test "$status" = 0
-            test ! -s "$error"
-            if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"; then exit 1; fi
-          }
-          bounded_command "$RUNNER_TEMP/npm-pack.out" npm pack --ignore-scripts --pack-destination release --loglevel=error
+          timeout --signal=TERM --kill-after=5s 300s npm pack --ignore-scripts --pack-destination release
           mapfile -t archives < <(find release -maxdepth 1 -type f -name '*.tgz' -print)
           test "${#archives[@]}" = 1
           archive="release/${RELEASE_TAG}.tgz"
@@ -195,30 +160,23 @@ jobs:
           git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
           config_status="$?"
           set -e
+          if test "$config_status" != 0 -a "$config_status" != 1; then cat "$config_file"; exit "$config_status"; fi
           test "$config_status" = 0 -o "$config_status" = 1
           while IFS= read -r key; do
-            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+            test -z "$key" || git config --local --no-includes --unset-all "$key"
           done <"$config_file"
           rm -f "$config_file"
           git remote set-url origin "$repo_url"
           test "$(git remote get-url origin)" = "$repo_url"
           verify_source() {
-            local d status release_commit
-            d="$(mktemp -d)"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
-            status="$?"
-            set -e
-            test "$status" = 0
-            test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
-            test ! -s "$d/out" -a ! -s "$d/err"
+            local release_commit
+            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
             test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
             release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
             test "$release_commit" = "$RELEASE_SHA"
             test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
             test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
             git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
-            rm -rf "$d"
           }
           verify_source
           archive="release/${RELEASE_TAG}.tgz"
@@ -227,6 +185,7 @@ jobs:
           test "sha256:$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_DIGEST"
           record="release/${RELEASE_TAG}.integrity.json"
           test -f "$record"
+          source scripts/capture-diagnostics.sh
           verify_record() {
             local file="$1"
             test "$(wc -c <"$file")" = "$EXPECTED_RECORD_SIZE"
@@ -234,59 +193,119 @@ jobs:
             EXPECTED_VERSION="${RELEASE_TAG#v}" EXPECTED_TAG="$RELEASE_TAG" EXPECTED_COMMIT="$RELEASE_SHA" EXPECTED_ARCHIVE_DIGEST="$EXPECTED_DIGEST" EXPECTED_ARCHIVE_SIZE="$EXPECTED_SIZE" node -e 'const fs=require("node:fs"),p=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const keys=["commit","package","schema","tag","tarball_sha256","tarball_sha512","tarball_size","version"]; if(JSON.stringify(Object.keys(p).sort())!==JSON.stringify(keys.sort())||p.schema!==1||p.package!=="@telecrypt-io/storage"||p.version!==process.env.EXPECTED_VERSION||p.tag!==process.env.EXPECTED_TAG||p.commit!==process.env.EXPECTED_COMMIT||p.tarball_sha256!==process.env.EXPECTED_ARCHIVE_DIGEST||p.tarball_size!==Number(process.env.EXPECTED_ARCHIVE_SIZE)||typeof p.tarball_sha512!=="string"||!/^sha512-[A-Za-z0-9+/]+=*$/.test(p.tarball_sha512))process.exit(1)' "$file"
           }
           verify_record "$record"
-          bounded_gh() {
+          capture_gh() {
             local output="$1" error status
             shift
             error="$output.err"
-            if python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh "$@"; then
+            if run_captured "$output" "$error" 120 gh "$@"; then
               status=0
             else
               status="$?"
             fi
-            test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
-            if test "$status" = 0; then test ! -s "$error"; fi
+            finish_capture "$status" true "$output" "$error"
+          }
+          capture_binary() {
+            local output="$1" error status
+            shift
+            error="$output.err"
+            if run_captured "$output" "$error" 120 gh "$@"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" false "$output" "$error"
+          }
+          replay_api_failure() {
+            local body="$1" error="$2"
+            shift 2
+            if test -f "$body.err"; then
+              replay_capture "$body" "$body.err" true "$error" "$@"
+            else
+              replay_capture "$body" "$error" true "$@"
+            fi
+          }
+          api_value() {
+            local body="$1" value status replay_status=0 semantic_output="$1.semantic.out"
+            shift
+            local error="$body.semantic.err"
+            if "$@" >"$semantic_output" 2>"$error"; then
+              if cat "$error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            replay_api_failure "$body" "$error" "$semantic_output" || replay_status="$?"
             return "$status"
           }
-          bounded_upload() {
-            local output="$1" input="$2" content_type="$3" name="$4" error status upload_url expected_upload_url
-            test "$name" = "${RELEASE_TAG}.tgz" -o "$name" = "${RELEASE_TAG}.integrity.json"
-            upload_url="$(jq -er '.upload_url | sub("\\{\\?name,label\\}$"; "")' "$probe")"
-            expected_upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets"
-            test "$upload_url" = "$expected_upload_url"
-            error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 --request POST --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2026-03-10' --header "Content-Type: $content_type" --data-binary "@$input" "$upload_url?name=$name"
-            status="$?"
-            set -e
-            test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
-            if test "$status" = 0; then test ! -s "$error"; fi
+          api_expect() {
+            local body="$1" expected="$2" value status
+            shift 2
+            if value="$(api_value "$body" "$@")"; then
+              :
+            else
+              status="$?"
+              return "$status"
+            fi
+            if test "$value" = "$expected"; then return 0; fi
+            printf 'API semantic mismatch (expected %s, got %s)\n' "$expected" "$value" >&2
+            replay_api_failure "$body" "$body.semantic.err"
+            return 1
+          }
+          require_api_json() {
+            local body="$1" transport_error="$2" status replay_status=0 semantic_output="$1.semantic.out" semantic_error="$1.semantic.err"
+            shift 2
+            if "$@" >"$semantic_output" 2>"$semantic_error"; then
+              if cat "$semantic_error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            if test "$transport_error" = "$body.err"; then
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" || replay_status="$?"
+            else
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" "$transport_error" || replay_status="$?"
+            fi
             return "$status"
+          }
+          upload_asset() {
+            local input="$1" content_type="$2" name="$3" upload_url expected_upload_url response status
+            test "$name" = "${RELEASE_TAG}.tgz" -o "$name" = "${RELEASE_TAG}.integrity.json"
+            upload_url="$(api_value "$probe" jq -er '.upload_url | sub("\\{\\?name,label\\}$"; "")' "$probe")"
+            expected_upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets"
+            if test "$upload_url" != "$expected_upload_url"; then
+              printf 'API semantic mismatch (unexpected upload URL)\n' >&2
+              replay_api_failure "$probe" "$probe.semantic.err"
+              return 1
+            fi
+            response="$RUNNER_TEMP/storage-sdk-upload-${name}.json"
+            if run_captured "$response" "$response.err" 120 curl --proto '=https' --tlsv1.2 --show-error --fail-with-body --max-time 120 --connect-timeout 20 --request POST --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2026-03-10' --header "Content-Type: $content_type" --data-binary "@$input" "$upload_url?name=$name"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$response" "$response.err"
           }
           verify_draft() {
             local json="$1" id="$2"
-            jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==true and .prerelease==false and (.immutable==false or .immutable==null) and (.created_at|iso) and .published_at==null and ((.assets|type)=="array")' "$json" >/dev/null
+            require_api_json "$json" "$json.err" jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==true and .prerelease==false and (.immutable==false or .immutable==null) and (.created_at|iso) and .published_at==null and ((.assets|type)=="array")' "$json"
           }
           revalidate_draft_for_publish() {
             local json="$1" id="$2"
-            bounded_gh "$json" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$id"
+            capture_gh "$json" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$id"
             verify_draft "$json" "$id"
-            test "$(jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$json")" = "$expected_draft_asset_metadata"
-            jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|type)=="array" and (.assets|length)==2) and all(.assets[]; type=="object" and (.id|type=="number" and . > 0 and floor==.) and .state=="uploaded") and (any(.assets[]; .name==($tag+".tgz") and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+            api_expect "$json" "$expected_draft_asset_metadata" jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$json"
+            require_api_json "$json" "$json.err" jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|type)=="array" and (.assets|length)==2) and all(.assets[]; type=="object" and (.id|type=="number" and . > 0 and floor==.) and .state=="uploaded") and (any(.assets[]; .name==($tag+".tgz") and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .size==$record_size and .digest==$record_digest))' "$json"
           }
           verify_published() {
             local json="$1" id="$2"
-            jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type)=="array" and (.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
+            require_api_json "$json" "$json.err" jq -e --arg id "$id" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type) == "array" and (.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json"
           }
           download_asset() {
-            local json="$1" output="$2" name="$3" asset_id error status
-            asset_id="$(jq -er --arg name "$name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
-            error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
-            status="$?"
-            set -e
-            test "$status" = 0
-            test "$(wc -c <"$error")" -le 131072 -a ! -s "$error"
+            local json="$1" output="$2" name="$3" asset_id
+            asset_id="$(api_value "$json" jq -er --arg name "$name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+            capture_binary "$output" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
             if test "$name" = "${RELEASE_TAG}.tgz"; then
               test "$(wc -c <"$output")" = "$EXPECTED_SIZE"
               test "sha256:$(sha256sum "$output" | awk '{print $1}')" = "$EXPECTED_DIGEST"
@@ -300,74 +319,83 @@ jobs:
             local file="$1" listing="$RUNNER_TEMP/sdk-archive-list" status
             local package_files=".github/package-files.txt"
             test -f "$package_files"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
-            status="$?"
-            set -e
-            test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
+            if run_captured "$listing" "$listing.err" 60 tar -tzf "$file"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$listing" "$listing.err"
+            test "$status" = 0
             test "$(sort "$listing")" = "$(sort "$package_files")"
             if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
-            python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
+            if run_captured "$listing.license" "$listing.license.err" 60 tar -xOf "$file" package/LICENSE; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$listing.license" "$listing.license.err"
+            test "$status" = 0
             cmp -s "$listing.license" LICENSE
-            test "$(wc -c <"$listing.license")" -le 65536
             test "$(tar -xOf "$file" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
           }
+          release_list_raw="$RUNNER_TEMP/release-list.raw.json"
           release_list="$RUNNER_TEMP/release-list.jsonl"
-          bounded_gh "$release_list" api --paginate --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --jq '.[] | {id,tag_name,draft}' "/repos/$GITHUB_REPOSITORY/releases?per_page=100"
-          jq -e -s 'all(.[]; type == "object" and ((keys | sort) == ["draft", "id", "tag_name"]) and (.id | type == "number" and . > 0 and floor == .) and (.tag_name | type == "string" and length > 0) and (.draft | type == "boolean"))' "$release_list" >/dev/null
+          capture_gh "$release_list_raw" api --paginate --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          api_value "$release_list_raw" jq -c -s 'map(.[])[] | {id,tag_name,draft}' "$release_list_raw" >"$release_list"
+          require_api_json "$release_list_raw" "$release_list_raw.err" jq -e -s 'all(.[]; type == "object" and ((keys | sort) == ["draft", "id", "tag_name"]) and (.id | type == "number" and . > 0 and floor == .) and (.tag_name | type == "string" and length > 0) and (.draft | type == "boolean"))' "$release_list"
           release_matches="$RUNNER_TEMP/release-matches.json"
-          jq -e -s --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' "$release_list" >"$release_matches"
-          match_count="$(jq -er 'length' "$release_matches")"
-          test "$match_count" = 0 -o "$match_count" = 1
+          api_value "$release_list_raw" jq -e -s --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' "$release_list" >"$release_matches"
+          match_count="$(api_value "$release_list_raw" jq -er 'length' "$release_matches")"
+          require_api_json "$release_list_raw" "$release_list_raw.err" test "$match_count" = 0 -o "$match_count" = 1
           probe="$RUNNER_TEMP/release-probe.json"
           case "$match_count" in
             0)
               create="$RUNNER_TEMP/release-create.json"
               verify_source
-              bounded_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"
-              release_id="$(jq -er '.id | select(type=="number" and .>0 and floor==.)' "$create")"
-              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              capture_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"
+              release_id="$(api_value "$create" jq -er '.id | select(type=="number" and .>0 and floor==.)' "$create")"
+              capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               ;;
             1)
-              release_id="$(jq -er '.[0].id | select(type=="number" and .>0 and floor==.)' "$release_matches")"
-              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              release_id="$(api_value "$release_list_raw" jq -er '.[0].id | select(type=="number" and .>0 and floor==.)' "$release_matches")"
+              capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               ;;
             *)
               echo "Release catalog contains multiple entries for the exact tag" >&2
               exit 1
               ;;
           esac
-          state="$(jq -er 'if .draft==true then "draft" elif .draft==false then "published" else empty end' "$probe")"
+          state="$(api_value "$probe" jq -er 'if .draft==true then "draft" elif .draft==false then "published" else empty end' "$probe")"
           case "$state" in
             draft)
               verify_draft "$probe" "$release_id"
-              jq -e '((.assets|length) <= 64) and all(.assets[]; type == "object" and (.id|type == "number" and . > 0 and floor == .))' "$probe" >/dev/null
+              require_api_json "$probe" "$probe.err" jq -e '(.assets|type == "array") and all(.assets[]; type == "object" and (.id|type == "number" and . > 0 and floor == .))' "$probe"
               asset_ids="$RUNNER_TEMP/release-assets"
-              jq -r '.assets[]?.id // empty' "$probe" >"$asset_ids"
+              api_value "$probe" jq -r '.assets[]?.id // empty' "$probe" >"$asset_ids"
               while IFS= read -r asset_id; do
                 test -z "$asset_id" || [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
                 if test -n "$asset_id"; then
                   verify_source
-                  bounded_gh "$RUNNER_TEMP/delete-$asset_id.json" api --hostname github.com --method DELETE --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                  capture_gh "$RUNNER_TEMP/delete-$asset_id.json" api --hostname github.com --method DELETE --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
                 fi
               done <"$asset_ids"
               asset_name="${RELEASE_TAG}.tgz"
               verify_source
-              bounded_upload "$RUNNER_TEMP/upload.json" "$archive" application/octet-stream "$asset_name"
+                  upload_asset "$archive" application/octet-stream "$asset_name"
               record_name="${RELEASE_TAG}.integrity.json"
               verify_source
-              bounded_upload "$RUNNER_TEMP/upload-record.json" "$record" application/json "$record_name"
-              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+                  upload_asset "$record" application/json "$record_name"
+              capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               verify_draft "$probe" "$release_id"
-              jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$probe" >/dev/null
-              expected_draft_asset_metadata="$(jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$probe")"
+              require_api_json "$probe" "$probe.err" jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$probe"
+              expected_draft_asset_metadata="$(api_value "$probe" jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$probe")"
               download_asset "$probe" "$RUNNER_TEMP/draft.tgz" "$asset_name"
               download_asset "$probe" "$RUNNER_TEMP/draft.integrity.json" "$record_name"
               # Revalidate the authoritative tag and current main immediately before the one publish mutation.
               verify_source
               revalidate_draft_for_publish "$probe" "$release_id"
-              bounded_gh "$RUNNER_TEMP/published.json" api --hostname github.com --method PATCH --header 'X-GitHub-Api-Version: 2026-03-10' --field draft=false "/repos/$GITHUB_REPOSITORY/releases/$release_id"
-              bounded_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              capture_gh "$RUNNER_TEMP/published.json" api --hostname github.com --method PATCH --header 'X-GitHub-Api-Version: 2026-03-10' --field draft=false "/repos/$GITHUB_REPOSITORY/releases/$release_id"
+              capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               verify_published "$probe" "$release_id"
               download_asset "$probe" "$RUNNER_TEMP/published.tgz" "$asset_name"
               download_asset "$probe" "$RUNNER_TEMP/published.integrity.json" "$record_name"
@@ -424,54 +452,117 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          source scripts/capture-diagnostics.sh
           archive="release/${RELEASE_TAG}.tgz"
           test "$(wc -c <"$archive")" = "$EXPECTED_SIZE"
           test "sha256:$(sha256sum "$archive" | awk '{print $1}')" = "$EXPECTED_DIGEST"
+          capture_binary() {
+            local output="$1" error status
+            shift
+            error="$output.err"
+            if run_captured "$output" "$error" 120 gh "$@"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" false "$output" "$error"
+          }
+          capture_response() {
+            local output="$1" error status
+            shift
+            error="$output.err"
+            if run_captured "$output" "$error" 120 gh "$@"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$output" "$error"
+          }
+          replay_api_failure() {
+            local body="$1" error="$2"
+            shift 2
+            if test -f "$body.err"; then
+              replay_capture "$body" "$body.err" true "$error" "$@"
+            else
+              replay_capture "$body" "$error" true "$@"
+            fi
+          }
+          api_value() {
+            local body="$1" value status replay_status=0 semantic_output="$1.semantic.out"
+            shift
+            local error="$body.semantic.err"
+            if "$@" >"$semantic_output" 2>"$error"; then
+              if cat "$error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            replay_api_failure "$body" "$error" "$semantic_output" || replay_status="$?"
+            return "$status"
+          }
+          require_api_json() {
+            local body="$1" transport_error="$2" status replay_status=0 semantic_output="$1.semantic.out" semantic_error="$1.semantic.err"
+            shift 2
+            if "$@" >"$semantic_output" 2>"$semantic_error"; then
+              if cat "$semantic_error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            if test "$transport_error" = "$body.err"; then
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" || replay_status="$?"
+            else
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" "$transport_error" || replay_status="$?"
+            fi
+            return "$status"
+          }
           repo_url="https://github.com/${GITHUB_REPOSITORY}.git"
           config_file="$RUNNER_TEMP/git-local-config"
           set +e
           git config --local --no-includes --name-only --get-regexp '^(include|includeif|url\..*\.(insteadof|pushinsteadof)|credential(\..*)?|http(\..*)?|remote\..*\.(proxy|uploadpack|receivepack|pushurl)|core\.(sshcommand|gitproxy)|ssh\..*)$' >"$config_file"
           config_status="$?"
           set -e
+          if test "$config_status" != 0 -a "$config_status" != 1; then cat "$config_file"; exit "$config_status"; fi
           test "$config_status" = 0 -o "$config_status" = 1
           while IFS= read -r key; do
-            test -z "$key" || git config --local --no-includes --unset-all "$key" >/dev/null 2>&1 || true
+            test -z "$key" || git config --local --no-includes --unset-all "$key"
           done <"$config_file"
           rm -f "$config_file"
           git remote set-url origin "$repo_url"
           test "$(git remote get-url origin)" = "$repo_url"
           verify_source() {
-            local d status release_commit
-            d="$(mktemp -d)"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$d/out" --stderr "$d/err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags --quiet "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
-            status="$?"
-            set -e
-            test "$status" = 0
-            test "$(wc -c <"$d/out")" -le 65536 -a "$(wc -c <"$d/err")" -le 65536
-            test ! -s "$d/out" -a ! -s "$d/err"
+            local release_commit
+            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
             test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
             release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
             test "$release_commit" = "$RELEASE_SHA"
             test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
             test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
             git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
-            rm -rf "$d"
           }
           verify_archive() {
             local file="$1" listing="$RUNNER_TEMP/sdk-publish-archive-list" status
             local package_files=".github/package-files.txt"
             test -f "$package_files"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$listing" --stderr "$listing.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -tzf "$file"
-            status="$?"
-            set -e
-            test "$status" = 0 -a "$(wc -c <"$listing")" -le 65536 -a "$(wc -c <"$listing.err")" -le 65536 -a ! -s "$listing.err"
+            if run_captured "$listing" "$listing.err" 60 tar -tzf "$file"; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$listing" "$listing.err"
+            test "$status" = 0
             test "$(sort "$listing")" = "$(sort "$package_files")"
             if grep -Eq '(^|/)node_modules(/|$)' "$listing"; then exit 1; fi
-            python3 scripts/bounded-command.py --stdout "$listing.license" --stderr "$listing.license.err" --max-stdout-bytes 65536 --max-stderr-bytes 65536 --timeout-seconds 60 --kill-after-seconds 5 -- tar -xOf "$file" package/LICENSE
+            if run_captured "$listing.license" "$listing.license.err" 60 tar -xOf "$file" package/LICENSE; then
+              status=0
+            else
+              status="$?"
+            fi
+            finish_capture "$status" true "$listing.license" "$listing.license.err"
+            test "$status" = 0
             cmp -s "$listing.license" LICENSE
-            test "$(wc -c <"$listing.license")" -le 65536
             test "$(tar -xOf "$file" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')" = "${RELEASE_TAG#v}"
           }
           verify_record() {
@@ -479,51 +570,42 @@ jobs:
             version="$(printf '%s' "$RELEASE_TAG" | cut -c 2-)"
             test "$(wc -c <"$file")" = "$EXPECTED_RECORD_SIZE"
             test "sha256:$(sha256sum "$file" | awk '{print $1}')" = "$EXPECTED_RECORD_DIGEST"
-            jq -e --arg version "$version" --arg tag "$RELEASE_TAG" --arg commit "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" 'keys == ["commit","package","schema","tag","tarball_sha256","tarball_sha512","tarball_size","version"] and .schema == 1 and .package == "@telecrypt-io/storage" and .version == $version and .tag == $tag and .commit == $commit and .tarball_sha256 == $digest and (.tarball_sha512 | type == "string" and test("^sha512-[A-Za-z0-9+/]+=*$")) and .tarball_size == $size' "$file" >/dev/null
+            jq -e --arg version "$version" --arg tag "$RELEASE_TAG" --arg commit "$RELEASE_SHA" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" 'keys == ["commit","package","schema","tag","tarball_sha256","tarball_sha512","tarball_size","version"] and .schema == 1 and .package == "@telecrypt-io/storage" and .version == $version and .tag == $tag and .commit == $commit and .tarball_sha256 == $digest and (.tarball_sha512 | type == "string" and test("^sha512-[A-Za-z0-9+/]+=*$")) and .tarball_size == $size' "$file"
           }
           record="release/$RELEASE_TAG.integrity.json"
           verify_record "$record"
           json="$RUNNER_TEMP/release.json"
-          error="$json.err"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$json" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$json")" -le 131072 -a "$(wc -c <"$error")" -le 131072 -a ! -s "$error"
+          capture_response "$json" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"
           asset_name="$RELEASE_TAG.tgz"
           record_name="$RELEASE_TAG.integrity.json"
-          jq -e --arg id "$EXPECTED_RELEASE_ID" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg name "$asset_name" --arg record_name "$record_name" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type)=="array" and (.assets|length)==2) and (any(.assets[]; .name==$name and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==$record_name and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json" >/dev/null
-          asset_id="$(jq -er --arg name "$asset_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+          require_api_json "$json" "$json.err" jq -e --arg id "$EXPECTED_RELEASE_ID" --arg tag "$RELEASE_TAG" --arg target "$RELEASE_SHA" --arg name "$asset_name" --arg record_name "$record_name" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" 'def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and ((try fromdateiso8601 catch null) != null); (.id|tostring)==$id and .tag_name==$tag and .name==$tag and .body==("Release "+$tag) and .target_commitish==$target and .draft==false and .prerelease==false and .immutable==true and (.created_at|iso) and (.published_at|iso) and ((.published_at|fromdateiso8601) >= (.created_at|fromdateiso8601)) and ((.assets|type)=="array" and (.assets|length)==2) and (any(.assets[]; .name==$name and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==$record_name and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$json"
+          asset_id="$(api_value "$json" jq -er --arg name "$asset_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
           downloaded="$RUNNER_TEMP/downloaded.tgz"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$downloaded" --stderr "$downloaded.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
-          status="$?"
-          set -e
-          test "$status" = 0
-          test "$(wc -c <"$downloaded.err")" -le 131072 -a ! -s "$downloaded.err"
+          capture_binary "$downloaded" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
           test "$(wc -c <"$downloaded")" = "$EXPECTED_SIZE"
           test "sha256:$(sha256sum "$downloaded" | awk '{print $1}')" = "$EXPECTED_DIGEST"
           cmp -s "$archive" "$downloaded"
           verify_archive "$downloaded"
-          record_id="$(jq -er --arg name "$record_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
+          record_id="$(api_value "$json" jq -er --arg name "$record_name" '.assets[] | select(.name==$name) | .id | select(type=="number" and .>0 and floor==.)' "$json")"
           downloaded_record="$RUNNER_TEMP/downloaded.integrity.json"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$downloaded_record" --stderr "$downloaded_record.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- gh api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$record_id"
-          status="$?"
-          set -e
-          test "$status" = 0 -a "$(wc -c <"$downloaded_record.err")" -le 131072 -a ! -s "$downloaded_record.err"
+          capture_binary "$downloaded_record" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$record_id"
           verify_record "$downloaded_record"
           version="${RELEASE_TAG#v}"
           registry_status="$RUNNER_TEMP/npm-registry.status"
           registry_body="$RUNNER_TEMP/npm-registry.body"
           registry_err="$registry_body.err"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$registry_status" --stderr "$registry_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- curl --proto '=https' --tlsv1.2 --silent --show-error --max-time 120 --connect-timeout 20 --max-filesize 131072 --output "$registry_body" --write-out '%{http_code}' "https://registry.npmjs.org/@telecrypt-io%2fstorage/$version"
-          registry_curl_status="$?"
-          set -e
+          capture_extra_paths=("$registry_body")
+          if run_captured "$registry_status" "$registry_err" 120 curl --proto '=https' --tlsv1.2 --show-error --max-time 120 --connect-timeout 20 --output "$registry_body" --write-out '%{http_code}' "https://registry.npmjs.org/@telecrypt-io%2fstorage/$version"; then registry_curl_status=0; else registry_curl_status="$?"; fi
+          capture_extra_paths=()
+          registry_replay_status=0
+          if test "$registry_curl_status" -ne 0; then
+            replay_capture "$registry_status" "$registry_err" true "$registry_body" || registry_replay_status="$?"
+          else
+            replay_capture "$registry_status" "$registry_err" false || registry_replay_status="$?"
+          fi
+          if test "$registry_curl_status" -eq 0 && test "$registry_replay_status" -ne 0; then exit "$registry_replay_status"; fi
           test "$registry_curl_status" = 0
-          test "$(wc -c <"$registry_status")" = 3 -a "$(wc -c <"$registry_body")" -le 131072 -a "$(wc -c <"$registry_err")" -le 131072 -a ! -s "$registry_err"
+          test "$(wc -c <"$registry_status")" = 3
           http_status="$(cat "$registry_status")"
           [[ "$http_status" =~ ^[0-9]{3}$ ]]
           case "$http_status" in
@@ -531,22 +613,24 @@ jobs:
             verify_source
             publish_out="$RUNNER_TEMP/npm-publish.out"
             publish_err="$publish_out.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$publish_out" --stderr "$publish_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm publish "./$archive" --access public --provenance --ignore-scripts --loglevel=error
-            publish_status="$?"
-            set -e
-            test "$(wc -c <"$publish_out")" -le 131072 -a "$(wc -c <"$publish_err")" -le 131072
+            if run_captured "$publish_out" "$publish_err" 120 npm publish "./$archive" --access public --provenance --ignore-scripts; then publish_status=0; else publish_status="$?"; fi
             if test "$publish_status" != 0; then
-              cat "$publish_out" >&2
-              cat "$publish_err" >&2
+              replay_capture "$publish_out" "$publish_err"
               exit "$publish_status"
             fi
-            test ! -s "$publish_err"
-            if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$publish_out" "$publish_err"; then exit 1; fi
+            if replay_capture "$publish_out" "$publish_err" false; then :; else
+              replay_status="$?"
+              exit "$replay_status"
+            fi
+            if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$publish_out" "$publish_err"; then
+              replay_capture "$publish_out" "$publish_err"
+              exit 1
+            fi
             ;;
             200)
             ;;
             *)
+            replay_capture "$registry_body" "$registry_err"
             echo "Unexpected npm registry status: $http_status" >&2
             exit 1
             ;;
@@ -557,14 +641,55 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          source scripts/capture-diagnostics.sh
           version="${RELEASE_TAG#v}"
           package="$PACKAGE_NAME@$version"
           archive="release/${RELEASE_TAG}.tgz"
           record="release/$RELEASE_TAG.integrity.json"
           d="$RUNNER_TEMP/npm-registry"
           mkdir -p "$d"
-          bounded_registry_retry() {
-            local semantic_verify=false output error status semantic_out semantic_err semantic_status retry_window_seconds retry_interval_seconds retry_deadline
+          replay_api_failure() {
+            local body="$1" error="$2"
+            shift 2
+            if test -f "$body.err"; then
+              replay_capture "$body" "$body.err" true "$error" "$@"
+            else
+              replay_capture "$body" "$error" true "$@"
+            fi
+          }
+          api_value() {
+            local body="$1" value status replay_status=0 semantic_output="$1.semantic.out"
+            shift
+            local error="$body.semantic.err"
+            if "$@" >"$semantic_output" 2>"$error"; then
+              if cat "$error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            replay_api_failure "$body" "$error" "$semantic_output" || replay_status="$?"
+            return "$status"
+          }
+          require_api_json() {
+            local body="$1" transport_error="$2" status replay_status=0 semantic_output="$1.semantic.out" semantic_error="$1.semantic.err"
+            shift 2
+            if "$@" >"$semantic_output" 2>"$semantic_error"; then
+              if cat "$semantic_error" >&2; then :; else replay_status=1; fi
+              if cat "$semantic_output"; then :; else replay_status=1; fi
+              return "$replay_status"
+            else
+              status="$?"
+            fi
+            if test "$transport_error" = "$body.err"; then
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" || replay_status="$?"
+            else
+              replay_api_failure "$body" "$semantic_error" "$semantic_output" "$transport_error" || replay_status="$?"
+            fi
+            return "$status"
+          }
+          registry_retry() {
+            local semantic_verify=false output error status semantic_status retry_window_seconds retry_interval_seconds retry_deadline attempt attempt_output attempt_error attempt_semantic_output attempt_semantic_error replay_failed=0
             if test "$1" = "--verify-provenance"; then
               semantic_verify=true
               shift
@@ -576,53 +701,53 @@ jobs:
             retry_window_seconds=300
             retry_interval_seconds=10
             retry_deadline=$((SECONDS + retry_window_seconds))
+            attempt=0
+            mkdir -p "$output.attempts"
             while :; do
-              semantic_out=""
-              semantic_err=""
+              attempt=$((attempt + 1))
+              attempt_output="$output.attempts/$attempt.out"
+              attempt_error="$output.attempts/$attempt.err"
               semantic_status=""
-              : >"$output"
-              : >"$error"
-              set +e
-              python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- "$@"
-              status="$?"
-              set -e
-              test "$(wc -c <"$output")" -le 131072 -a "$(wc -c <"$error")" -le 131072
+              if run_captured "$attempt_output" "$attempt_error" 120 "$@"; then status=0; else status="$?"; fi
+              cp "$attempt_output" "$output"
+              cp "$attempt_error" "$error"
               if test "$status" = 0; then
-                test ! -s "$error"
                 if test "$semantic_verify" = true; then
-                  semantic_out="$output.verify"
-                  semantic_err="$semantic_out.err"
-                  set +e
-                  python3 scripts/bounded-command.py --stdout "$semantic_out" --stderr "$semantic_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$output" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"
-                  semantic_status="$?"
-                  set -e
-                  test "$(wc -c <"$semantic_out")" -le 131072 -a "$(wc -c <"$semantic_err")" -le 131072
-                  if test "$semantic_status" = 0; then return 0; fi
-                  if ! grep -Fq 'attestations document must contain exactly two statements' "$semantic_err"; then
-                    cat "$semantic_out" >&2
-                    cat "$semantic_err" >&2
+                  attempt_semantic_output="$attempt_output.verify"
+                  attempt_semantic_error="$attempt_semantic_output.err"
+                  if run_captured "$attempt_semantic_output" "$attempt_semantic_error" 120 node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$output" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"; then semantic_status=0; else semantic_status="$?"; fi
+                  if test "$semantic_status" = 0; then
+                    if test -s "$attempt_error"; then cat "$attempt_error" >&2; fi
+                    if test -s "$attempt_semantic_error"; then cat "$attempt_semantic_error" >&2; fi
+                    if test "$replay_failed" -ne 0; then return 1; fi
+                    return 0
+                  fi
+                  if replay_capture "$attempt_output" "$attempt_error" true "$attempt_semantic_output" "$attempt_semantic_error"; then :; else replay_failed=1; fi
+                  if ! grep -Fq 'attestations document must contain exactly two statements' "$attempt_semantic_error"; then
                     return "$semantic_status"
                   fi
                 else
+                  if replay_capture "$attempt_output" "$attempt_error"; then :; else replay_failed=1; fi
+                  if test -s "$attempt_error"; then cat "$attempt_error" >&2; fi
+                  if test "$replay_failed" -ne 0; then return 1; fi
                   return 0
                 fi
+              else
+                if replay_capture "$attempt_output" "$attempt_error"; then :; else replay_failed=1; fi
               fi
               if (( SECONDS >= retry_deadline )); then
-                cat "$output" >&2
-                cat "$error" >&2
-                if test "$semantic_verify" = true && test -n "$semantic_status"; then
-                  cat "$semantic_out" >&2
-                  cat "$semantic_err" >&2
-                  return "$semantic_status"
-                fi
+                if test "$semantic_verify" = true && test -n "$semantic_status"; then return "$semantic_status"; fi
                 return "$status"
               fi
               sleep "$retry_interval_seconds"
             done
           }
-          bounded_registry_retry "$d/dist.json" "$d/dist.err" npm view "$package" dist --json --loglevel=error
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/dist.json" "$d/dist.err"; then exit 1; fi
-          node - "$d/dist.json" "$archive" <<'NODE'
+          registry_retry "$d/dist.json" "$d/dist.err" npm view "$package" dist --json
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/dist.json" "$d/dist.err"; then
+            replay_capture "$d/dist.json" "$d/dist.err"
+            exit 1
+          fi
+          require_api_json "$d/dist.json" "$d/dist.err" node - "$d/dist.json" "$archive" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
           const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
           const bytes = fs.readFileSync(process.argv[3]);
@@ -630,7 +755,7 @@ jobs:
           if (typeof dist.integrity !== "string" || dist.integrity !== `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`) process.exit(1);
           if (!dist.attestations || typeof dist.attestations.url !== "string" || !dist.attestations.url) process.exit(1);
           NODE
-          attestations_url="$(node - "$d/dist.json" "$PACKAGE_NAME" "$version" <<'NODE'
+          attestations_url="$(api_value "$d/dist.json" node - "$d/dist.json" "$PACKAGE_NAME" "$version" <<'NODE'
           const fs = require("node:fs");
           const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
           const packageName = process.argv[3];
@@ -642,53 +767,58 @@ jobs:
           process.stdout.write(parsed.toString());
           NODE
           )"
-          bounded_registry_retry --verify-provenance "$d/attestations.json" "$d/attestations.err" curl --proto '=https' --tlsv1.2 --silent --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/attestations.json" "$d/attestations.err"; then exit 1; fi
-          node - "$d/dist.json" "$archive" "$record" <<'NODE'
+          registry_retry --verify-provenance "$d/attestations.json" "$d/attestations.err" curl --proto '=https' --tlsv1.2 --show-error --fail-with-body --max-time 120 --connect-timeout 20 "$attestations_url"
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/attestations.json" "$d/attestations.err"; then
+            replay_capture "$d/attestations.json" "$d/attestations.err"
+            exit 1
+          fi
+          require_api_json "$d/dist.json" "$d/dist.err" node - "$d/dist.json" "$archive" "$record" <<'NODE'
           const fs = require("node:fs"), crypto = require("node:crypto");
           const dist = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
           const bytes = fs.readFileSync(process.argv[3]);
           const record = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
           if (dist.integrity !== record.tarball_sha512 || record.tarball_sha256 !== "sha256:" + crypto.createHash("sha256").update(bytes).digest("hex")) process.exit(1);
           NODE
-          set +e
-          python3 scripts/bounded-command.py --stdout "$d/pack.json" --stderr "$d/pack.err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- npm pack "$package" --ignore-scripts --pack-destination "$d" --json --loglevel=error
-          status="$?"
-          set -e
+          if run_captured "$d/pack.json" "$d/pack.err" 120 npm pack "$package" --ignore-scripts --pack-destination "$d" --json; then status=0; else status="$?"; fi
+          finish_capture "$status" true "$d/pack.json" "$d/pack.err"
           test "$status" = 0
-          test "$(wc -c <"$d/pack.json")" -le 131072 -a "$(wc -c <"$d/pack.err")" -le 131072 -a ! -s "$d/pack.err"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/pack.json" "$d/pack.err"; then exit 1; fi
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$d/pack.json" "$d/pack.err"; then
+            replay_capture "$d/pack.json" "$d/pack.err"
+            exit 1
+          fi
           mapfile -t packed < <(find "$d" -maxdepth 1 -type f -name '*.tgz' -print)
           test "${#packed[@]}" = 1
           cmp -s "$archive" "${packed[0]}"
           audit="$RUNNER_TEMP/npm-signature-check"
           mkdir -p "$audit"
-          helper="$PWD/scripts/bounded-command.py"
           printf '{"name":"npm-signature-check","private":true,"dependencies":{"%s":"%s"}}\n' "$PACKAGE_NAME" "$version" >"$audit/package.json"
           audit_install_out="$d/audit-install.out"
           audit_install_err="$audit_install_out.err"
-          set +e
-          (cd "$audit" && python3 "$helper" --stdout "$audit_install_out" --stderr "$audit_install_err" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm install --ignore-scripts --no-fund --no-audit --loglevel=error)
-          status="$?"
-          set -e
-          test "$status" = 0 -a "$(wc -c <"$audit_install_out")" -le 524288 -a "$(wc -c <"$audit_install_err")" -le 524288 -a ! -s "$audit_install_err"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_install_out" "$audit_install_err"; then exit 1; fi
+          if run_captured "$audit_install_out" "$audit_install_err" 300 bash -c 'cd "$1" && npm install --ignore-scripts --no-fund --no-audit' bash "$audit"; then status=0; else status="$?"; fi
+          finish_capture "$status" true "$audit_install_out" "$audit_install_err"
+          test "$status" = 0
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_install_out" "$audit_install_err"; then
+            replay_capture "$audit_install_out" "$audit_install_err"
+            exit 1
+          fi
           audit_out="$d/audit.out"
           audit_err="$audit_out.err"
-          set +e
-          (cd "$audit" && python3 "$helper" --stdout "$audit_out" --stderr "$audit_err" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds 300 --kill-after-seconds 5 -- npm audit signatures --loglevel=error)
-          status="$?"
-          set -e
-          test "$status" = 0 -a "$(wc -c <"$audit_out")" -le 524288 -a "$(wc -c <"$audit_err")" -le 524288 -a ! -s "$audit_err"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_out" "$audit_err"; then exit 1; fi
-          test -s "$audit_out"
-          grep -Eqi 'verified attestations?' "$audit_out"
+          if run_captured "$audit_out" "$audit_err" 300 bash -c 'cd "$1" && npm audit signatures' bash "$audit"; then status=0; else status="$?"; fi
+          finish_capture "$status" true "$audit_out" "$audit_err"
+          test "$status" = 0
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$audit_out" "$audit_err"; then
+            replay_capture "$audit_out" "$audit_err"
+            exit 1
+          fi
+          require_capture "$audit_out" "$audit_err" test -s "$audit_out"
+          require_capture "$audit_out" "$audit_err" grep -Eqi 'verified attestations?' "$audit_out"
           verify_out="$d/provenance.out"
           verify_err="$verify_out.err"
-          set +e
-          python3 scripts/bounded-command.py --stdout "$verify_out" --stderr "$verify_err" --max-stdout-bytes 131072 --max-stderr-bytes 131072 --timeout-seconds 120 --kill-after-seconds 5 -- node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$d/attestations.json" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"
-          status="$?"
-          set -e
-          test "$status" = 0 -a "$(wc -c <"$verify_out")" -le 131072 -a "$(wc -c <"$verify_err")" -le 131072 -a ! -s "$verify_err"
-          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$verify_out" "$verify_err"; then exit 1; fi
-          grep -Fq 'verified npm provenance' "$verify_out"
+          if run_captured "$verify_out" "$verify_err" 120 node scripts/verify-npm-provenance.mjs --dist "$d/dist.json" --attestations "$d/attestations.json" --archive "$archive" --package "$PACKAGE_NAME" --version "$version" --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"; then status=0; else status="$?"; fi
+          finish_capture "$status" true "$verify_out" "$verify_err"
+          test "$status" = 0
+          if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$verify_out" "$verify_err"; then
+            replay_capture "$verify_out" "$verify_err"
+            exit 1
+          fi
+          require_capture "$verify_out" "$verify_err" grep -Fq 'verified npm provenance' "$verify_out"

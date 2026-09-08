@@ -126,8 +126,8 @@ def publication_action(probe: dict | None, run_attempt: int, tag: str = "v1.2.3"
     if probe.get("draft") is True:
         if probe.get("created_at") != "2026-08-24T00:00:00Z" or probe.get("published_at") is not None or probe.get("immutable") not in (None, False):
             raise ContractError("draft unexpectedly immutable")
-        if not isinstance(probe.get("id"), int) or isinstance(probe.get("id"), bool) or probe["id"] <= 0 or not isinstance(probe.get("assets"), list) or len(probe["assets"]) > 64 or any(not isinstance(asset, dict) or not isinstance(asset.get("id"), int) or isinstance(asset.get("id"), bool) or asset["id"] <= 0 for asset in probe["assets"]):
-            raise ContractError("draft identity or asset bounds are not exact")
+        if not isinstance(probe.get("id"), int) or isinstance(probe.get("id"), bool) or probe["id"] <= 0 or not isinstance(probe.get("assets"), list) or any(not isinstance(asset, dict) or not isinstance(asset.get("id"), int) or isinstance(asset.get("id"), bool) or asset["id"] <= 0 for asset in probe["assets"]):
+            raise ContractError("draft identity or asset schema is not exact")
         return "reuse-draft"
     if probe.get("draft") is False:
         if run_attempt <= 1:
@@ -161,12 +161,10 @@ def release_catalog_action(entries: list[object], tag: str = "v1.2.3") -> tuple[
 
 
 def release_catalog_output_action(exit_status: int, stdout: str, tag: str = "v1.2.3") -> tuple[str, int | None]:
-    """Model one bounded successful newline-delimited catalog projection."""
+    """Model one successful newline-delimited catalog projection."""
 
     if exit_status != 0:
         raise ContractError("catalog transport or API failures are not recoverable")
-    if len(stdout.encode("utf-8")) > 131072:
-        raise ContractError("catalog output exceeds the bounded capture")
     entries = []
     for line in stdout.splitlines():
         if not line.strip():
@@ -222,14 +220,13 @@ def check_state_machine() -> None:
         (1, '{"id":42,"tag_name":"v1.2.3","draft":true}\n'),
         (0, '{"id":42,"tag_name":"v1.2.3","draft":true}\nnot-json\n'),
         (0, '{"id":42,"tag_name":"v1.2.3"}\n'),
-        (0, "x" * 131073),
     ):
         try:
             release_catalog_output_action(*bad_output, tag)
         except ContractError:
             pass
         else:
-            raise ContractError(f"accepted invalid Release catalog output: {bad_output[:1]}")
+            raise ContractError(f"accepted invalid Release catalog output: {bad_output}")
     assert publication_action(None, 1, tag) == "create-draft"
     assert publication_action({"id": 42, "tag_name": tag, "name": tag, "body": f"Release {tag}", "target_commitish": "a" * 40, "created_at": "2026-08-24T00:00:00Z", "published_at": None, "draft": True, "prerelease": False, "assets": []}, 1, tag) == "reuse-draft"
     assert publication_action(exact_asset(tag), 2, tag) == "reuse-published"
@@ -405,7 +402,19 @@ def check_workflow_operations() -> None:
     publish_job = job("publish")
     publish = publish_job
     build = job("build")
+    for pattern in (
+        r"--loglevel(?:=|\s+)error",
+        r"\bnpm\b[^\n]*(?:--silent|--quiet)",
+        r"\bgit\b[^\n]*\bfetch\b[^\n]*--quiet",
+    ):
+        if re.search(pattern, WORKFLOW + VERIFY, re.IGNORECASE):
+            raise ContractError(f"required command output filtering remains: {pattern}")
     release_shell = step(release, "Create or reuse the exact draft Release")
+    capture_gh_start = release_shell.index("capture_gh()")
+    capture_gh_end = release_shell.index("upload_asset()", capture_gh_start)
+    capture_gh = release_shell[capture_gh_start:capture_gh_end]
+    if 'finish_capture "$status" true "$output" "$error"' not in capture_gh:
+        raise ContractError("capture_gh must report nonempty stderr on successful and failed calls")
     required = (
         "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag",
         "refs/heads/main:refs/remotes/origin/main",
@@ -424,9 +433,10 @@ def check_workflow_operations() -> None:
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "GH_HOST: github.com",
-        "scripts/bounded-command.py",
+        "timeout --signal=TERM --kill-after=5s",
         "--paginate",
-        "--jq '.[] | {id,tag_name,draft}'",
+        "release-list.raw.json",
+        "api_value \"$release_list_raw\" jq -c -s",
         "releases?per_page=100",
         "jq -e -s",
         "release_matches",
@@ -436,7 +446,7 @@ def check_workflow_operations() -> None:
         "--method POST",
         "--field draft=true",
         "--method DELETE",
-        "bounded_upload",
+        "upload_asset",
         "uploads.github.com",
         "Authorization: Bearer",
         "--data-binary \"@$input\"",
@@ -447,7 +457,6 @@ def check_workflow_operations() -> None:
         "target_commitish=$RELEASE_SHA",
         "created_at",
         "published_at",
-        "(.assets|length) <= 64",
         "(.assets|length)==2",
         ".integrity.json",
         "record_digest",
@@ -458,9 +467,9 @@ def check_workflow_operations() -> None:
             raise ContractError(f"release state machine is missing {fragment}")
     if release_shell.index("--method POST") > release_shell.index("--method DELETE"):
         raise ContractError("draft creation must precede asset replacement")
-    if release_shell.index("--method DELETE") > release_shell.index('bounded_upload "$RUNNER_TEMP/upload.json"'):
+    if release_shell.index("--method DELETE") > release_shell.index('upload_asset "$archive"'):
         raise ContractError("asset deletion must precede upload")
-    if release_shell.index('bounded_upload "$RUNNER_TEMP/upload-record.json"') > release_shell.index("--method PATCH"):
+    if release_shell.index('upload_asset "$record"') > release_shell.index("--method PATCH"):
         raise ContractError("publication must follow draft upload")
     if "release create" in WORKFLOW or "gh release create" in WORKFLOW or "--draft" in WORKFLOW:
         raise ContractError("one-shot Release creation remains")
@@ -477,11 +486,11 @@ def check_workflow_operations() -> None:
     ):
         if fragment in release_shell:
             raise ContractError(f"obsolete Release status probe machinery remains: {fragment}")
-    if release_shell.count('bounded_gh "$release_list" api --paginate') != 1:
+    if release_shell.count('capture_gh "$release_list_raw" api --paginate') != 1:
         raise ContractError("Release catalog must use exactly one bounded paginated request")
-    if release_shell.count("--jq '.[] | {id,tag_name,draft}'") != 1:
-        raise ContractError("Release catalog must use exactly one minimal projection")
-    if release_shell.index("jq -e -s") < release_shell.index('bounded_gh "$release_list"'):
+    if release_shell.count('api_value "$release_list_raw" jq -c -s') != 1:
+        raise ContractError("Release catalog must retain the complete API body before projection")
+    if release_shell.index("jq -e -s") < release_shell.index('capture_gh "$release_list_raw"'):
         raise ContractError("Release catalog must be validated after the bounded request")
     revalidate_start = release_shell.index("revalidate_draft_for_publish()")
     revalidate_end = release_shell.index("verify_published()", revalidate_start)
@@ -520,7 +529,7 @@ def check_workflow_operations() -> None:
     for fragment in (
         "attestations_url=",
         "attestations.json",
-        "bounded_registry_retry",
+        "registry_retry",
         "--verify-provenance",
         "attestations document must contain exactly two statements",
         "scripts/verify-npm-provenance.mjs",
@@ -537,10 +546,10 @@ def check_workflow_operations() -> None:
         raise ContractError("npm registry gitHead binding remains; provenance is authoritative")
     if publish.index("npm audit signatures") > publish.rindex("scripts/verify-npm-provenance.mjs"):
         raise ContractError("cryptographic npm signature verification must precede payload binding")
-    if publish.count("bounded_registry_retry --verify-provenance") != 1:
+    if publish.count("registry_retry --verify-provenance") != 1:
         raise ContractError("attestation retrieval must have exactly one semantic verifier retry path")
-    retry_start = publish.index("bounded_registry_retry()")
-    retry_end = publish.index("bounded_registry_retry --verify-provenance")
+    retry_start = publish.index("registry_retry()")
+    retry_end = publish.index("registry_retry --verify-provenance")
     retry_function = publish[retry_start:retry_end]
     if "scripts/verify-npm-provenance.mjs" not in retry_function or "attestations document must contain exactly two statements" not in retry_function:
         raise ContractError("attestation retry does not reuse the bounded provenance verifier")
@@ -554,8 +563,18 @@ def check_workflow_operations() -> None:
     ):
         if fragment not in retry_function:
             raise ContractError(f"bounded npm read is missing {fragment}")
-    if "for attempt in" in retry_function or "attempt =" in retry_function:
-        raise ContractError("bounded npm read still uses an unbounded attempt-count model")
+    for fragment in (
+        'mkdir -p "$output.attempts"',
+        'attempt=$((attempt + 1))',
+        'attempt_output="$output.attempts/$attempt.out"',
+        'attempt_error="$output.attempts/$attempt.err"',
+        'cp "$attempt_output" "$output"',
+        'cp "$attempt_error" "$error"',
+        'if test -s "$attempt_error"; then cat "$attempt_error" >&2; fi',
+        'cat "$attempt_file" >&2',
+    ):
+        if fragment not in retry_function:
+            raise ContractError(f"npm retry diagnostics are missing {fragment}")
     if "timeout-minutes: 25" not in publish_job:
         raise ContractError("publish job timeout must remain 25 minutes")
     if RETRY_WINDOW_SECONDS != 300 or RETRY_INTERVAL_SECONDS != 10 or SAFE_READ_TIMEOUT_SECONDS != 120:
@@ -582,7 +601,7 @@ def check_workflow_operations() -> None:
         raise ContractError("release build must install without lifecycle scripts or audit network access")
     if "revalidate_draft_for_publish" not in release_shell:
         raise ContractError("the draft is not re-fetched immediately before publication")
-    final_recheck = 'verify_source\n              revalidate_draft_for_publish "$probe" "$release_id"\n              bounded_gh "$RUNNER_TEMP/published.json"'
+    final_recheck = 'verify_source\n              revalidate_draft_for_publish "$probe" "$release_id"\n              capture_gh "$RUNNER_TEMP/published.json"'
     if final_recheck not in release_shell:
         raise ContractError("publication does not perform the final source and Release recheck immediately before PATCH")
 

@@ -25,7 +25,12 @@ import {
 } from "matrix-js-sdk/lib/oauth/index.js";
 import type { AccessTokens, TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
 import { StorageError } from "./errors.js";
-import { raceWithAbort, readBoundedResponseBody } from "./http.js";
+import {
+  cancelResponseBody,
+  raceWithAbort,
+  readResponseBody,
+  ResponseBodyReadError,
+} from "./http.js";
 import {
   validateCanonicalMatrixUserId,
   validateMatrixDeviceId,
@@ -74,8 +79,6 @@ const MAX_AUTHORIZATION_CONTEXT_LENGTH = 64 * 1024;
 const PKCE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
 const STATE_PATTERN = /^[A-Za-z0-9._~-]{32,128}$/;
-const MAX_OAUTH_ERROR_BODY_BYTES = 16 * 1024;
-const MAX_OAUTH_SUCCESS_BODY_BYTES = 32 * 1024;
 const OIDC_REQUEST_TIMEOUT_MS = 30_000;
 const OIDC_REFRESH_TIMEOUT_MS = 30_000;
 const OIDC_CLEANUP_TIMEOUT_MS = 30_000;
@@ -113,9 +116,13 @@ const SAFE_OAUTH_ERROR_CODES = new Set([
   "expired",
 ]);
 
-interface BoundedResponseText {
+interface ResponseText {
   text: string;
-  truncated: boolean;
+}
+
+interface JsonResponse {
+  value: unknown;
+  text: string;
 }
 
 interface SafeOAuthError {
@@ -144,6 +151,244 @@ class OidcValidationError extends StorageError {
     super(message);
     this.name = "OidcValidationError";
   }
+}
+
+const DIAGNOSTIC_SECRET_FIELD = /^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?id|client[_-]?secret|user[_-]?id|device[_-]?id|authorization(?:[_-]?code)?|device[_-]?code|user[_-]?code|code[_-]?verifier|token|credential[s]?|private[_-]?key|(?:[A-Za-z0-9]+[_-])?(?:encryption|signing|password|secret|api[_-]?key|recovery[_-]?key|cookie|session)(?:[_-]?token|[_-]?key)?)$/iu;
+const DIAGNOSTIC_EMAIL = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+/giu;
+const DIAGNOSTIC_MXID = /@[A-Z0-9._=+\-/]+:[A-Z0-9.-]+/giu;
+const DIAGNOSTIC_ULID = /\b[0-9A-HJKMNP-TV-Z]{26}\b/giu;
+
+/** Keep provider diagnostics useful without allowing credentials, customer
+ * identifiers, or control characters from an untrusted response to cross the
+ * SDK boundary. */
+export function sanitizeDiagnosticText(value: string): string {
+  const quotedValue = `"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,};\\]]+`;
+  return value
+    .replace(/(Bearer\s+)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',}]+)/giu, "$1<redacted>")
+    .replace(
+      new RegExp(`(["'])([^"']+)\\1(\\s*[:=]\\s*)(${quotedValue})`, "giu"),
+      (whole, quote: string, key: string, separator: string) =>
+        DIAGNOSTIC_SECRET_FIELD.test(key.replace(/\\(["'])/gu, "$1"))
+          ? `${quote}${key}${quote}${separator}"<redacted>"`
+          : whole,
+    )
+    .replace(
+      new RegExp(`\\b([A-Za-z][A-Za-z0-9_-]*)\\b(\\s*[:=]\\s*)(${quotedValue})`, "giu"),
+      (whole, key: string, separator: string) =>
+        DIAGNOSTIC_SECRET_FIELD.test(key) ? `${key}${separator}"<redacted>"` : whole,
+    )
+    .replace(DIAGNOSTIC_EMAIL, "<redacted>")
+    .replace(DIAGNOSTIC_MXID, "<redacted>")
+    .replace(DIAGNOSTIC_ULID, "<redacted>")
+    .replace(/[\r\n\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, " ")
+    .trim();
+}
+
+class OidcResponseError extends Error {
+  readonly status: number;
+
+  constructor(operation: string, status: number, body: string, cause?: unknown) {
+    const detail = sanitizeDiagnosticText(body);
+    super(
+      `OIDC ${operation} provider response (${status})${detail === "" ? "" : `: ${detail}`}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "OidcResponseError";
+    this.status = status;
+  }
+}
+
+interface DiagnosticProperty {
+  key: PropertyKey;
+  value: unknown;
+}
+
+function diagnosticKey(key: PropertyKey): string {
+  return typeof key === "symbol" ? key.toString() : key;
+}
+
+function diagnosticDisplayKey(key: PropertyKey): string {
+  return sanitizeDiagnosticText(diagnosticKey(key)) || "<empty property>";
+}
+
+function diagnosticPropertyIsSecret(key: PropertyKey): boolean {
+  return DIAGNOSTIC_SECRET_FIELD.test(diagnosticKey(key));
+}
+
+function readDiagnosticProperties(
+  value: object,
+  seen: WeakSet<object>,
+): { properties: DiagnosticProperty[]; failures: string[] } {
+  const properties: DiagnosticProperty[] = [];
+  const failures: string[] = [];
+  let keys: PropertyKey[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch (error) {
+    failures.push(`own properties unavailable: ${diagnosticFailureText(error, seen)}`);
+    return { properties, failures };
+  }
+  for (const key of keys) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch (error) {
+      failures.push(
+        `${diagnosticDisplayKey(key)} unavailable: ${diagnosticPropertyIsSecret(key) ? "<redacted>" : diagnosticFailureText(error, seen)}`,
+      );
+      continue;
+    }
+    if (!descriptor) continue;
+    try {
+      if ("value" in descriptor) {
+        properties.push({ key, value: descriptor.value });
+      } else if (typeof descriptor.get === "function") {
+        properties.push({ key, value: Reflect.get(value, key) });
+      } else {
+        failures.push(
+          `${diagnosticDisplayKey(key)} unavailable: ${diagnosticPropertyIsSecret(key) ? "<redacted>" : "accessor has no getter"}`,
+        );
+      }
+    } catch (error) {
+      failures.push(
+        `${diagnosticDisplayKey(key)} unavailable: ${diagnosticPropertyIsSecret(key) ? "<redacted>" : diagnosticFailureText(error, seen)}`,
+      );
+    }
+  }
+  return { properties, failures };
+}
+
+function diagnosticObjectText(value: object, seen: WeakSet<object>): string {
+  const inspection = readDiagnosticProperties(value, seen);
+  const parts: string[] = inspection.failures.slice();
+  for (const property of inspection.properties) {
+    const key = diagnosticDisplayKey(property.key);
+    parts.push(
+      `${key}: ${diagnosticPropertyIsSecret(property.key) ? "<redacted>" : diagnosticValueText(property.value, seen)}`,
+    );
+  }
+  if (parts.length === 0) {
+    return "object { }";
+  }
+  return `object { ${parts.join(", ")} }`;
+}
+
+function diagnosticValueText(value: unknown, seen: WeakSet<object>): string {
+  if (value !== null && (typeof value === "object" || typeof value === "function")) {
+    if (seen.has(value)) return "[cyclic diagnostic]";
+    seen.add(value);
+  }
+  if (value instanceof AggregateError) {
+    const parts = [`${sanitizeDiagnosticText(value.name)}: ${sanitizeDiagnosticText(value.message)}`];
+    if (typeof value.stack === "string") parts.push(`stack: ${sanitizeDiagnosticText(value.stack)}`);
+    try {
+      parts.push(`children: ${value.errors.map((child) => diagnosticValueText(child, seen)).join(", ")}`);
+    } catch (error) {
+      parts.push(`children unavailable: ${diagnosticFailureText(error, seen)}`);
+    }
+    const inspection = readDiagnosticProperties(value, seen);
+    for (const property of inspection.properties) {
+      if (["name", "message", "stack", "cause", "errors"].includes(diagnosticKey(property.key))) continue;
+      const key = diagnosticDisplayKey(property.key);
+      parts.push(`${key}: ${diagnosticPropertyIsSecret(property.key) ? "<redacted>" : diagnosticValueText(property.value, seen)}`);
+    }
+    parts.push(...inspection.failures);
+    return parts.join("; ");
+  }
+  if (value instanceof Error) {
+    const parts = [`${sanitizeDiagnosticText(value.name)}: ${sanitizeDiagnosticText(value.message)}`];
+    if (typeof value.stack === "string") parts.push(`stack: ${sanitizeDiagnosticText(value.stack)}`);
+    try {
+      if (value.cause !== undefined) parts.push(`cause: ${diagnosticValueText(value.cause, seen)}`);
+    } catch (error) {
+      parts.push(`cause unavailable: ${diagnosticFailureText(error, seen)}`);
+    }
+    const inspection = readDiagnosticProperties(value, seen);
+    for (const property of inspection.properties) {
+      if (["name", "message", "stack", "cause", "bytes"].includes(diagnosticKey(property.key))) continue;
+      const key = diagnosticDisplayKey(property.key);
+      parts.push(`${key}: ${diagnosticPropertyIsSecret(property.key) ? "<redacted>" : diagnosticValueText(property.value, seen)}`);
+    }
+    parts.push(...inspection.failures);
+    return parts.join("; ");
+  }
+  if (value !== null && (typeof value === "object" || typeof value === "function")) {
+    return diagnosticObjectText(value, seen);
+  }
+  try {
+    return sanitizeDiagnosticText(String(value));
+  } catch {
+    return "unknown failure";
+  }
+}
+
+function diagnosticFailureText(error: unknown, seen: WeakSet<object>): string {
+  try {
+    return diagnosticValueText(error, seen);
+  } catch {
+    return "unknown property failure";
+  }
+}
+
+/** Copy a transport error's useful details across the SDK boundary after the
+ * same secret/control-character sanitization used for provider responses. */
+export function diagnosticCause(error: unknown, seen = new WeakSet<object>()): Error {
+  if (error !== null && (typeof error === "object" || typeof error === "function")) {
+    if (seen.has(error)) return new Error("[cyclic diagnostic]");
+    seen.add(error);
+  }
+  if (error instanceof AggregateError) {
+    let children: unknown[] = [];
+    try {
+      if (Array.isArray(error.errors)) children = error.errors;
+    } catch {
+      children = [];
+    }
+    const copy = new AggregateError(
+      children.map((child) => diagnosticCause(child, seen)),
+      diagnosticValueText(error, new WeakSet<object>()),
+    );
+    copy.name = sanitizeDiagnosticText(error.name) || "AggregateError";
+    if (typeof error.stack === "string") copy.stack = sanitizeDiagnosticText(error.stack);
+    let cause: unknown;
+    try {
+      cause = error.cause;
+    } catch {
+      cause = undefined;
+    }
+    if (cause !== undefined) {
+      Object.defineProperty(copy, "cause", {
+        configurable: true,
+        enumerable: false,
+        value: diagnosticCause(cause, seen),
+        writable: true,
+      });
+    }
+    return copy;
+  }
+  if (error instanceof Error) {
+    const copy = new Error(diagnosticValueText(error, new WeakSet<object>()));
+    copy.name = sanitizeDiagnosticText(error.name) || "Error";
+    if (typeof error.stack === "string") copy.stack = sanitizeDiagnosticText(error.stack);
+    let cause: unknown;
+    try {
+      cause = error.cause;
+    } catch {
+      cause = undefined;
+    }
+    if (cause !== undefined) {
+      Object.defineProperty(copy, "cause", {
+        configurable: true,
+        enumerable: false,
+        value: diagnosticCause(cause, seen),
+        writable: true,
+      });
+    }
+    return copy;
+  }
+  const copy = new Error(diagnosticValueText(error, new WeakSet<object>()));
+  copy.name = "ThrownObject";
+  return copy;
 }
 
 interface AuthorizationCodeContext {
@@ -224,8 +469,8 @@ function parseSafeRedirectUri(value: unknown, name: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(text);
-  } catch {
-    throw new StorageError(`OIDC authorization context has an invalid ${name}`);
+  } catch (error) {
+    throw new StorageError(`OIDC authorization context has an invalid ${name}`, { cause: error });
   }
   const isRootWithoutSlash = parsed.pathname === "/" && parsed.toString() === `${text}/`;
   if (
@@ -295,33 +540,42 @@ function validateRegistrationMetadata(metadata: OidcRegistrationClientMetadata):
   return { clientUri, redirectUris };
 }
 
-async function readBoundedResponseText(
+async function readResponseText(
   response: Response,
-  maxBytes = MAX_OAUTH_ERROR_BODY_BYTES,
   signal?: AbortSignal,
-): Promise<BoundedResponseText> {
-  const body = await readBoundedResponseBody(response, maxBytes, signal);
-  return { text: new TextDecoder().decode(body.bytes), truncated: body.truncated };
+  operation = "OIDC response",
+): Promise<ResponseText> {
+  try {
+    const body = await readResponseBody(response, signal);
+    return { text: new TextDecoder().decode(body.bytes) };
+  } catch (error) {
+    if (!(error instanceof ResponseBodyReadError)) throw error;
+    const partial = sanitizeDiagnosticText(new TextDecoder().decode(error.bytes));
+    throw new StorageError(
+      `${operation} response body could not be read${partial === "" ? "" : `: ${partial}`}`,
+      {
+        cause: new OidcResponseError(operation, response.status, partial, error.cause),
+      },
+    );
+  }
 }
 
-async function readBoundedJsonResponse(
+async function readJsonResponse(
   response: Response,
   operation: string,
   signal?: AbortSignal,
-): Promise<unknown> {
-  const maxBytes = response.ok ? MAX_OAUTH_SUCCESS_BODY_BYTES : MAX_OAUTH_ERROR_BODY_BYTES;
-  const body = await readBoundedResponseText(response, maxBytes, signal);
-  if (body.truncated) {
-    throw new StorageError(`OIDC ${operation} returned an oversized response`);
-  }
+): Promise<JsonResponse> {
+  const body = await readResponseText(response, signal, operation);
   try {
-    return JSON.parse(body.text);
-  } catch {
-    throw new StorageError(`OIDC ${operation} returned an invalid response`);
+    return { value: JSON.parse(body.text), text: body.text };
+  } catch (error) {
+    throw new StorageError(`OIDC ${operation} returned an invalid response`, {
+      cause: new OidcResponseError(operation, response.status, body.text, error),
+    });
   }
 }
 
-function assertNoRedirect(response: Response, endpoint: string, operation: string): void {
+async function assertNoRedirect(response: Response, endpoint: string, operation: string): Promise<void> {
   // OAuth request bodies contain bearer credentials, refresh tokens, or
   // authorization codes. Redirects must never be followed with those bodies.
   // `redirect: "manual"` makes this a local rejection rather than a network
@@ -332,8 +586,9 @@ function assertNoRedirect(response: Response, endpoint: string, operation: strin
     (response.url !== "" && response.url !== endpoint) ||
     response.redirected
   ) {
-    void response.body?.cancel().catch(() => undefined);
-    throw new StorageError(`OIDC ${operation} rejected an untrusted redirect`);
+    const failure = new StorageError(`OIDC ${operation} rejected an untrusted redirect`);
+    await cancelResponseBody(response, `OIDC ${operation} redirect`, failure);
+    throw failure;
   }
 }
 
@@ -354,15 +609,17 @@ function parseSafeOAuthError(body: string): SafeOAuthError | undefined {
   return { code: parsed.error };
 }
 
-function formatTokenRefreshFailure(status: number, body: BoundedResponseText): string {
-  if (body.truncated) {
-    return `OIDC token refresh failed (${status}): provider error response was too large`;
-  }
+function formatTokenRefreshFailure(status: number, body: ResponseText): StorageError {
   const oauthError = parseSafeOAuthError(body.text);
   if (!oauthError) {
-    return `OIDC token refresh failed (${status}): provider returned an invalid OAuth error response`;
+    return new StorageError(
+      `OIDC token refresh failed (${status}): provider returned an invalid OAuth error response`,
+      { cause: new OidcResponseError("token refresh", status, body.text) },
+    );
   }
-  return `OIDC token refresh failed (${status}): OAuth error ${oauthError.code}`;
+  return new StorageError(`OIDC token refresh failed (${status}): OAuth error ${oauthError.code}`, {
+    cause: new OidcResponseError("token refresh", status, body.text),
+  });
 }
 
 function providerErrorStatus(error: unknown): number | undefined {
@@ -372,11 +629,45 @@ function providerErrorStatus(error: unknown): number | undefined {
     : undefined;
 }
 
-function formatProviderFailure(operation: string, error: unknown): string {
-  if (error instanceof OidcRequestTimeoutError) return error.message;
-  if (error instanceof OidcRequestCancelledError) return error.message;
+function formatProviderFailure(operation: string, error: unknown): StorageError {
+  if (error instanceof StorageError) return error;
+  if (error instanceof OidcRequestTimeoutError) {
+    return new StorageError(error.message, { cause: diagnosticCause(error) });
+  }
+  if (error instanceof OidcRequestCancelledError) {
+    return new StorageError(error.message, { cause: diagnosticCause(error) });
+  }
   const status = providerErrorStatus(error);
-  return `OIDC ${operation} failed${status === undefined ? "" : ` (${status})`}`;
+  return new StorageError(
+    `OIDC ${operation} failed${status === undefined ? "" : ` (${status})`}`,
+    { cause: diagnosticCause(error) },
+  );
+}
+
+function providerResponseFailure(
+  operation: string,
+  response: Response,
+  body: string,
+  message: string,
+): StorageError {
+  return new StorageError(message, {
+    cause: new OidcResponseError(operation, response.status, body),
+  });
+}
+
+function responseValidationFailure(
+  operation: string,
+  response: Response,
+  body: string,
+  error: unknown,
+): StorageError {
+  const message =
+    error instanceof Error
+      ? sanitizeDiagnosticText(error.message) || `OIDC ${operation} returned an invalid response`
+      : `OIDC ${operation} returned an invalid response`;
+  return new StorageError(message, {
+    cause: new OidcResponseError(operation, response.status, body, diagnosticCause(error)),
+  });
 }
 
 function ensureOidcNotCancelled(signal: AbortSignal | undefined, operation: string): void {
@@ -407,7 +698,6 @@ async function requestWithTimeout<T>(
     const response = await raceWithAbort(
       fetch(input, { ...init, signal: controller.signal }),
       controller.signal,
-      () => undefined,
       () =>
         timedOut
           ? new OidcRequestTimeoutError(operation)
@@ -415,8 +705,13 @@ async function requestWithTimeout<T>(
     );
     return await consume(response, controller.signal);
   } catch (error) {
-    if (timedOut) throw new OidcRequestTimeoutError(operation);
+    if (error instanceof AggregateError) throw error;
+    if (timedOut) {
+      if (error instanceof OidcRequestTimeoutError) throw error;
+      throw new OidcRequestTimeoutError(operation);
+    }
     if (signals.some((signal) => signal.aborted)) {
+      if (error instanceof OidcRequestCancelledError) throw error;
       throw new OidcRequestCancelledError(operation);
     }
     throw error;
@@ -451,8 +746,8 @@ function requestUrl(input: RequestInfo | URL): string {
 
 /**
  * MatrixClient's OAuth helpers use the SDK HTTP layer for discovery and
- * whoami. Supply a bounded/manual-redirect fetch implementation so those
- * calls have the same body and credential boundary as the direct OAuth calls.
+ * whoami. Supply a manual-redirect fetch implementation so those calls have
+ * the same response cleanup and credential boundary as the direct OAuth calls.
  */
 function boundedMatrixFetch(operation: string, externalSignal?: AbortSignal): typeof fetch {
   return async (input, init) => {
@@ -462,18 +757,8 @@ function boundedMatrixFetch(operation: string, externalSignal?: AbortSignal): ty
       { ...init, redirect: "manual" },
       operation,
       async (response, requestSignal) => {
-        assertNoRedirect(response, endpoint, operation);
-        const maxBytes = response.ok ? MAX_OAUTH_SUCCESS_BODY_BYTES : MAX_OAUTH_ERROR_BODY_BYTES;
-        const body = await readBoundedResponseText(response, maxBytes, requestSignal);
-        if (body.truncated) {
-          if (response.ok) {
-            throw new StorageError(`OIDC ${operation} returned an oversized response`);
-          }
-          return new Response(null, {
-            status: response.status,
-            statusText: response.statusText,
-          });
-        }
+        await assertNoRedirect(response, endpoint, operation);
+        const body = await readResponseText(response, requestSignal, operation);
         return new Response(body.text, {
           status: response.status,
           statusText: response.statusText,
@@ -491,8 +776,8 @@ function parseHttpUrl(value: unknown, name: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(text);
-  } catch {
-    throw new StorageError(`OIDC authorization context has an invalid ${name}`);
+  } catch (error) {
+    throw new StorageError(`OIDC authorization context has an invalid ${name}`, { cause: error });
   }
   const isRootWithoutSlash = parsed.pathname === "/" && parsed.toString() === `${text}/`;
   if (
@@ -644,8 +929,8 @@ function validateTrustedAuthMetadata(value: unknown): OidcClientConfig {
 function validateDeviceAuthorizationSession(value: unknown): DeviceAuthorizationResponse {
   try {
     validateDeviceAuthorizationResponse(value);
-  } catch {
-    throw new StorageError("OIDC device authorization returned an invalid response");
+  } catch (error) {
+    throw new StorageError("OIDC device authorization returned an invalid response", { cause: error });
   }
   const session = value as DeviceAuthorizationResponse;
   requireBoundedString(session.device_code, "device code", MAX_OIDC_CODE_LENGTH);
@@ -696,8 +981,8 @@ function validateTokenBounds(value: {
       requireBoundedString(value.refresh_token, "refresh token", MAX_OIDC_TOKEN_LENGTH);
     }
     if (value.scope !== undefined) requireScope(value.scope, "scope");
-  } catch {
-    throw new StorageError(`OIDC ${operation} returned an invalid token response`);
+  } catch (error) {
+    throw new StorageError(`OIDC ${operation} returned an invalid token response`, { cause: error });
   }
   if (
     value.expires_in !== undefined &&
@@ -782,36 +1067,41 @@ export async function discoverOidcIssuer(
   try {
     const homeserver = parseHttpUrl(homeserverBaseUrl, "homeserver URL");
     const endpoint = matrixAuthMetadataEndpoint(homeserver);
-    const { response, body } = await requestWithTimeout(
+    const { response, body, responseText } = await requestWithTimeout(
       endpoint,
       { method: "GET", headers: { Accept: "application/json" }, redirect: "manual" },
       "discovery",
       async (response, requestSignal) => {
-        assertNoRedirect(response, endpoint, "discovery");
+        await assertNoRedirect(response, endpoint, "discovery");
         if (!response.ok) {
-          // Discovery only consumes metadata on success. Drain a bounded
-          // error body without parsing or surfacing provider-controlled text;
-          // the status remains the only caller-visible diagnostic.
-          await readBoundedResponseBody(response, MAX_OAUTH_ERROR_BODY_BYTES, requestSignal);
-          return { response, body: undefined };
+          const body = await readResponseText(response, requestSignal, "discovery");
+          return { response, body: undefined, responseText: body.text };
         }
+        const body = await readJsonResponse(response, "discovery", requestSignal);
         return {
           response,
-          body: await readBoundedJsonResponse(response, "discovery", requestSignal),
+          body: body.value,
+          responseText: body.text,
         };
       },
       OIDC_REQUEST_TIMEOUT_MS,
       signal,
     );
     if (!response.ok) {
-      const failure = new StorageError("OIDC discovery failed") as StorageError & { httpStatus: number };
+      const failure = providerResponseFailure(
+        "discovery",
+        response,
+        responseText ?? "",
+        "OIDC discovery failed",
+      ) as StorageError & { httpStatus: number };
       failure.httpStatus = response.status;
       throw failure;
     }
     ensureOidcNotCancelled(signal, "discovery");
     return validateTrustedAuthMetadata(body);
   } catch (err) {
-    throw new StorageError(formatProviderFailure("discovery", err));
+    if (err instanceof AggregateError) throw err;
+    throw formatProviderFailure("discovery", err);
   }
 }
 
@@ -852,7 +1142,7 @@ export async function registerClient(
       policy_uri: metadata.policyUri,
     };
     const endpoint = exactEndpoint(safeAuthMetadata.registration_endpoint, "registration endpoint");
-    const { response, body } = await requestWithTimeout(
+    const { response, body, responseText } = await requestWithTimeout(
       endpoint,
       {
         method: "POST",
@@ -862,22 +1152,47 @@ export async function registerClient(
       },
       "dynamic client registration",
       async (response, requestSignal) => {
-        assertNoRedirect(response, endpoint, "dynamic client registration");
+        await assertNoRedirect(response, endpoint, "dynamic client registration");
+        const body = await readJsonResponse(response, "dynamic client registration", requestSignal);
         return {
           response,
-          body: await readBoundedJsonResponse(response, "dynamic client registration", requestSignal),
+          body: body.value,
+          responseText: body.text,
         };
       },
       OIDC_REQUEST_TIMEOUT_MS,
       signal,
     );
-    if (!response.ok || !validateRegistrationResponse(body)) {
-      throw new StorageError("OIDC dynamic client registration failed");
+    if (!response.ok) {
+      throw providerResponseFailure(
+        "dynamic client registration",
+        response,
+        responseText ?? "",
+        "OIDC dynamic client registration failed",
+      );
+    }
+    if (!validateRegistrationResponse(body)) {
+      throw providerResponseFailure(
+        "dynamic client registration",
+        response,
+        responseText ?? "",
+        "OIDC dynamic client registration returned an invalid response",
+      );
     }
     ensureOidcNotCancelled(signal, "dynamic client registration");
-    return requireClientId(body.client_id);
+    try {
+      return requireClientId(body.client_id);
+    } catch (error) {
+      throw responseValidationFailure(
+        "dynamic client registration",
+        response,
+        responseText ?? "",
+        error,
+      );
+    }
   } catch (err) {
-    throw new StorageError(formatProviderFailure("dynamic client registration", err));
+    if (err instanceof AggregateError) throw err;
+    throw formatProviderFailure("dynamic client registration", err);
   }
 }
 
@@ -908,7 +1223,7 @@ export async function startDeviceCodeLogin(
     const endpoint = safeAuthMetadata.device_authorization_endpoint;
     if (!endpoint) throw new StorageError("OIDC device authorization is not supported");
     const trustedEndpoint = exactEndpoint(endpoint, "device authorization endpoint");
-    const { response, body } = await requestWithTimeout(
+    const { response, body, responseText } = await requestWithTimeout(
       trustedEndpoint,
       {
         method: "POST",
@@ -918,24 +1233,44 @@ export async function startDeviceCodeLogin(
       },
       "device authorization",
       async (response, requestSignal) => {
-        assertNoRedirect(response, trustedEndpoint, "device authorization");
+        await assertNoRedirect(response, trustedEndpoint, "device authorization");
+        const body = await readJsonResponse(response, "device authorization", requestSignal);
         return {
           response,
-          body: await readBoundedJsonResponse(response, "device authorization", requestSignal),
+          body: body.value,
+          responseText: body.text,
         };
       },
       OIDC_REQUEST_TIMEOUT_MS,
       signal,
     );
-    if (!response.ok) throw new StorageError("OIDC device authorization failed");
-    const session = validateDeviceAuthorizationSession(body);
+    if (!response.ok) {
+      throw providerResponseFailure(
+        "device authorization",
+        response,
+        responseText ?? "",
+        "OIDC device authorization failed",
+      );
+    }
+    let session: DeviceAuthorizationResponse;
+    try {
+      session = validateDeviceAuthorizationSession(body);
+    } catch (error) {
+      throw responseValidationFailure(
+        "device authorization",
+        response,
+        responseText ?? "",
+        error,
+      );
+    }
     ensureOidcNotCancelled(signal, "device authorization");
     // Keep the requested device binding attached to this in-memory session
     // without changing the RFC response shape or serializing it into logs.
     deviceAuthorizationDeviceIds.set(session as unknown as object, deviceId);
     return session;
   } catch (err) {
-    throw new StorageError(formatProviderFailure("device authorization", err));
+    if (err instanceof AggregateError) throw err;
+    throw formatProviderFailure("device authorization", err);
   }
 }
 
@@ -974,7 +1309,7 @@ export async function waitForDeviceCodeLogin(
         ensureOidcNotCancelled(signal, "device authorization");
         return { error: "expired" };
       }
-      const { response, body } = await requestWithTimeout(
+      const { response, body, responseText } = await requestWithTimeout(
         endpoint,
         {
           method: "POST",
@@ -988,26 +1323,54 @@ export async function waitForDeviceCodeLogin(
         },
         "device authorization",
         async (response, requestSignal) => {
-          assertNoRedirect(response, endpoint, "device authorization");
+          await assertNoRedirect(response, endpoint, "device authorization");
+          const body = await readJsonResponse(response, "device authorization", requestSignal);
           return {
             response,
-            body: await readBoundedJsonResponse(response, "device authorization", requestSignal),
+            body: body.value,
+            responseText: body.text,
           };
         },
         Math.min(OIDC_REQUEST_TIMEOUT_MS, remaining),
         signal,
       );
-      if (response.ok && isValidDeviceAccessTokenResponse(body)) {
-        const tokenResponse = validateDeviceAccessTokenResponse(body);
-        if (
-          !requestedDeviceId ||
-          typeof tokenResponse.scope !== "string" ||
-          !scopeMatchesDevice(tokenResponse.scope, requestedDeviceId)
-        ) {
-          throw new OidcValidationError("OIDC device authorization returned an unexpected granted scope");
+      if (!response.ok && !isRecord(body)) {
+        throw providerResponseFailure(
+          "device authorization",
+          response,
+          responseText ?? "",
+          "OIDC device authorization returned an invalid response",
+        );
+      }
+      if (response.ok) {
+        if (!isValidDeviceAccessTokenResponse(body)) {
+          throw providerResponseFailure(
+            "device authorization",
+            response,
+            responseText ?? "",
+            "OIDC device authorization returned an invalid response",
+          );
         }
-        ensureOidcNotCancelled(signal, "device authorization");
-        return tokenResponse;
+        try {
+          const tokenResponse = validateDeviceAccessTokenResponse(body);
+          if (
+            !requestedDeviceId ||
+            typeof tokenResponse.scope !== "string" ||
+            !scopeMatchesDevice(tokenResponse.scope, requestedDeviceId)
+          ) {
+            throw new OidcValidationError("OIDC device authorization returned an unexpected granted scope");
+          }
+          ensureOidcNotCancelled(signal, "device authorization");
+          return tokenResponse;
+        } catch (error) {
+          if (error instanceof OidcRequestCancelledError) throw error;
+          throw responseValidationFailure(
+            "device authorization",
+            response,
+            responseText ?? "",
+            error,
+          );
+        }
       }
       const error = isRecord(body) && typeof body.error === "string" ? body.error : undefined;
       switch (error) {
@@ -1022,15 +1385,20 @@ export async function waitForDeviceCodeLogin(
           return { error: SAFE_OAUTH_ERROR_CODES.has(error) ? error : "provider_error" };
         default:
           ensureOidcNotCancelled(signal, "device authorization");
-          return { error: "provider_error" };
+          throw providerResponseFailure(
+            "device authorization",
+            response,
+            responseText ?? "",
+            "OIDC device authorization returned an unknown provider error",
+          );
       }
       await abortableDelay(Math.min(interval, Math.max(0, expiration - Date.now())), signal);
     } while (Date.now() < expiration);
     ensureOidcNotCancelled(signal, "device authorization");
     return { error: "expired" };
   } catch (err) {
-    if (err instanceof OidcValidationError) throw err;
-    throw new StorageError(formatProviderFailure("device authorization", err));
+    if (err instanceof OidcValidationError || err instanceof AggregateError) throw err;
+    throw formatProviderFailure("device authorization", err);
   }
 }
 
@@ -1076,8 +1444,8 @@ export async function beginAuthorizationCodeFlow(opts: {
   let generated: URL;
   try {
     generated = new URL(url);
-  } catch {
-    throw new StorageError("OIDC authorization URL is invalid");
+  } catch (error) {
+    throw new StorageError("OIDC authorization URL is invalid", { cause: error });
   }
   const expectedEndpoint = parseHttpUrl(authMetadata.authorization_endpoint, "authorization endpoint");
   const stateValues = generated.searchParams.getAll("state");
@@ -1134,7 +1502,7 @@ export async function completeAuthorizationCodeFlow(
     context = parseAuthorizationContext(JSON.parse(serialized), state);
   } catch (error) {
     if (error instanceof StorageError) throw error;
-    throw new StorageError("OIDC authorization context is missing or invalid");
+    throw new StorageError("OIDC authorization context is missing or invalid", { cause: error });
   } finally {
     // Consume the state before any network exchange. A retry must not replay
     // the authorization code, even if the exchange fails.
@@ -1151,7 +1519,7 @@ export async function completeAuthorizationCodeFlow(
       redirect_uri: context.redirectUri,
       code,
     });
-    const { response, body } = await requestWithTimeout(
+    const { response, body, responseText } = await requestWithTimeout(
       endpoint,
       {
         method: "POST",
@@ -1161,22 +1529,41 @@ export async function completeAuthorizationCodeFlow(
       },
       "authorization code exchange",
       async (response, requestSignal) => {
-        assertNoRedirect(response, endpoint, "authorization code exchange");
+        await assertNoRedirect(response, endpoint, "authorization code exchange");
+        const body = await readJsonResponse(response, "authorization code exchange", requestSignal);
         return {
           response,
-          body: await readBoundedJsonResponse(response, "authorization code exchange", requestSignal),
+          body: body.value,
+          responseText: body.text,
         };
       },
       OIDC_REQUEST_TIMEOUT_MS,
       signal,
     );
-    if (!response.ok) throw new StorageError("OIDC authorization code exchange failed");
-    validateBearerTokenResponse(body);
-    validateTokenBounds(body, "authorization code exchange");
-    const normalized = normalizeBearerTokenResponseTokenType(body);
-    const grantedScope = normalized.scope;
-    if (typeof grantedScope !== "string" || !scopeMatchesDevice(grantedScope, context.deviceId)) {
-      throw new StorageError("OIDC authorization code exchange returned an unexpected granted scope");
+    if (!response.ok) {
+      throw providerResponseFailure(
+        "authorization code exchange",
+        response,
+        responseText ?? "",
+        "OIDC authorization code exchange failed",
+      );
+    }
+    let normalized!: ReturnType<typeof normalizeBearerTokenResponseTokenType>;
+    try {
+      validateBearerTokenResponse(body);
+      validateTokenBounds(body, "authorization code exchange");
+      normalized = normalizeBearerTokenResponseTokenType(body);
+      const grantedScope = normalized.scope;
+      if (typeof grantedScope !== "string" || !scopeMatchesDevice(grantedScope, context.deviceId)) {
+        throw new StorageError("OIDC authorization code exchange returned an unexpected granted scope");
+      }
+    } catch (error) {
+      throw responseValidationFailure(
+        "authorization code exchange",
+        response,
+        responseText ?? "",
+        error,
+      );
     }
     const tokenResponse: BearerTokenResponse = {
       ...normalized,
@@ -1189,8 +1576,8 @@ export async function completeAuthorizationCodeFlow(
       homeserverUrl: context.homeserverUrl,
     };
   } catch (err) {
-    if (err instanceof StorageError) throw err;
-    throw new StorageError(formatProviderFailure("authorization code exchange", err));
+    if (err instanceof StorageError || err instanceof AggregateError) throw err;
+    throw formatProviderFailure("authorization code exchange", err);
   }
 }
 
@@ -1264,8 +1651,8 @@ function scopeMatchesDevice(scope: string, expectedDeviceId: string): boolean {
 function validateMatrixUserId(userId: unknown, serverName: string): string {
   try {
     return validateCanonicalMatrixUserId(userId, serverName);
-  } catch {
-    throw new StorageError("OIDC identity confirmation returned an invalid or foreign user ID");
+  } catch (error) {
+    throw new StorageError("OIDC identity confirmation returned an invalid or foreign user ID", { cause: error });
   }
 }
 
@@ -1294,18 +1681,19 @@ export async function whoAmI(
     if (res.device_id !== undefined && res.device_id !== null) {
       try {
         validateMatrixDeviceId(res.device_id);
-      } catch {
-        throw new StorageError("OIDC identity confirmation returned an invalid device ID");
+      } catch (error) {
+        throw new StorageError("OIDC identity confirmation returned an invalid device ID", { cause: error });
       }
     }
     if (signal?.aborted) throw new OidcRequestCancelledError("identity confirmation");
     return { userId, deviceId: res.device_id ?? null };
   } catch (err) {
+    if (err instanceof AggregateError) throw err;
     if (signal?.aborted) {
       throw new StorageError("OIDC identity confirmation cancelled");
     }
     if (err instanceof StorageError) throw err;
-    throw new StorageError(formatProviderFailure("identity confirmation", err));
+    throw formatProviderFailure("identity confirmation", err);
   }
 }
 
@@ -1314,9 +1702,8 @@ export async function whoAmI(
  * POST to the token endpoint. A public client (`token_endpoint_auth_method:
  * "none"`, what `registerClient` above registers) authenticates a refresh
  * with just `client_id` in the body, no secret. This narrow request remains
- * local because Matrix 42's `OAuth2.performRefreshTokenGrant` parses every
- * non-success body with unbounded `response.json()`; this path bounds the
- * body and exposes only an allowlisted OAuth error code.
+ * local because Matrix 42's `OAuth2.performRefreshTokenGrant` exposes
+ * provider-controlled response details directly.
  */
 async function refreshOidcToken(
   tokenEndpoint: string,
@@ -1347,35 +1734,43 @@ async function refreshOidcToken(
         redirect: "manual",
       }),
       controller.signal,
-      () => undefined,
       () =>
         signal?.aborted
-          ? new StorageError("OIDC token refresh cancelled")
-          : new StorageError("OIDC token refresh timed out"),
+          ? new StorageError("OIDC token refresh cancelled", {
+              cause: new OidcRequestCancelledError("token refresh"),
+            })
+          : new StorageError("OIDC token refresh timed out", {
+              cause: new OidcRequestTimeoutError("token refresh"),
+            }),
     );
-    assertNoRedirect(res, endpoint, "token refresh");
+    await assertNoRedirect(res, endpoint, "token refresh");
     if (!res.ok) {
-      let body: BoundedResponseText;
+      let body: ResponseText;
       try {
-        body = await readBoundedResponseText(res, MAX_OAUTH_ERROR_BODY_BYTES, controller.signal);
+        body = await readResponseText(res, controller.signal, "token refresh");
       } catch (error) {
         if (signal?.aborted || controller.signal.aborted) throw error;
-        body = { text: "", truncated: false };
+        throw new StorageError("OIDC token refresh error response could not be read", {
+          cause: diagnosticCause(error),
+        });
       }
-      throw new StorageError(formatTokenRefreshFailure(res.status, body));
+      throw formatTokenRefreshFailure(res.status, body);
     }
-    const body = await readBoundedResponseText(res, MAX_OAUTH_SUCCESS_BODY_BYTES, controller.signal);
-    if (body.truncated) {
-      throw new StorageError("OIDC token refresh returned an oversized response");
-    }
+    const body = await readResponseText(res, controller.signal, "token refresh");
+    const invalidResponse = (message: string, cause?: unknown): StorageError =>
+      new StorageError(message, {
+        cause: new OidcResponseError("token refresh", res.status, body.text, cause),
+      });
     let data: unknown;
     try {
       data = JSON.parse(body.text);
-    } catch {
-      throw new StorageError("OIDC token refresh returned an invalid response");
+    } catch (error) {
+      throw new StorageError("OIDC token refresh returned an invalid response", {
+        cause: new OidcResponseError("token refresh", res.status, body.text, error),
+      });
     }
     if (!data || typeof data !== "object") {
-      throw new StorageError("OIDC token refresh returned an invalid response");
+      throw invalidResponse("OIDC token refresh returned an invalid response");
     }
     const record = data as Record<string, unknown>;
     const accessToken = record.access_token;
@@ -1388,11 +1783,11 @@ async function refreshOidcToken(
       accessToken.length > MAX_OIDC_TOKEN_LENGTH ||
       /[\s\u0000-\u001f\u007f]/.test(accessToken)
     ) {
-      throw new StorageError("OIDC token refresh returned no access token");
+      throw invalidResponse("OIDC token refresh returned no access token");
     }
     const tokenType = record.token_type;
     if (typeof tokenType !== "string" || tokenType.toLowerCase() !== "bearer") {
-      throw new StorageError("OIDC token refresh returned an invalid token type");
+      throw invalidResponse("OIDC token refresh returned an invalid token type");
     }
     if (
       nextRefreshToken !== undefined &&
@@ -1401,22 +1796,22 @@ async function refreshOidcToken(
         nextRefreshToken.length > MAX_OIDC_TOKEN_LENGTH ||
         /[\s\u0000-\u001f\u007f]/.test(nextRefreshToken))
     ) {
-      throw new StorageError("OIDC token refresh returned an invalid refresh token");
+      throw invalidResponse("OIDC token refresh returned an invalid refresh token");
     }
     if (grantedScope !== undefined) {
       if (typeof grantedScope !== "string") {
-        throw new StorageError("OIDC token refresh returned an invalid scope");
+        throw invalidResponse("OIDC token refresh returned an invalid scope");
       }
       try {
         requireScope(grantedScope, "scope");
-      } catch {
-        throw new StorageError("OIDC token refresh returned an invalid scope");
+      } catch (error) {
+        throw invalidResponse("OIDC token refresh returned an invalid scope", { cause: error });
       }
       if (!scopeMatchesDevice(grantedScope, expectedDeviceId)) {
-        throw new StorageError("OIDC token refresh returned an unexpected granted scope");
+        throw invalidResponse("OIDC token refresh returned an unexpected granted scope");
       }
     } else {
-      throw new StorageError("OIDC token refresh returned no device-bound scope");
+      throw invalidResponse("OIDC token refresh returned no device-bound scope");
     }
     if (
       expiresIn !== undefined &&
@@ -1425,7 +1820,7 @@ async function refreshOidcToken(
         expiresIn < 0 ||
         expiresIn > 86400)
     ) {
-      throw new StorageError("OIDC token refresh returned an invalid expiry");
+      throw invalidResponse("OIDC token refresh returned an invalid expiry");
     }
     ensureOidcNotCancelled(signal, "token refresh");
     return {
@@ -1439,14 +1834,14 @@ async function refreshOidcToken(
           : new Date(Date.now() + expiresIn * 1000),
     };
   } catch (error) {
-    if (error instanceof StorageError) throw error;
+    if (error instanceof StorageError || error instanceof AggregateError) throw error;
     if (signal?.aborted) {
-      throw new StorageError("OIDC token refresh cancelled");
+      throw new StorageError("OIDC token refresh cancelled", { cause: diagnosticCause(error) });
     }
     if (controller.signal.aborted) {
-      throw new StorageError("OIDC token refresh timed out");
+      throw new StorageError("OIDC token refresh timed out", { cause: diagnosticCause(error) });
     }
-    throw new StorageError("OIDC token refresh failed");
+    throw new StorageError("OIDC token refresh failed", { cause: diagnosticCause(error) });
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abortExternal);
@@ -1464,32 +1859,40 @@ async function revokeOidcToken(
   const endpoint = exactEndpoint(revocationEndpoint, "revocation endpoint");
   const safeClientId = requireClientId(clientId);
   const safeToken = requireBoundedString(token, "token", MAX_OIDC_TOKEN_LENGTH);
-  const { response } = await requestWithTimeout(
-    endpoint,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: safeClientId,
-        token: safeToken,
-        token_type_hint: tokenTypeHint,
-      }).toString(),
-      redirect: "manual",
-    },
-    "token revocation",
-    async (res, requestSignal) => {
-      assertNoRedirect(res, endpoint, "token revocation");
-      if (!res.ok) {
-        await readBoundedResponseText(res, MAX_OAUTH_ERROR_BODY_BYTES, requestSignal);
-      } else {
-        await readBoundedResponseText(res, MAX_OAUTH_SUCCESS_BODY_BYTES, requestSignal);
-      }
-      return { response: res };
-    },
-    OIDC_REQUEST_TIMEOUT_MS,
-    signal,
-  );
-  if (!response.ok) throw new StorageError("OIDC token revocation failed");
+  try {
+    const { response, responseText } = await requestWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: safeClientId,
+          token: safeToken,
+          token_type_hint: tokenTypeHint,
+        }).toString(),
+        redirect: "manual",
+      },
+      "token revocation",
+      async (res, requestSignal) => {
+        await assertNoRedirect(res, endpoint, "token revocation");
+        const body = await readResponseText(res, requestSignal, "token revocation");
+        return { response: res, responseText: body.text };
+      },
+      OIDC_REQUEST_TIMEOUT_MS,
+      signal,
+    );
+    if (!response.ok) {
+      throw providerResponseFailure(
+        "token revocation",
+        response,
+        responseText ?? "",
+        "OIDC token revocation failed",
+      );
+    }
+  } catch (error) {
+    if (error instanceof StorageError || error instanceof AggregateError) throw error;
+    throw formatProviderFailure("token revocation", error);
+  }
 }
 
 async function persistOidcTokens(
@@ -1517,7 +1920,6 @@ async function persistOidcTokens(
     await raceWithAbort(
       Promise.resolve().then(() => onPersist(tokens, controller.signal)),
       controller.signal,
-      () => undefined,
       () =>
         timedOut
           ? new OidcRequestTimeoutError("token persistence")
@@ -1573,37 +1975,57 @@ export function buildTokenRefreshFunction(
         { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken },
         signal,
       );
-    } catch {
+    } catch (persistenceError) {
       if (revocationEndpoint) {
         // Cleanup must remain possible even when the caller's signal is
         // already aborted. Use a separate bounded signal so persistence
         // failure cannot strand freshly-issued tokens merely because the
         // original request was cancelled.
         const cleanup = createOidcCleanupSignal();
+        const cleanupFailures: unknown[] = [];
         try {
-          await revokeOidcToken(
-            revocationEndpoint,
-            safeClientId,
-            tokens.accessToken,
-            "access_token",
-            cleanup.signal,
-          );
-          if (tokens.refreshToken) {
+          try {
             await revokeOidcToken(
               revocationEndpoint,
               safeClientId,
-              tokens.refreshToken,
-              "refresh_token",
+              tokens.accessToken,
+              "access_token",
               cleanup.signal,
             );
+          } catch (error) {
+            cleanupFailures.push(error);
           }
-        } catch {
+          if (tokens.refreshToken) {
+            try {
+              await revokeOidcToken(
+                revocationEndpoint,
+                safeClientId,
+                tokens.refreshToken,
+                "refresh_token",
+                cleanup.signal,
+              );
+            } catch (error) {
+              cleanupFailures.push(error);
+            }
+          }
+        } finally {
           cleanup.close();
-          throw new StorageError("OIDC token persistence failed and session cleanup was incomplete");
         }
-        cleanup.close();
+        if (cleanupFailures.length > 0) {
+          throw new StorageError(
+            "OIDC token persistence failed and session cleanup was incomplete",
+            {
+              cause: new AggregateError(
+                [persistenceError, ...cleanupFailures],
+                "OIDC token persistence and session cleanup failed",
+              ),
+            },
+          );
+        }
       }
-      throw new StorageError("OIDC token persistence failed; discard the refreshed session");
+      throw new StorageError("OIDC token persistence failed; discard the refreshed session", {
+        cause: persistenceError,
+      });
     }
     ensureOidcNotCancelled(signal, "token refresh");
     return tokens;

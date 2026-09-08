@@ -18,7 +18,9 @@ import {
   deleteFile,
   deleteFolder,
   deleteVault,
+  createSubfolder,
   downloadFile as downloadCoreFile,
+  getFileDetails,
   joinVault,
   listFiles,
   listPendingInvites,
@@ -28,7 +30,7 @@ import {
   shareVault,
   unshareVault,
 } from "../src/core/operations.js";
-import { MutationPartialError, UndecryptableFileError } from "../src/core/errors.js";
+import { MutationPartialError, RoomCleanupIncompleteError, UndecryptableFileError } from "../src/core/errors.js";
 import { waitForCondition } from "../src/core/poll.js";
 import { isFileDeleted, isTreeDeleted } from "../src/deletion-markers.js";
 
@@ -58,6 +60,57 @@ function reviewedInviteRoom(extra: Record<string, unknown> = {}): Record<string,
 }
 
 describe("operation safety", () => {
+  it("does not convert a tree state failure into not found", async () => {
+    const failure = new Error("expected room create event");
+    const getTree = vi.fn(() => { throw failure; });
+    const storage = { getTree } as unknown as TeleCryptIOStorage;
+
+    await expect(listFiles(storage, "!incomplete-state:example.test")).rejects.toMatchObject({
+      message: "storage space lookup failed",
+      cause: failure,
+    });
+    expect(getTree).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not convert a file state failure into not found", async () => {
+    const failure = new Error("file state unavailable");
+    const tree = makeTree("!file-state:example.test", "Files", true);
+    tree.getFile = vi.fn(() => { throw failure; });
+    const storage = { getTree: () => tree } as unknown as TeleCryptIOStorage;
+
+    await expect(deleteFile(storage, tree.id, "$file:example.test")).rejects.toMatchObject({
+      message: "file lookup failed",
+      cause: failure,
+    });
+    expect(tree.getFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry nested-folder creation after incomplete cleanup", async () => {
+    const parent = makeTree("!parent-rate-limit:example.test", "Parent", true);
+    const failure = Object.assign(new Error("rate limited after cleanup failure"), {
+      cleanupIncomplete: true,
+      isRateLimitError: () => true,
+    });
+    const createSubtree = vi.fn().mockRejectedValue(failure);
+    const storage = {
+      getTree: () => parent,
+      createSubtree,
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(createSubfolder(storage, parent.id, "Child")).rejects.toBe(failure);
+    expect(createSubtree).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a typed incomplete-cleanup result", async () => {
+    const parent = makeTree("!parent-typed-cleanup:example.test", "Parent", true);
+    const failure = new RoomCleanupIncompleteError("!partial-child:example.test");
+    const createSubtree = vi.fn().mockRejectedValue(failure);
+    const storage = { getTree: () => parent, createSubtree } as unknown as TeleCryptIOStorage;
+
+    await expect(createSubfolder(storage, parent.id, "Child")).rejects.toBe(failure);
+    expect(createSubtree).toHaveBeenCalledTimes(1);
+  });
+
   function deletionFixture(history: Array<{ id: string; mediaId: string }>) {
     const versions = history.map(({ id, mediaId }) => ({
       id,
@@ -313,29 +366,21 @@ describe("operation safety", () => {
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
   });
 
-  it("bounds the version chain before issuing a deletion request", async () => {
-    const fixture = deletionFixture(
-      Array.from({ length: 129 }, (_, index) => ({
-        id: `$v${index}`,
-        mediaId: `mxc://example.test/v${index}`,
-      })),
-    );
-
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v0")).rejects.toThrow(
-      "file version history is invalid or too large",
-    );
-    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
-  });
-
-  it("bounds the pending-invite room inventory before iterating it", async () => {
+  it("iterates the complete pending-invite room inventory", async () => {
+    const rooms = Array.from({ length: 10_001 }, (_, index) => ({
+      roomId: `!invite-${index}:example.test`,
+      getMyMembership: () => "join",
+      currentState: { getStateEvents: () => null },
+    }));
     const storage = {
-      getClient: () => ({ getRooms: () => Array.from({ length: 10_001 }, () => ({}) ) }),
+      getClient: () => ({ getRooms: () => rooms }),
+      getTree: () => null,
     } as unknown as TeleCryptIOStorage;
 
-    await expect(listPendingInvites(storage)).rejects.toThrow("invite list is too large");
+    await expect(listPendingInvites(storage)).resolves.toEqual([]);
   });
 
-  it("bounds file and folder collections before mapping remote objects", async () => {
+  it("maps complete file and folder collections", async () => {
     const hugeFiles = Array.from({ length: 10_001 }, (_, index) => ({
       id: `$file-${index}`,
       getName: () => `file-${index}`,
@@ -352,8 +397,8 @@ describe("operation safety", () => {
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(listFiles(storage, tree.id)).rejects.toThrow("file list is too large");
-    await expect(listSubfolders(storage, tree.id)).rejects.toThrow("folder list is too large");
+    await expect(listFiles(storage, tree.id)).resolves.toHaveLength(10_001);
+    await expect(listSubfolders(storage, tree.id)).resolves.toHaveLength(10_001);
   });
 
   it("refreshes the parent room before listing subfolders", async () => {
@@ -495,6 +540,39 @@ describe("operation safety", () => {
     await expect(downloadCoreFile(storage, tree.id, branch.id)).rejects.toBe(failure);
   });
 
+  it("preserves an unknown download failure as the cause", async () => {
+    const branch = { id: "$file", getName: () => "secret.txt" };
+    const tree = makeTree("!download-failure:example.test", "Vault", true);
+    tree.getFile = vi.fn().mockReturnValue(branch);
+    const failure = new Error("download transport unavailable");
+    const storage = {
+      getTree: () => tree,
+      downloadFile: vi.fn().mockRejectedValue(failure),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(downloadCoreFile(storage, tree.id, branch.id)).rejects.toMatchObject({
+      message: "download failed",
+      cause: failure,
+    });
+  });
+
+  it("preserves an unknown file-details failure as the cause", async () => {
+    const failure = new Error("file event unavailable");
+    const branch = {
+      id: "$details-file",
+      getName: () => "details.txt",
+      getFileEvent: vi.fn().mockRejectedValue(failure),
+    };
+    const tree = makeTree("!details-failure:example.test", "Vault", true);
+    tree.getFile = vi.fn().mockReturnValue(branch);
+    const storage = { getTree: () => tree } as unknown as TeleCryptIOStorage;
+
+    await expect(getFileDetails(storage, tree.id, branch.id)).rejects.toMatchObject({
+      message: "get file details failed",
+      cause: failure,
+    });
+  });
+
   it("evicts a declined invite from the local room store after server cleanup", async () => {
     const removeRoom = vi.fn();
     const refreshRoomState = vi.fn().mockResolvedValue(undefined);
@@ -633,6 +711,23 @@ describe("operation safety", () => {
       tree.id,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it("surfaces a rename refresh failure immediately with its cause", async () => {
+    const tree = makeTree("!rename-refresh-failure:example.test", "Child", false);
+    tree.setName = vi.fn().mockResolvedValue(undefined);
+    const refreshFailure = new Error("refresh unavailable");
+    const refreshRoomState = vi.fn().mockRejectedValue(refreshFailure);
+    const storage = {
+      getTree: () => tree,
+      refreshRoomState,
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(renameFolder(storage, tree.id, "Renamed")).rejects.toMatchObject({
+      message: "rename failed",
+      cause: refreshFailure,
+    });
+    expect(refreshRoomState).toHaveBeenCalledTimes(1);
   });
 
   it("bounds direct room-state refreshes and forwards cancellation", async () => {
@@ -793,10 +888,11 @@ describe("operation safety", () => {
   });
 
   it.each([
-    ["huge", Number.MAX_SAFE_INTEGER, 30_000],
+    ["ordinary", 45_000, 45_000],
+    ["huge", Number.MAX_SAFE_INTEGER, 2_147_483_647],
     ["NaN", Number.NaN, 15_000],
     ["negative", -1, 15_000],
-  ])("bounds %s server retry delays", async (_label, advised, expectedDelay) => {
+  ])("uses %s server retry delays until the operation deadline", async (_label, advised, expectedDelay) => {
     vi.useFakeTimers();
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
     try {
@@ -808,11 +904,11 @@ describe("operation safety", () => {
         getRoomMembership: vi.fn().mockResolvedValue("invite"),
         getClient: () => ({ joinRoom: vi.fn().mockRejectedValue(rateLimited) }),
       } as unknown as TeleCryptIOStorage;
-      const pending = joinVault(storage, "!limited:example.test");
+      const pending = joinVault(storage, "!limited:example.test", { timeoutMs: 60_000 });
       await vi.advanceTimersByTimeAsync(0);
       expect(setTimeoutSpy.mock.calls.some((call) => call[1] === expectedDelay)).toBe(true);
-      const assertion = expect(pending).rejects.toThrow("join failed");
-      await vi.advanceTimersByTimeAsync(90_000);
+      const assertion = expect(pending).rejects.toThrow("operation cancelled");
+      await vi.advanceTimersByTimeAsync(60_000);
       await assertion;
     } finally {
       setTimeoutSpy.mockRestore();
@@ -1229,7 +1325,14 @@ describe("operation safety", () => {
       },
     };
 
-    await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).rejects.toThrow("delete failed");
+    let caught: unknown;
+    try {
+      await deleteVault(new TeleCryptIOStorage(client as never), root.id);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ message: "delete failed", cause: expect.any(Error) });
+    expect((caught as Error).cause).toBeInstanceOf(Error);
     expect(client.leave).not.toHaveBeenCalled();
     expect(client.forget).not.toHaveBeenCalled();
     expect(links.get("child")).toEqual(active);

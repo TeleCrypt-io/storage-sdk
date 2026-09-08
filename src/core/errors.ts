@@ -3,8 +3,8 @@
  * conditions (bad login, wrong recovery key, missing file, vault, or folder, not
  * logged in, ...). Platform-agnostic: no Node/CLI dependencies. */
 export class StorageError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "StorageError";
   }
 }
@@ -25,8 +25,11 @@ export class RecoveryAlreadyConfiguredError extends StorageError {
 export class RecoveryRestoreError extends StorageError {
   readonly code = "RECOVERY_RESTORE_FAILED" as const;
 
-  constructor() {
-    super("recovery restore failed; verify the Recovery Key and account");
+  constructor(cause?: unknown) {
+    super(
+      "recovery restore failed; verify the Recovery Key and account",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RecoveryRestoreError";
   }
 }
@@ -35,8 +38,11 @@ export class RecoveryRestoreError extends StorageError {
 export class RecoverySetupError extends StorageError {
   readonly code = "RECOVERY_SETUP_FAILED" as const;
 
-  constructor() {
-    super("recovery setup did not complete; check recovery status before retrying");
+  constructor(cause?: unknown) {
+    super(
+      "recovery setup did not complete; check recovery status before retrying",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RecoverySetupError";
   }
 }
@@ -45,8 +51,11 @@ export class RecoverySetupError extends StorageError {
 export class RecoverySetupAmbiguousError extends StorageError {
   readonly code = "RECOVERY_SETUP_AMBIGUOUS" as const;
 
-  constructor() {
-    super("recovery setup may have completed; check recovery status before retrying");
+  constructor(cause?: unknown) {
+    super(
+      "recovery setup may have completed; check recovery status before retrying",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RecoverySetupAmbiguousError";
   }
 }
@@ -55,8 +64,11 @@ export class RecoverySetupAmbiguousError extends StorageError {
 export class RecoveryRestoreAmbiguousError extends StorageError {
   readonly code = "RECOVERY_RESTORE_AMBIGUOUS" as const;
 
-  constructor() {
-    super("recovery restore may have completed; check recovery status before retrying");
+  constructor(cause?: unknown) {
+    super(
+      "recovery restore may have completed; check recovery status before retrying",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RecoveryRestoreAmbiguousError";
   }
 }
@@ -66,8 +78,8 @@ export class MutationOutcomeUnknownError extends StorageError {
   readonly code = "MUTATION_OUTCOME_UNKNOWN" as const;
   readonly operation: string;
 
-  constructor(operation = "operation") {
-    super(`${operation} outcome is unknown; reconcile current state before retrying`);
+  constructor(operation = "operation", options?: ErrorOptions) {
+    super(`${operation} outcome is unknown; reconcile current state before retrying`, options);
     this.name = "MutationOutcomeUnknownError";
     this.operation = operation;
   }
@@ -79,9 +91,15 @@ export class MutationPartialError extends StorageError {
   readonly operation: string;
   readonly completedIds: readonly string[];
 
-  constructor(operation: string, completedIds: readonly string[], detail?: string) {
+  constructor(
+    operation: string,
+    completedIds: readonly string[],
+    detail?: string,
+    options?: ErrorOptions,
+  ) {
     super(
       `${operation} failed after partial completion${detail ? `: ${detail}` : ""}; retry to reconcile current state`,
+      options,
     );
     this.name = "MutationPartialError";
     this.operation = operation;
@@ -106,8 +124,11 @@ export class RoomCreationAmbiguousError extends StorageError {
   readonly code = "ROOM_CREATION_AMBIGUOUS" as const;
   readonly operation: string;
 
-  constructor(operation = "room creation") {
-    super(`${operation} outcome is unknown; reconcile newly-created rooms before retrying`);
+  constructor(operation = "room creation", cause?: unknown) {
+    super(
+      `${operation} outcome is unknown; reconcile newly-created rooms before retrying`,
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RoomCreationAmbiguousError";
     this.operation = operation;
   }
@@ -118,8 +139,11 @@ export class RoomCleanupIncompleteError extends StorageError {
   readonly code = "ROOM_CLEANUP_INCOMPLETE" as const;
   readonly roomId: string;
 
-  constructor(roomId: string) {
-    super("created room cleanup is incomplete; retry cleanup for the created room");
+  constructor(roomId: string, cause?: unknown) {
+    super(
+      "created room cleanup is incomplete; retry cleanup for the created room",
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "RoomCleanupIncompleteError";
     this.roomId = roomId;
   }

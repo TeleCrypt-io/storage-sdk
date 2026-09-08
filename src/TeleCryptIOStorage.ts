@@ -40,7 +40,14 @@ import {
   validateMatrixEventId,
   validateMatrixRoomId,
 } from "./core/constants.js";
-import { raceWithAbort, readBoundedResponseBody } from "./core/http.js";
+import {
+  cancelResponseBody,
+  raceWithAbort,
+  readMediaResponseBody,
+  readResponseBody,
+  ResponseBodyReadError,
+} from "./core/http.js";
+import { sanitizeDiagnosticText } from "./core/oidc.js";
 import { validateName } from "./core/validation.js";
 import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
@@ -81,7 +88,7 @@ export interface FileBranch {
     info: Record<string, unknown>;
     httpUrl: string;
   }>;
-  getFileEvent(): Promise<{ getContent: () => Record<string, unknown> }>;
+  getFileEvent(): Promise<Pick<MatrixEvent, "getContent" | "getTs">>;
   getVersionHistory(): Promise<FileBranch[]>;
   createNewVersion(
     name: string,
@@ -178,11 +185,6 @@ const RECOVERY_CRYPTO_TIMEOUT_MS = 60000;
 const MAX_MEDIA_REDIRECTS = 5;
 const MAX_MATRIX_TOKEN_LENGTH = 8192;
 const MAX_MIMETYPE_LENGTH = 255;
-const MAX_MATRIX_STATE_RESPONSE_BYTES = 4 * 1024 * 1024;
-const MAX_MATRIX_RESPONSE_BYTES = 16 * 1024 * 1024;
-const MAX_MATRIX_STATE_EVENTS = 10000;
-const MAX_MATRIX_MEMBERS = 10000;
-const MAX_MATRIX_JOINED_ROOMS = 4096;
 
 function cloneCryptoCallbacks(callbacks?: CryptoCallbacks): CryptoCallbacks {
   // MatrixClient retains this object for the lifetime of the client. Keep the
@@ -226,33 +228,28 @@ export function withMatrixMutationAbort<T>(
     try {
       pending = operation();
     } catch (error) {
-      finish(() => reject(cancelled ? new MutationOutcomeUnknownError(operationName) : error));
+      finish(() => reject(cancelled ? new MutationOutcomeUnknownError(operationName, { cause: error }) : error));
       return;
     }
     pending.then(
       (value) => finish(() => (cancelled ? reject(new MutationOutcomeUnknownError(operationName)) : resolve(value))),
-      (error: unknown) => finish(() => reject(cancelled ? new MutationOutcomeUnknownError(operationName) : error)),
+      (error: unknown) => finish(() => reject(cancelled ? new MutationOutcomeUnknownError(operationName, { cause: error }) : error)),
     );
   });
 }
 
-async function readBoundedMatrixResponse(
+async function readMatrixResponse(
   response: Response,
-  maxBytes: number,
   signal?: AbortSignal,
   abortError?: () => Error,
 ): Promise<Response> {
-  const body = await readBoundedResponseBody(response, maxBytes, signal, {
+  const body = await readResponseBody(response, signal, {
     abortError,
-    deferReaderRelease: true,
   });
-  if (body.truncated) throw new Error("Matrix response body is too large");
   if (!response.body) return response;
   // Fetch forbids a response body for 204, 205, and 304 responses. Some
   // browser implementations nevertheless expose an empty response stream for
-  // a 204 from a proxy. Reconstructing that response with even an empty
-  // Uint8Array then throws before matrix-js-sdk can accept the successful
-  // response. Preserve the bodyless status after boundedly consuming the
+  // a 204 from a proxy. Preserve the bodyless status after consuming the
   // stream so callers such as FetchHttpApi can still read an empty Blob.
   const bodylessStatus = response.status === 204 || response.status === 205 || response.status === 304;
   if (bodylessStatus) {
@@ -272,16 +269,6 @@ async function readBoundedMatrixResponse(
   });
 }
 
-function isMatrixStateOrMembershipUrl(input: RequestInfo | URL): boolean {
-  const url =
-    typeof input === "string"
-      ? new URL(input, "https://matrix.invalid")
-      : input instanceof URL
-        ? input
-        : new URL(input.url, "https://matrix.invalid");
-  return /\/rooms\/[^/]+\/(?:state|members)(?:\/|$)/.test(url.pathname);
-}
-
 export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
   const wrapped = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const pending = (async (): Promise<Response> => {
@@ -299,7 +286,6 @@ export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
         const response = await raceWithAbort(
           fetchFn(input, { ...init, redirect: "manual", signal: controller.signal }),
           controller.signal,
-          () => undefined,
           () => (timedOut ? new Error("Matrix request timed out") : new DOMException("The operation was aborted", "AbortError")),
         );
         if (
@@ -307,14 +293,12 @@ export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
           response.type === "opaqueredirect" ||
           (response.status >= 300 && response.status < 400)
         ) {
-          response.body?.cancel().catch(() => undefined);
-          throw new Error("Matrix redirect rejected");
+          const failure = new Error("Matrix redirect rejected");
+          await cancelResponseBody(response, "Matrix redirect", failure);
+          throw failure;
         }
-        return await readBoundedMatrixResponse(
+        return await readMatrixResponse(
           response,
-          isMatrixStateOrMembershipUrl(input)
-            ? MAX_MATRIX_STATE_RESPONSE_BYTES
-            : MAX_MATRIX_RESPONSE_BYTES,
           controller.signal,
           () => (timedOut ? new Error("Matrix request timed out") : new DOMException("The operation was aborted", "AbortError")),
         );
@@ -323,9 +307,6 @@ export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
         externalSignal?.removeEventListener("abort", abortExternal);
       }
     })();
-    // Preserve fetch-style rejection for callers while observing an immediate
-    // abort until the caller has had a chance to attach its own handler.
-    void pending.catch(() => undefined);
     return pending;
   }) as typeof fetch;
   return wrapped;
@@ -386,8 +367,8 @@ function validateHomeserverUrl(value: string): URL {
   let url: URL;
   try {
     url = new URL(value);
-  } catch {
-    throw new Error("invalid Matrix homeserver URL");
+  } catch (error) {
+    throw new Error("invalid Matrix homeserver URL", { cause: error });
   }
   if (
     (url.protocol !== "http:" && url.protocol !== "https:") ||
@@ -444,6 +425,44 @@ function validateMimetype(value: string): void {
   }
 }
 
+export interface FileEventMetadata {
+  mimetype: string | null;
+  size: number | null;
+}
+
+/** Reads the event-owned metadata shared by details and download operations. */
+export function readFileEventMetadata(content: unknown): FileEventMetadata {
+  if (!isRecord(content)) throw new StorageError("media metadata is invalid");
+  const rawInfo = content["info"];
+  if (rawInfo !== undefined && !isRecord(rawInfo)) {
+    throw new StorageError("media metadata is invalid");
+  }
+  const info = isRecord(rawInfo) ? rawInfo : undefined;
+  const rawSize = info?.["size"];
+  if (rawSize !== undefined) {
+    if (typeof rawSize !== "number" || !Number.isSafeInteger(rawSize) || rawSize < 0) {
+      throw new StorageError("media metadata is invalid");
+    }
+    if (rawSize > MAX_MEDIA_FILE_BYTES) throw new FileTooLargeError();
+  }
+  const rawMimetype = info?.["mimetype"];
+  if (rawMimetype !== undefined && typeof rawMimetype !== "string") {
+    throw new StorageError("media metadata is invalid");
+  }
+  const mimetype = rawMimetype ?? null;
+  if (mimetype !== null) {
+    try {
+      validateMimetype(mimetype);
+    } catch (error) {
+      throw new StorageError("media metadata is invalid", { cause: error });
+    }
+  }
+  return {
+    mimetype,
+    size: typeof rawSize === "number" ? rawSize : null,
+  };
+}
+
 interface MatrixMemberEntry {
   state_key: string;
   content: { membership: string };
@@ -473,6 +492,11 @@ interface CrossSigningStatusShape {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function isUndecryptableFilePlaceholder(branch: FileBranch): Promise<boolean> {
+  const content = (await branch.getFileEvent()).getContent();
+  return isRecord(content) && content["msgtype"] === "m.file" && content["file"] === undefined;
 }
 
 function validateSecretStorageStatus(value: unknown): SecretStorageStatusShape {
@@ -551,7 +575,6 @@ async function withRecoveryCryptoDeadline<T>(
     return await raceWithAbort(
       pending,
       controller.signal,
-      () => undefined,
       () =>
         timedOut
           ? new RecoveryCryptoTimeoutError(operationName)
@@ -566,9 +589,6 @@ async function withRecoveryCryptoDeadline<T>(
 function parseMatrixMembersResponse(value: unknown): MatrixMemberEntry[] {
   if (!isRecord(value) || !Array.isArray(value.chunk)) {
     throw new Error("invalid Matrix members response");
-  }
-  if (value.chunk.length > MAX_MATRIX_MEMBERS) {
-    throw new Error("Matrix members response is too large");
   }
   return value.chunk.map((entry): MatrixMemberEntry => {
     if (
@@ -590,9 +610,6 @@ function parseMatrixMembersResponse(value: unknown): MatrixMemberEntry[] {
 
 function parseMatrixStateResponse(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("invalid Matrix room state response");
-  if (value.length > MAX_MATRIX_STATE_EVENTS) {
-    throw new Error("Matrix room state response is too large");
-  }
   return value.map((event): Record<string, unknown> => {
     if (
       !isRecord(event) ||
@@ -625,9 +642,6 @@ function parseMatrixPowerLevels(value: unknown): MatrixPowerLevels {
     const field = value[name];
     if (field === undefined) continue;
     if (!isRecord(field)) throw new Error("invalid Matrix power-level response");
-    if (Object.keys(field).length > MAX_MATRIX_MEMBERS) {
-      throw new Error("Matrix power-level response is too large");
-    }
     for (const key of Object.keys(field)) validateMatrixIdentifier(key, `${name} key`);
     for (const level of Object.values(field)) {
       if (typeof level !== "number" || !Number.isFinite(level)) {
@@ -645,8 +659,11 @@ function isGoneRoomError(error: unknown): boolean {
   );
 }
 
-function throwWithCleanupDetail(error: unknown, roomId: string): never {
-  const cleanup = new RoomCleanupIncompleteError(roomId);
+function throwWithCleanupDetail(error: unknown, roomId: string, cleanupError?: unknown): never {
+  const cleanupCause = cleanupError === undefined
+    ? error
+    : new AggregateError([error, cleanupError], "operation and room cleanup failed", { cause: error });
+  const cleanup = new RoomCleanupIncompleteError(roomId, cleanupCause);
   if (error instanceof Error) {
     try {
       Object.defineProperty(error, "cleanupIncomplete", {
@@ -658,9 +675,10 @@ function throwWithCleanupDetail(error: unknown, roomId: string): never {
         enumerable: false,
       });
     } catch {
-      // Preserve the original mutation error even if an unusual Error object
-      // is non-extensible; the cleanup detail remains in the cause chain only
-      // when it could be attached safely.
+      // A non-extensible provider error cannot carry the cleanup marker. Throw
+      // the existing typed cleanup error and retain the provider error as cause
+      // so callers cannot mistake the mutation for a safe retry.
+      throw cleanup;
     }
     throw error;
   }
@@ -747,9 +765,6 @@ export class TeleCryptIOStorage {
         for (const [eventType, byStateKey] of currentEvents) {
           for (const [stateKey, event] of byStateKey) {
             if (present.has(`${eventType}\u0000${stateKey}`)) continue;
-            if (refreshed.length >= MAX_MATRIX_STATE_EVENTS) {
-              throw new Error("Matrix room state response is too large");
-            }
             const original = event.getEffectiveEvent();
             refreshed.push(
               new MatrixEvent({
@@ -882,8 +897,10 @@ export class TeleCryptIOStorage {
       // a sync task before the awaited operation rejects.
       try {
         client.stopClient();
-      } catch {
-        // Preserve the original bootstrap failure.
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -1122,7 +1139,7 @@ export class TeleCryptIOStorage {
       if (signal?.aborted && error instanceof StorageError) {
         throw error;
       }
-      throw new RecoverySetupAmbiguousError();
+      throw new RecoverySetupAmbiguousError(error);
     }
     if (status.defaultKeyId || status.ready || backupVersion !== null) {
       throw new RecoveryAlreadyConfiguredError();
@@ -1143,11 +1160,11 @@ export class TeleCryptIOStorage {
         // matches the working pattern already proven in keys.test.ts.
         authUploadDeviceSigningKeys: async () => undefined,
       }), signal, "cross-signing bootstrap");
-    } catch {
+    } catch (error) {
       // Cross-signing setup can commit server-side state before a transport
       // failure is observed. Do not turn that uncertainty into a retry that
       // could replace recovery state.
-      throw new RecoverySetupAmbiguousError();
+      throw new RecoverySetupAmbiguousError(error);
     }
     // CryptoApi mutations do not accept an AbortSignal. Once one has settled,
     // do not cross the next one-way mutation boundary: the caller may already
@@ -1161,8 +1178,8 @@ export class TeleCryptIOStorage {
         signal,
         "recovery-key generation",
       );
-    } catch {
-      throw new RecoverySetupAmbiguousError();
+    } catch (error) {
+      throw new RecoverySetupAmbiguousError(error);
     }
     if (!generated.encodedPrivateKey) {
       throw new RecoverySetupAmbiguousError();
@@ -1211,14 +1228,25 @@ export class TeleCryptIOStorage {
         if (afterStatus.defaultKeyId || afterStatus.ready || afterBackup !== null) {
           throw new RecoverySetupAmbiguousError();
         }
-      } catch (error) {
-        if (error instanceof RecoverySetupAmbiguousError || error instanceof RecoverySetupError) throw error;
+      } catch (statusError) {
+        if (statusError instanceof RecoverySetupAmbiguousError) {
+          throw new RecoverySetupAmbiguousError(
+            new AggregateError([error, statusError], "recovery setup and status verification were both inconclusive", {
+              cause: error,
+            }),
+          );
+        }
+        if (statusError instanceof RecoverySetupError) throw statusError;
         // A failed status probe cannot prove that the one-way operation did
         // not commit. Never turn that uncertainty into an apparently safe
         // retry that could replace account recovery state.
-        throw new RecoverySetupAmbiguousError();
+        throw new RecoverySetupAmbiguousError(
+          new AggregateError([error, statusError], "recovery setup and status verification failed", {
+            cause: error,
+          }),
+        );
       }
-      throw new RecoverySetupError();
+      throw new RecoverySetupError(error);
     }
 
     try {
@@ -1231,7 +1259,7 @@ export class TeleCryptIOStorage {
       if (!afterStatus.ready || afterBackup === null) throw new RecoverySetupAmbiguousError();
     } catch (error) {
       if (error instanceof RecoverySetupAmbiguousError) throw error;
-      throw new RecoverySetupAmbiguousError();
+      throw new RecoverySetupAmbiguousError(error);
     }
 
     // This is the last boundary before exposing the only recovery credential
@@ -1263,8 +1291,8 @@ export class TeleCryptIOStorage {
       const storageStatus = validateSecretStorageStatus(rawStorageStatus);
       const backupVersion = validateBackupVersion(rawBackupVersion);
       return storageStatus.ready && backupVersion !== null;
-    } catch {
-      throw new RecoverySetupAmbiguousError();
+    } catch (error) {
+      throw new RecoverySetupAmbiguousError(error);
     }
   }
 
@@ -1306,8 +1334,8 @@ export class TeleCryptIOStorage {
             },
             backupVersion,
           };
-        } catch {
-          throw new RecoverySetupAmbiguousError();
+        } catch (error) {
+          throw new RecoverySetupAmbiguousError(error);
         }
       },
       signal,
@@ -1352,8 +1380,8 @@ export class TeleCryptIOStorage {
     let privateKey: Uint8Array<ArrayBuffer>;
     try {
       privateKey = decodeRecoveryKey(recoveryKey);
-    } catch {
-      throw new RecoveryRestoreError();
+    } catch (error) {
+      throw new RecoveryRestoreError(error);
     }
     if (signal?.aborted) throw new StorageError("operation cancelled");
 
@@ -1367,7 +1395,7 @@ export class TeleCryptIOStorage {
         if (signal?.aborted) throw new RecoveryRestoreAmbiguousError();
       } catch (error) {
         if (error instanceof RecoveryRestoreAmbiguousError) throw error;
-        throw new RecoveryRestoreError();
+        throw new RecoveryRestoreError(error);
       }
 
       try {
@@ -1383,7 +1411,8 @@ export class TeleCryptIOStorage {
         return { imported: result.imported, total: result.total };
       } catch (error) {
         if (error instanceof RecoveryRestoreAmbiguousError) throw error;
-        throw new RecoveryRestoreError();
+        if (error instanceof RecoveryRestoreError) throw error;
+        throw new RecoveryRestoreError(error);
       }
     }, signal);
   }
@@ -1463,17 +1492,21 @@ export class TeleCryptIOStorage {
     signal?: AbortSignal,
   ): Promise<TreeSpace> {
     const deadline = Date.now() + TREE_SYNC_TIMEOUT_MS;
+    let lastError: unknown;
     for (;;) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       try {
         const tree = this.client.unstableGetFileTreeSpace(roomId) as unknown as TreeSpace | null;
         if (tree) return this.decorateTreeSpace(tree);
-      } catch {
+      } catch (error) {
+        lastError = error;
         // The room can be present before its complete state has been applied
         // to this client's local store. Keep polling the exact returned ID.
       }
       if (Date.now() >= deadline) {
-        throw new Error(`${operation}: created room did not become a file tree space in local sync state`);
+        throw new Error(`${operation}: created room did not become a file tree space in local sync state`, {
+          cause: lastError,
+        });
       }
       await new Promise<void>((resolve, reject) => {
         let timer: ReturnType<typeof setTimeout>;
@@ -1516,6 +1549,7 @@ export class TeleCryptIOStorage {
     const cleanupSignal = new AbortController().signal;
     let incomplete = false;
     let safeToForget = true;
+    const failures: unknown[] = [];
     try {
       await TeleCryptIOStorage.withTimeout(
         withMatrixMutationAbort(this.client, () => this.client.leave(roomId), cleanupSignal),
@@ -1526,6 +1560,7 @@ export class TeleCryptIOStorage {
     } catch (error) {
       if (!isGoneRoomError(error)) {
         incomplete = true;
+        failures.push(error);
         // A timed-out or failed leave may still be in flight. Do not race a
         // forget request against it; the caller must retry cleanup later.
         safeToForget = false;
@@ -1540,11 +1575,17 @@ export class TeleCryptIOStorage {
           cleanupSignal,
         );
       } catch (error) {
-        if (!isGoneRoomError(error)) incomplete = true;
+        if (!isGoneRoomError(error)) {
+          incomplete = true;
+          failures.push(error);
+        }
       }
     }
     if (incomplete) {
-      throw new RoomCleanupIncompleteError(roomId);
+      const cause = failures.length === 1
+        ? failures[0]
+        : new AggregateError(failures, "room cleanup failed");
+      throw new RoomCleanupIncompleteError(roomId, cause);
     }
   }
 
@@ -1600,7 +1641,7 @@ export class TeleCryptIOStorage {
       // non-validation failure follows the reconciliation path instead of a
       // retryable generic error that could orphan a second room.
       if (error instanceof RoomCreationAmbiguousError) throw error;
-      throw new RoomCreationAmbiguousError(operation);
+      throw new RoomCreationAmbiguousError(operation, error);
     });
     let roomId: string;
     try {
@@ -1608,21 +1649,21 @@ export class TeleCryptIOStorage {
         (response as unknown as { room_id?: unknown } | undefined)?.room_id,
         "room creation response",
       );
-    } catch {
-      throw new RoomCreationAmbiguousError(operation);
+    } catch (error) {
+      throw new RoomCreationAmbiguousError(operation, error);
     }
     try {
       return await this.waitForTreeSpace(roomId, operation, signal);
     } catch (error) {
       try {
         await this.cleanupCreatedRoom(roomId, signal);
-      } catch {
-        throwWithCleanupDetail(error, roomId);
+      } catch (cleanupError) {
+        throwWithCleanupDetail(error, roomId, cleanupError);
       }
       // The room existed even if cleanup happened to succeed. Keep the
       // caller on the reconciliation path: a retry based on a local timeout
       // or malformed response must never assume that no room was created.
-      throw new RoomCreationAmbiguousError(operation);
+      throw new RoomCreationAmbiguousError(operation, error);
     }
   }
 
@@ -1641,7 +1682,6 @@ export class TeleCryptIOStorage {
   async listTrees(signal?: AbortSignal): Promise<TreeSpace[]> {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     const rooms = this.client.getRooms();
-    if (rooms.length > MAX_MATRIX_JOINED_ROOMS) throw new StorageError("room list is too large");
     const trees: TreeSpace[] = [];
     for (const room of rooms) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
@@ -1733,6 +1773,7 @@ export class TeleCryptIOStorage {
         // signal, then report incomplete cleanup if they cannot be verified.
         const compensationSignal = new AbortController().signal;
         let rollbackIncomplete = false;
+        const cleanupFailures: unknown[] = [];
         // A sendStateEvent rejection is ambiguous: the homeserver may have
         // committed the event before the client observed a transport error.
         // Refresh the parent before probing even when no event ID was
@@ -1769,16 +1810,21 @@ export class TeleCryptIOStorage {
                 })
               ) {
                 rollbackIncomplete = true;
+                cleanupFailures.push(new Error("parent link rollback could not be verified"));
               }
             } else {
               await this.refreshRoomState(currentParent.id, { signal: compensationSignal });
               const removed = await this.removeChildLink(currentParent.id, tree.id, compensationSignal);
               // Without an event ID, a missing link after one refresh does not
               // prove that a request which timed out will never commit.
-              if (!removed) rollbackIncomplete = true;
+              if (!removed) {
+                rollbackIncomplete = true;
+                cleanupFailures.push(new Error("parent link rollback could not be verified"));
+              }
             }
-          } catch {
+          } catch (cleanupError) {
             rollbackIncomplete = true;
+            cleanupFailures.push(cleanupError);
           }
         }
         if (childLinkAttempted) {
@@ -1811,22 +1857,32 @@ export class TeleCryptIOStorage {
                 })
               ) {
                 rollbackIncomplete = true;
+                cleanupFailures.push(new Error("child link rollback could not be verified"));
               }
             } else {
               await this.refreshRoomState(tree.id, { signal: compensationSignal });
               const removed = await this.removeParentLink(tree.id, currentParent.id, compensationSignal);
-              if (!removed) rollbackIncomplete = true;
+              if (!removed) {
+                rollbackIncomplete = true;
+                cleanupFailures.push(new Error("child link rollback could not be verified"));
+              }
             }
-          } catch {
+          } catch (cleanupError) {
             rollbackIncomplete = true;
+            cleanupFailures.push(cleanupError);
           }
         }
         try {
           await this.cleanupCreatedRoom(tree.id, effectiveSignal);
-        } catch {
-          throwWithCleanupDetail(error, tree.id);
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
         }
-        if (rollbackIncomplete) throwWithCleanupDetail(error, tree.id);
+        if (rollbackIncomplete || cleanupFailures.length > 0) {
+          const cleanupCause = cleanupFailures.length === 1
+            ? cleanupFailures[0]
+            : new AggregateError(cleanupFailures, "tree creation cleanup failed");
+          throwWithCleanupDetail(error, tree.id, cleanupCause);
+        }
         throw error;
       }
     }, signal);
@@ -1965,15 +2021,15 @@ export class TeleCryptIOStorage {
       // this operation and create a duplicate file; only the explicit typed
       // mutation outcome is safe to propagate unchanged.
       if (error instanceof MutationOutcomeUnknownError) throw error;
-      throw new MutationOutcomeUnknownError("file upload");
+      throw new MutationOutcomeUnknownError("file upload", { cause: error });
     }
     if (signal?.aborted) throw new StorageError("operation cancelled");
     try {
       return validateMatrixEventId(response?.event_id, "file upload response event ID");
-    } catch {
+    } catch (error) {
       // An invalid response can still follow a committed event. Treat it as
       // unknown rather than presenting a retryable generic upload failure.
-      throw new MutationOutcomeUnknownError("file upload");
+      throw new MutationOutcomeUnknownError("file upload", { cause: error });
     }
   }
 
@@ -1985,28 +2041,39 @@ export class TeleCryptIOStorage {
     let info: Record<string, unknown> | undefined;
     try {
       ({ info } = await branch.getFileInfo());
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw new StorageError("operation cancelled");
+      if (error instanceof StorageError || error instanceof MatrixError) throw error;
       // matrix-js-sdk's MSC3089Branch.getFileInfo() reads `file["url"]` off
-      // the raw event content; when the event is undecryptable on this
-      // device it hands back a placeholder with no `file` block, so that
-      // read throws an opaque "Cannot read properties of undefined" instead
-      // of a useful error. Surface the real cause.
-      throw new UndecryptableFileError();
+      // the raw event content; an undecryptable m.file event is exposed as a
+      // placeholder with no `file` block. Translate only that structural
+      // shape and preserve every other SDK/transport failure unchanged.
+      let isPlaceholder = false;
+      try {
+        isPlaceholder = await isUndecryptableFilePlaceholder(branch);
+      } catch (placeholderError) {
+        throw new AggregateError(
+          [error, placeholderError],
+          "file metadata lookup and placeholder inspection both failed",
+          { cause: error },
+        );
+      }
+      if (isPlaceholder) {
+        throw new UndecryptableFileError();
+      }
+      throw error;
     }
     // Also reject an incomplete placeholder if matrix-js-sdk returns one.
     if (!info || typeof info.url !== "string") {
       throw new UndecryptableFileError();
     }
-    const declaredSize = info.size;
-    if (
-      declaredSize !== undefined &&
-      (typeof declaredSize !== "number" ||
-        !Number.isSafeInteger(declaredSize) ||
-        declaredSize < 0 ||
-        declaredSize > MAX_MEDIA_FILE_BYTES)
-    ) {
-      throw new FileTooLargeError();
-    }
+    // `info` is the encrypted attachment descriptor. Its shape is owned by
+    // matrix-encrypt-attachment and does not carry the plaintext size. The
+    // event's `info` block is the sole source of user-facing file metadata.
+    const eventMetadata = readFileEventMetadata((await branch.getFileEvent()).getContent());
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    const declaredSize = eventMetadata.size;
+    const mimetype = eventMetadata.mimetype ?? "application/octet-stream";
     const mxcUrl = info.url;
     const clientAny = this.client as unknown as {
       mxcUrlToHttp: (
@@ -2021,8 +2088,8 @@ export class TeleCryptIOStorage {
     let trustedOrigin: string;
     try {
       trustedOrigin = validateHomeserverUrl(clientAny.getHomeserverUrl()).origin;
-    } catch {
-      throw new Error("failed to build media URL");
+    } catch (error) {
+      throw new Error("failed to build media URL", { cause: error });
     }
     const downloadUrl = clientAny.mxcUrlToHttp(
       mxcUrl,
@@ -2038,8 +2105,8 @@ export class TeleCryptIOStorage {
     let currentUrl: URL;
     try {
       currentUrl = new URL(downloadUrl);
-    } catch {
-      throw new Error("failed to build media URL");
+    } catch (error) {
+      throw new Error("failed to build media URL", { cause: error });
     }
     if (
       (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") ||
@@ -2065,99 +2132,113 @@ export class TeleCryptIOStorage {
             headers: { Authorization: `Bearer ${accessToken}` },
           }),
           controller.signal,
-          () => undefined,
           () =>
             signal?.aborted
               ? new StorageError("operation cancelled")
               : new Error("media download timed out"),
         );
         if ([301, 302, 303, 307, 308].includes(res.status)) {
-          try {
-            void res.body?.cancel().catch(() => undefined);
-          } catch {
-            // The redirect response is already being rejected or discarded.
+          let redirectError: Error | undefined;
+          let nextUrl: URL | undefined;
+          if (redirect >= MAX_MEDIA_REDIRECTS) {
+            redirectError = new Error("media download redirect limit exceeded");
+          } else {
+            const location = res.headers.get("location");
+            if (!location) {
+              redirectError = new Error("media download redirect missing location");
+            } else {
+              try {
+                nextUrl = new URL(location, currentUrl);
+              } catch (error) {
+                redirectError = new Error("media download redirect is invalid", { cause: error });
+              }
+              if (
+                nextUrl &&
+                ((nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") ||
+                  nextUrl.username !== "" ||
+                  nextUrl.password !== "")
+              ) {
+                redirectError = new Error("media download redirect is invalid");
+              }
+              if (nextUrl && nextUrl.origin !== trustedOrigin) {
+                redirectError = new Error("media download redirect crossed origin");
+              }
+            }
           }
-          if (redirect >= MAX_MEDIA_REDIRECTS) throw new Error("media download redirect limit exceeded");
-          const location = res.headers.get("location");
-          if (!location) throw new Error("media download redirect missing location");
-          try {
-            currentUrl = new URL(location, currentUrl);
-          } catch {
-            throw new Error("media download redirect is invalid");
-          }
-          if (
-            (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") ||
-            currentUrl.username !== "" ||
-            currentUrl.password !== ""
-          ) {
-            throw new Error("media download redirect is invalid");
-          }
-          if (currentUrl.origin !== trustedOrigin) {
-            throw new Error("media download redirect crossed origin");
-          }
+          await cancelResponseBody(res, "media redirect", redirectError);
+          if (redirectError) throw redirectError;
+          currentUrl = nextUrl!;
           continue;
         }
         if (!res.ok) {
+          const statusFailure = new Error(`media download failed: ${res.status}`);
+          let detail = "";
           try {
-            void res.body?.cancel().catch(() => undefined);
-          } catch {
-            // The error response is already being rejected.
+            // Error responses are diagnostics, not product media. Consume the
+            // complete body so no provider detail is discarded, then apply
+            // the SDK's shared secret/control-character sanitizer before it
+            // crosses the SDK boundary.
+            const body = await readResponseBody(res, controller.signal);
+            detail = sanitizeDiagnosticText(new TextDecoder().decode(body.bytes));
+          } catch (bodyError) {
+            const partial =
+              bodyError instanceof ResponseBodyReadError
+                ? sanitizeDiagnosticText(new TextDecoder().decode(bodyError.bytes))
+                : "";
+            const readFailure =
+              bodyError instanceof ResponseBodyReadError
+                ? new Error(
+                    `media error response body could not be read${partial === "" ? "" : `: ${partial}`}`,
+                    { cause: bodyError.cause },
+                  )
+                : bodyError;
+            throw new AggregateError(
+              [statusFailure, readFailure],
+              "media download failed while reading the response body",
+              { cause: statusFailure },
+            );
           }
-          throw new Error(`media download failed: ${res.status}`);
+          throw new Error(`${statusFailure.message}${detail === "" ? "" : `: ${detail}`}`);
         }
         if (!res.body) {
-          // A bodyless Response has no bounded reader. Even a plausible
-          // Content-Length is only advisory and must not authorize an
-          // unbounded arrayBuffer() allocation.
-          throw new Error("media download has no bounded response body");
+          throw new Error("media download has no response body");
         }
-        const body = await readBoundedResponseBody(res, MAX_MEDIA_FILE_BYTES, controller.signal);
-        if (body.truncated) throw new FileTooLargeError();
+        const body = await readMediaResponseBody(res, MAX_MEDIA_FILE_BYTES, controller.signal);
         ciphertext = body.bytes.buffer;
         break;
       }
     } catch (error) {
-      if (signal?.aborted) throw new StorageError("operation cancelled");
-      if (controller.signal.aborted) throw new Error("media download timed out");
+      if (error instanceof AggregateError) {
+        if (signal?.aborted) throw new StorageError("operation cancelled", { cause: error });
+        if (controller.signal.aborted) throw new Error("media download timed out", { cause: error });
+        throw error;
+      }
+      if (error instanceof ResponseBodyReadError) {
+        throw new Error("media download failed", { cause: error.cause ?? new Error(error.message) });
+      }
+      if (signal?.aborted) throw new StorageError("operation cancelled", { cause: error });
+      if (controller.signal.aborted) throw new Error("media download timed out", { cause: error });
       if (error instanceof FileTooLargeError) throw error;
-      throw new Error("media download failed");
+      throw new Error("media download failed", { cause: error });
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abortExternal);
     }
     let data: ArrayBuffer;
     try {
-      // matrix-encrypt-attachment's supported AES-CTR v1/v2 formats are
-      // size-preserving: decryption allocates exactly the ciphertext length.
-      // The ciphertext reader above therefore bounds the allocation before
-      // entering the non-streaming third-party decryptor; the authenticated
-      // event size is also rejected before decryption when present.
-      if (ciphertext.byteLength > MAX_MEDIA_FILE_BYTES) throw new FileTooLargeError();
       data = await decryptAttachment(
         ciphertext,
         info as unknown as Parameters<typeof decryptAttachment>[1],
       );
     } catch (error) {
       if (error instanceof FileTooLargeError) throw error;
-      throw new Error("media decryption failed");
-    }
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    const eventContent = (await branch.getFileEvent()).getContent();
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    if (!isRecord(eventContent)) throw new Error("media metadata is invalid");
-    const infoBlock = isRecord(eventContent["info"])
-      ? eventContent["info"]
-      : undefined;
-    const mimetype =
-      typeof infoBlock?.["mimetype"] === "string"
-        ? infoBlock["mimetype"]
-        : "application/octet-stream";
-    try {
-      validateMimetype(mimetype);
-    } catch {
-      throw new Error("media metadata is invalid");
+      throw new Error("media decryption failed", { cause: error });
     }
     if (data.byteLength > MAX_MEDIA_FILE_BYTES) throw new FileTooLargeError();
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    if (declaredSize !== null && data.byteLength !== declaredSize) {
+      throw new StorageError("media metadata size does not match decrypted file");
+    }
     if (signal?.aborted) throw new StorageError("operation cancelled");
     return { data, mimetype };
   }

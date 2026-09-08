@@ -39,8 +39,8 @@ const vault = await core.createVault(storage, "Photos");
 await core.uploadFile(storage, vault.id, "cat.jpg", bytes, "image/jpeg");
 ```
 
-The recommended constructors configure the Matrix client with the SDK's bounded, manual-redirect
-transport and finite request deadline. The public `new TeleCryptIOStorage(client)` constructor is
+The recommended constructors configure the Matrix client with the SDK's manual-redirect transport
+and finite request deadline. The public `new TeleCryptIOStorage(client)` constructor is
 an advanced escape hatch: it does not rewrite matrix-js-sdk internals. Callers using it must build
 the client through matrix-js-sdk's supported `createClient` options (`fetchFn` and
 `localTimeoutMs`) and remain responsible for the safety of other Matrix SDK requests. SDK methods
@@ -55,7 +55,7 @@ provides no server-side room-creation idempotency key.
 
 The SDK owns the browser authorization-code PKCE context in `sessionStorage` and provides device-code,
 discovery, dynamic registration, identity confirmation, and refresh helpers. OAuth metadata, token
-scopes, Matrix user/device identities, redirects, and response bodies are validated and bounded before
+scopes, Matrix user/device identities, redirects, and complete response bodies are validated before
 they are returned. Network-bound helpers accept `AbortSignal` where cancellation is meaningful; token
 refresh uses a public client and persists the resulting token pair through the caller's callback.
 
@@ -118,6 +118,9 @@ npm run synapse:down
 ```
 
 Tests run against a real local Synapse/MAS fixture in Podman, never against a production server.
+Fixture setup and teardown propagate required Podman failures. During health polling only the
+transient probe chatter is quiet; a timeout emits complete container logs and reports any failure
+to retrieve them.
 
 See [RELEASING.md](./RELEASING.md) for the guarded npm release procedure.
 

@@ -45,25 +45,11 @@ jobs:
           set -euo pipefail
           test "$(node --version)" = "v24.20.0"
           test "$(npm --version)" = "11.19.0"
-      - name: Install and verify the SDK with bounded diagnostics
+      - name: Install and verify the SDK with complete diagnostics
         shell: bash
         run: |
           set -euo pipefail
-          bounded_command() {
-            local output="$1" seconds="$2" status error
-            shift 2
-            error="$output.err"
-            set +e
-            python3 scripts/bounded-command.py --stdout "$output" --stderr "$error" --max-stdout-bytes 524288 --max-stderr-bytes 524288 --timeout-seconds "$seconds" --kill-after-seconds 5 -- "$@"
-            status="$?"
-            set -e
-            test "$(wc -c <"$output")" -le 524288 -a "$(wc -c <"$error")" -le 524288
-            test "$status" = 0
-            test ! -s "$error"
-            ! grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$output" "$error"
-          }
-          bounded_command "$RUNNER_TEMP/npm-ci.out" 600 npm ci --ignore-scripts --no-fund --no-audit --loglevel=error
-          bounded_command "$RUNNER_TEMP/npm-lint.out" 300 npm run lint
-          bounded_command "$RUNNER_TEMP/npm-test-unit.out" 600 npm run test:unit
-          bounded_command "$RUNNER_TEMP/npm-build.out" 300 npm run build
-          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-bounded-command.py
+          timeout --signal=TERM --kill-after=5s 600s npm ci --ignore-scripts --no-fund --no-audit
+          timeout --signal=TERM --kill-after=5s 300s npm run lint
+          timeout --signal=TERM --kill-after=5s 600s npm run test:unit
+          timeout --signal=TERM --kill-after=5s 300s npm run build

@@ -1,3 +1,10 @@
+export class ConditionTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`timed out after ${timeoutMs}ms waiting for condition`);
+    this.name = "ConditionTimeoutError";
+  }
+}
+
 /**
  * A freshly-synced client doesn't always see a room/event the *instant* the
  * server has committed it — e.g. a room this same session just created can
@@ -16,7 +23,7 @@ export async function waitForCondition<T>(
   const intervalMs = opts?.intervalMs ?? 300;
   const deadline = Date.now() + timeoutMs;
   const timeoutError = (): Error =>
-    new Error(`timed out after ${timeoutMs}ms waiting for condition`);
+    new ConditionTimeoutError(timeoutMs);
 
   const abortError = (): Error => {
     const reason = opts?.signal?.reason;

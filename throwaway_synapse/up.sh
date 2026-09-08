@@ -51,14 +51,23 @@ esac
 
 if [[ "${1:-}" == "--fresh" ]]; then
   echo "==> --fresh: removing containers, network, volume, and data"
-  podman rm -f "$SYN" "$MAS" "$DB" "$PROXY" >/dev/null 2>&1 || true
-  podman volume rm -f "$PGVOL" >/dev/null 2>&1 || true
-  podman network rm "$NET" >/dev/null 2>&1 || true
+  podman_remove_container_if_present "$SYN"
+  podman_remove_container_if_present "$MAS"
+  podman_remove_container_if_present "$DB"
+  podman_remove_container_if_present "$PROXY"
+  podman_remove_volume_if_present "$PGVOL"
+  podman_remove_network_if_present "$NET"
   remove_fixture_data "--fresh" "$DATA"
 fi
 
 mkdir -p "$DATA/synapse" "$DATA/mas"
-podman network create "$NET" >/dev/null 2>&1 || true
+if podman_network_exists "$NET"; then
+  :
+else
+  network_status="$?"
+  if [[ "$network_status" != 1 ]]; then exit "$network_status"; fi
+  podman network create "$NET"
+fi
 
 # Shared secret Synapse and MAS use to authenticate requests to each other
 # (matrix_authentication_service.secret / matrix.secret). Generated once,
@@ -73,18 +82,23 @@ SHARED_SECRET="$(cat "$SECRET_FILE")"
 # ---------------------------------------------------------------------------
 # 1. Postgres (MAS's database — MAS does not support SQLite).
 # ---------------------------------------------------------------------------
-if ! podman container exists "$DB"; then
+if podman_container_exists "$DB"; then
+  DB_STATUS="$(podman inspect --format '{{.State.Status}}' "$DB")"
+  if [[ "$DB_STATUS" != "running" ]]; then
+    podman start "$DB"
+  fi
+else
+  db_exists_status="$?"
+  if [[ "$db_exists_status" != 1 ]]; then exit "$db_exists_status"; fi
   echo "==> starting postgres ($DB)"
   podman run -d --name "$DB" --network "$NET" \
     -e POSTGRES_USER=mas -e POSTGRES_PASSWORD=mas -e POSTGRES_DB=mas \
     -v "${PGVOL}:/var/lib/postgresql/data" \
-    "$PG_IMG" >/dev/null
-else
-  podman start "$DB" >/dev/null 2>&1 || true
+    "$PG_IMG"
 fi
 
-DB_STATUS="$(podman inspect --format '{{.State.Status}}' "$DB" 2>/dev/null || true)"
-DB_IP="$(podman inspect --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$DB" 2>/dev/null || true)"
+DB_STATUS="$(podman inspect --format '{{.State.Status}}' "$DB")"
+DB_IP="$(podman inspect --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$DB")"
 if [[ "$DB_STATUS" != "running" || ! "$DB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo "ERROR: PostgreSQL did not expose a running container with a valid IPv4 address" >&2
   exit 1
@@ -148,21 +162,21 @@ fi
 # 4. (Re)start MAS. `mas-cli server` runs pending DB migrations itself on
 #    startup — no separate migrate step needed.
 # ---------------------------------------------------------------------------
-podman rm -f "$MAS" >/dev/null 2>&1 || true
+podman_remove_container_if_present "$MAS"
 echo "==> starting MAS ($MAS)"
 podman run -d --name "$MAS" --network "$NET" \
   --add-host "$DB:$DB_IP" \
   -v "$DATA/mas:/data:Z" \
-  "$MAS_IMG" server -c /data/config.yaml >/dev/null
+  "$MAS_IMG" server -c /data/config.yaml
 
 # ---------------------------------------------------------------------------
 # 5. (Re)start Synapse.
 # ---------------------------------------------------------------------------
-podman rm -f "$SYN" >/dev/null 2>&1 || true
+podman_remove_container_if_present "$SYN"
 echo "==> starting Synapse ($SYN)"
 podman run -d --name "$SYN" --network "$NET" \
   -v "$DATA/synapse:/data:Z" \
-  "$SYN_IMG" >/dev/null
+  "$SYN_IMG"
 
 # ---------------------------------------------------------------------------
 # 6. (Re)start the Caddy front door on :8008 — the public "homeserver" URL
@@ -172,39 +186,78 @@ echo "==> validating front-door configuration"
 podman run --rm \
   -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro,Z" \
   --entrypoint caddy \
-  "$PROXY_IMG" validate --config /etc/caddy/Caddyfile >/dev/null
-podman rm -f "$PROXY" >/dev/null 2>&1 || true
+  "$PROXY_IMG" validate --config /etc/caddy/Caddyfile
+podman_remove_container_if_present "$PROXY"
 echo "==> starting front door ($PROXY) on :8008"
 podman run -d --name "$PROXY" --network "$NET" \
   -p 8008:8008 \
   -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro,Z" \
-  "$PROXY_IMG" >/dev/null
+  "$PROXY_IMG"
 
 # ---------------------------------------------------------------------------
 # 7. Wait for health.
+# Every probe's complete response/transport output is retained until the
+# readiness deadline. A timeout below reports that output and complete
+# container logs, including any diagnostic retrieval failure.
 # ---------------------------------------------------------------------------
+probe_diagnostics="$(mktemp)"
+probe_diagnostics_reported=false
+cleanup_probe_diagnostics() {
+  local status="$?"
+  if [[ "$status" != 0 && "$probe_diagnostics_reported" != true ]]; then
+    if ! cat -- "$probe_diagnostics" >&2; then
+      echo "ERROR: could not retrieve readiness probe diagnostics" >&2
+      status=1
+    fi
+  fi
+  if ! rm -f -- "$probe_diagnostics"; then
+    echo "ERROR: could not remove readiness probe diagnostics" >&2
+    status=1
+  fi
+  return "$status"
+}
+trap cleanup_probe_diagnostics EXIT
+
 echo -n "==> waiting for MAS"
 for i in $(seq 1 60); do
-  if curl -fsS -m2 "http://localhost:8008/auth/.well-known/openid-configuration" >/dev/null 2>&1; then
+  printf 'MAS readiness probe %s\n' "$i" >> "$probe_diagnostics"
+  if curl --silent --show-error --fail-with-body --max-time 2 \
+    "http://localhost:8008/auth/.well-known/openid-configuration" >> "$probe_diagnostics" 2>&1; then
+    printf 'MAS readiness probe %s succeeded\n' "$i" >> "$probe_diagnostics"
     echo " — ready"
     break
+  else
+    probe_status="$?"
+    printf 'MAS readiness probe %s failed (status %s)\n' "$i" "$probe_status" >> "$probe_diagnostics"
   fi
   echo -n "."
   sleep 1
   if [[ "$i" == 60 ]]; then
     echo ""
     echo "ERROR: MAS did not become ready in 60s. Logs:" >&2
-    podman logs --tail 60 "$MAS" >&2 || true
+    cat -- "$probe_diagnostics" >&2
+    probe_diagnostics_reported=true
+    podman_logs_status=0
+    podman logs "$MAS" >&2 || podman_logs_status="$?"
+    if [[ "$podman_logs_status" != 0 ]]; then
+      echo "ERROR: could not retrieve complete MAS diagnostics (status $podman_logs_status)" >&2
+    fi
     exit 1
   fi
 done
 
 echo -n "==> waiting for the front door (Synapse + MAS auth proxy)"
 for i in $(seq 1 60); do
-  if curl -fsS -m2 "http://localhost:8008/_matrix/client/versions" >/dev/null 2>&1; then
+  printf 'Front-door readiness probe %s\n' "$i" >> "$probe_diagnostics"
+  if curl --silent --show-error --fail-with-body --max-time 2 \
+    "http://localhost:8008/_matrix/client/versions" >> "$probe_diagnostics" 2>&1; then
+    printf 'Front-door readiness probe %s succeeded\n' "$i" >> "$probe_diagnostics"
     echo " — ready"
     echo "Homeserver (via front door) is up at http://localhost:8008"
     exit 0
+  else
+    probe_status="$?"
+    printf 'Front-door readiness probe %s failed (status %s)\n' "$i" "$probe_status" >> "$probe_diagnostics"
   fi
   echo -n "."
   sleep 1
@@ -212,6 +265,12 @@ done
 
 echo ""
 echo "ERROR: front door did not become ready in 60s. Logs:" >&2
-podman logs --tail 40 "$PROXY" >&2 || true
-podman logs --tail 40 "$SYN" >&2 || true
+cat -- "$probe_diagnostics" >&2
+probe_diagnostics_reported=true
+podman_logs_status=0
+if ! podman logs "$PROXY" >&2; then podman_logs_status=1; fi
+if ! podman logs "$SYN" >&2; then podman_logs_status=1; fi
+if [[ "$podman_logs_status" != 0 ]]; then
+  echo "ERROR: could not retrieve complete front-door diagnostics (status $podman_logs_status)" >&2
+fi
 exit 1

@@ -221,7 +221,7 @@ describe("authorization context replay and tamper protection", () => {
     });
   });
 
-  it("bounds an oversized authorization-code exchange response", async () => {
+  it("accepts a complete authorization-code exchange response without a response-size rejection", async () => {
     const storage = new MemoryStorage();
     const { state } = await beginForCallback(storage);
     const fetchMock = vi.fn().mockResolvedValue(
@@ -229,6 +229,10 @@ describe("authorization context replay and tamper protection", () => {
         JSON.stringify({
           token_type: "Bearer",
           access_token: "access-token",
+          refresh_token: "refresh-token",
+          scope:
+            "openid urn:matrix:org.matrix.msc2967.client:api:* " +
+            "urn:matrix:org.matrix.msc2967.client:device:CALLBACK123",
           padding: "x".repeat(40_000),
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -236,9 +240,9 @@ describe("authorization context replay and tamper protection", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
-      "OIDC authorization code exchange returned an oversized response",
-    );
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).resolves.toMatchObject({
+      oidcClientSettings: { clientId: "test-client" },
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ redirect: "manual" });
   });

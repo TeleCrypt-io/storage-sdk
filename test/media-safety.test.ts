@@ -8,7 +8,7 @@ vi.mock("matrix-encrypt-attachment", () => ({
 }));
 
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
-import { FileTooLargeError } from "../src/core/errors.js";
+import { FileTooLargeError, UndecryptableFileError } from "../src/core/errors.js";
 import { MAX_MEDIA_FILE_BYTES, validateCanonicalMatrixUserId } from "../src/core/constants.js";
 
 function branch() {
@@ -108,32 +108,78 @@ describe("media safety bounds", () => {
     expect(createFile).not.toHaveBeenCalled();
   });
 
-  it("rejects an oversized chunked encrypted response and cancels the reader", async () => {
-    const cancel = vi.fn().mockResolvedValue(undefined);
-    const reader = {
-      read: vi.fn().mockResolvedValue({
-        done: false,
-        value: new Uint8Array(MAX_MEDIA_FILE_BYTES + 1),
-      }),
-      cancel,
-      releaseLock: vi.fn(),
-    };
+  it("rejects a successful media response above the product size limit", async () => {
     const client = {
       getAccessToken: () => "access-token",
       getHomeserverUrl: () => "https://matrix.example.test",
       mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
     };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      body: { getReader: () => reader },
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Uint8Array([1]), {
+          status: 200,
+          headers: { "content-length": String(MAX_MEDIA_FILE_BYTES + 1) },
+        }),
+      ),
+    );
 
     await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toBeInstanceOf(
       FileTooLargeError,
     );
-    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a non-placeholder file-info failure", async () => {
+    const failure = new Error("media metadata transport unavailable");
+    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
+    file.getFileInfo = vi.fn().mockRejectedValue(failure);
+
+    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBe(failure);
+  });
+
+  it("translates only the undecryptable file placeholder shape", async () => {
+    const file = branch() as {
+      getFileInfo: ReturnType<typeof vi.fn>;
+      getFileEvent: ReturnType<typeof vi.fn>;
+    };
+    file.getFileInfo = vi.fn().mockRejectedValue(new TypeError("matrix file info failed"));
+    file.getFileEvent = vi.fn().mockResolvedValue({
+      getContent: () => ({ msgtype: "m.file", body: "secret.txt" }),
+    });
+
+    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBeInstanceOf(
+      UndecryptableFileError,
+    );
+  });
+
+  it("preserves file-info and placeholder inspection failures", async () => {
+    const infoFailure = new Error("matrix file info failed");
+    const eventFailure = new Error("matrix file event unavailable");
+    const file = branch() as {
+      getFileInfo: ReturnType<typeof vi.fn>;
+      getFileEvent: ReturnType<typeof vi.fn>;
+    };
+    file.getFileInfo = vi.fn().mockRejectedValue(infoFailure);
+    file.getFileEvent = vi.fn().mockRejectedValue(eventFailure);
+
+    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toMatchObject({
+      message: "file metadata lookup and placeholder inspection both failed",
+      cause: infoFailure,
+      errors: [infoFailure, eventFailure],
+    });
+  });
+
+  it("preserves caller cancellation while file info fails", async () => {
+    const controller = new AbortController();
+    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
+    file.getFileInfo = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      throw new Error("file info request cancelled");
+    });
+
+    await expect(
+      new TeleCryptIOStorage({} as never).downloadFile(file as never, controller.signal),
+    ).rejects.toThrow("operation cancelled");
   });
 
   it("rejects a bodyless media response without calling unbounded arrayBuffer", async () => {
@@ -177,6 +223,32 @@ describe("media safety bounds", () => {
       headers: { Authorization: "Bearer access-token" },
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a media response failure with body cleanup failure", async () => {
+    const cleanupError = new Error("media cleanup failed");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+      body: { cancel: vi.fn().mockRejectedValue(cleanupError) },
+    } as unknown as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    const client = {
+      getAccessToken: () => "access-token",
+      getHomeserverUrl: () => "https://matrix.example.test",
+      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
+    };
+
+    let caught: unknown;
+    try {
+      await new TeleCryptIOStorage(client as never).downloadFile(branch());
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors[0]).toMatchObject({ message: "media download failed: 503" });
+    expect((caught as AggregateError).errors[1]).toBe(cleanupError);
   });
 
   it("does not mutate an advanced client's transport configuration", () => {
@@ -262,6 +334,45 @@ describe("media safety bounds", () => {
     await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toThrow(
       "media metadata is invalid",
     );
+  });
+
+  it("rejects decrypted bytes whose event size metadata does not match", async () => {
+    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
+    file.getFileEvent = vi.fn().mockResolvedValue({
+      getContent: () => ({ info: { mimetype: "text/plain", size: 2 } }),
+    });
+    const client = {
+      getAccessToken: () => "access-token",
+      getHomeserverUrl: () => "https://matrix.example.test",
+      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Uint8Array([1]), { status: 200, headers: { "content-length": "1" } }),
+      ),
+    );
+
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toThrow(
+      "media metadata size does not match decrypted file",
+    );
+  });
+
+  it("rejects an event size declaration above the media limit", async () => {
+    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
+    file.getFileEvent = vi.fn().mockResolvedValue({
+      getContent: () => ({ info: { mimetype: "text/plain", size: MAX_MEDIA_FILE_BYTES + 1 } }),
+    });
+    const client = {
+      getAccessToken: () => "access-token",
+      getHomeserverUrl: () => "https://matrix.example.test",
+      mxcUrlToHttp: vi.fn(),
+    };
+
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toBeInstanceOf(
+      FileTooLargeError,
+    );
+    expect(client.mxcUrlToHttp).not.toHaveBeenCalled();
   });
 
   it("checks cancellation after the file event metadata read", async () => {

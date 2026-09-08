@@ -171,11 +171,11 @@ describe("npm provenance verifier", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("uses bounded JSON inputs rather than reading an unbounded stream", () => {
+  it("reports malformed complete JSON instead of rejecting by response size", () => {
     const fixture = makeFixture();
     fixture.distRaw = `${JSON.stringify(fixture.dist)}${"x".repeat(131_072)}`;
     const result = run(fixture);
     expect(result.ok).toBe(false);
-    expect(String(result.error)).toContain("bounded JSON input");
+    expect(String(result.error)).toContain("not valid JSON");
   });
 });

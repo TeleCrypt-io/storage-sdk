@@ -31,14 +31,25 @@ case "${1:-}" in
 esac
 
 for name in "$PROXY" "$SYN" "$MAS" "$DB"; do
-  podman rm -f "$name" >/dev/null 2>&1 && echo "==> removed $name" || echo "==> $name was not running"
+  if podman_container_exists "$name"; then
+    podman rm -f "$name"
+    echo "==> removed $name"
+  else
+    status="$?"
+    if [[ "$status" != 1 ]]; then exit "$status"; fi
+    echo "==> $name was not running"
+  fi
 done
-if podman network rm "$NET" >/dev/null 2>&1; then
+if podman_network_exists "$NET"; then
+  podman network rm "$NET"
   echo "==> removed network $NET"
+else
+  status="$?"
+  if [[ "$status" != 1 ]]; then exit "$status"; fi
 fi
 
 if [[ "${1:-}" == "--wipe" ]]; then
-  podman volume rm -f "$PGVOL" >/dev/null 2>&1 || true
+  podman_remove_volume_if_present "$PGVOL"
   remove_fixture_data "--wipe" "$DATA"
   echo "==> wiped ./data and Postgres volume"
 fi

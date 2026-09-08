@@ -12,6 +12,7 @@
  */
 import {
   FileBranch,
+  readFileEventMetadata,
   TeleCryptIOStorage,
   TreeSpace,
   withMatrixMutationAbort,
@@ -38,9 +39,8 @@ import {
   RoomCreationAmbiguousError,
   RoomCleanupIncompleteError,
   StorageError,
-  UndecryptableFileError,
 } from "./errors.js";
-import { waitForCondition } from "./poll.js";
+import { ConditionTimeoutError, waitForCondition } from "./poll.js";
 import { validateMatrixEventId } from "./constants.js";
 import { validateName } from "./validation.js";
 import {
@@ -83,14 +83,12 @@ export interface OperationOptions {
  * server-advised backoff. Mirrors the harness library suite's
  * `withRateLimitRetry`; must not mask non-rate-limit failures.
  */
-const RATE_LIMIT_RETRIES = 6;
 const RATE_LIMIT_DEFAULT_DELAY_MS = 15_000;
-const RATE_LIMIT_MAX_DELAY_MS = 30_000;
-const RATE_LIMIT_MAX_TOTAL_DELAY_MS = 90_000;
+// JavaScript timers cannot represent a longer delay reliably. The operation's
+// own deadline remains the authority that stops retrying.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_DELETION_ROOMS = 4096;
 const MAX_DELETION_DEPTH = 128;
-const MAX_FILE_VERSION_CHAIN = 128;
-const MAX_LIST_ITEMS = 10000;
 const DEFAULT_MUTATION_TIMEOUT_MS = 5 * 60_000;
 const MAX_MUTATION_TIMEOUT_MS = 15 * 60_000;
 
@@ -146,7 +144,6 @@ async function raceOperationDeadline<T>(
     return await Promise.race([pending, abort]);
   } finally {
     if (onAbort) deadline.signal.removeEventListener("abort", onAbort);
-    void pending.catch(() => undefined);
   }
 }
 
@@ -156,17 +153,12 @@ async function withOperationDeadline<T>(
   kind: OperationKind = "read",
 ): Promise<T> {
   const deadline = createOperationDeadline(options);
-  let pending: Promise<T> | undefined;
   try {
     ensureOperationActive(deadline.signal);
-    pending = Promise.resolve().then(() => operation(deadline.signal));
+    const pending = Promise.resolve().then(() => operation(deadline.signal));
     return await raceOperationDeadline(deadline, pending, kind);
   } finally {
     deadline.close();
-    // A caller-facing deadline must not wait for a broken provider, but the
-    // late result remains observed so an ignored AbortSignal cannot create an
-    // unhandled rejection.
-    if (pending) void pending.catch(() => undefined);
   }
 }
 
@@ -177,17 +169,32 @@ function isRateLimited(error: unknown): boolean {
   return typeof isRateLimitError === "function" && isRateLimitError.call(error) === true;
 }
 
+function requiresMutationReconciliation(error: unknown): boolean {
+  return (
+    error instanceof MutationOutcomeUnknownError ||
+    error instanceof RoomCreationAmbiguousError ||
+    error instanceof RoomCleanupIncompleteError ||
+    (error instanceof Error &&
+      (error as Error & { cleanupIncomplete?: unknown }).cleanupIncomplete === true)
+  );
+}
+
 async function withRateLimitRetry<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  let totalDelay = 0;
-  for (let attempt = 0; ; attempt++) {
+  for (;;) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     try {
       return await operation();
     } catch (error) {
-      if (!isRateLimited(error) || attempt >= RATE_LIMIT_RETRIES) throw error;
+      // A mutation that may have committed, or whose compensating cleanup is
+      // incomplete, must be reconciled by its owner before any retry. A
+      // server rate-limit response does not make repeating room creation safe.
+      if (requiresMutationReconciliation(error)) {
+        throw error;
+      }
+      if (!isRateLimited(error)) throw error;
       // The server's retry_after_ms only covers one token; tree operations
       // need several (kick + leave + forget). Wait at least 15s so the
       // burst refills.
@@ -201,11 +208,7 @@ async function withRateLimitRetry<T>(
           }
         }
       }
-      retryAfter = Math.min(retryAfter, RATE_LIMIT_MAX_DELAY_MS);
-      const remaining = RATE_LIMIT_MAX_TOTAL_DELAY_MS - totalDelay;
-      if (remaining <= 0) throw error;
-      retryAfter = Math.min(retryAfter, remaining);
-      totalDelay += retryAfter;
+      retryAfter = Math.min(retryAfter, MAX_TIMER_DELAY_MS);
       await new Promise<void>((resolve, reject) => {
         let timer: ReturnType<typeof setTimeout>;
         const onAbort = (): void => {
@@ -241,9 +244,10 @@ async function resolveTree(
       timeoutMs: 15000,
       signal,
     });
-  } catch {
+  } catch (error) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
-    throw new StorageError("storage space not found");
+    if (error instanceof ConditionTimeoutError) throw new StorageError("storage space not found");
+    throw new StorageError("storage space lookup failed", { cause: error });
   }
 }
 
@@ -279,9 +283,10 @@ async function resolveFile(
       () => (isMarkedFileDeleted(storage, tree.id, fileId) ? null : tree.getFile(fileId)),
       { timeoutMs: 15000, signal },
     );
-  } catch {
+  } catch (error) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
-    throw new StorageError("file not found");
+    if (error instanceof ConditionTimeoutError) throw new StorageError("file not found");
+    throw new StorageError("file lookup failed", { cause: error });
   }
 }
 
@@ -305,8 +310,8 @@ function snapshotTreeSpaces(
     let children: TreeSpace[];
     try {
       children = tree.getDirectories();
-    } catch {
-      throw new StorageError("could not enumerate storage space descendants safely");
+    } catch (error) {
+      throw new StorageError("could not enumerate storage space descendants safely", { cause: error });
     }
     if (children.length > MAX_DELETION_ROOMS) {
       throw new StorageError(tooLargeMessage);
@@ -337,8 +342,8 @@ function assertTreeEmptyForDeletion(
           !isMarkedFileDeleted(storage, tree.id, file.id) &&
           !isConfirmedDeletedFile(storage.getClient(), tree.id, file),
       );
-  } catch {
-    throw new StorageError("could not enumerate storage files safely");
+  } catch (error) {
+    throw new StorageError("could not enumerate storage files safely", { cause: error });
   }
   if (files.length > 0) throw new NonEmptyTreeError(tree.id);
 }
@@ -481,8 +486,8 @@ function validateDeletionGraph(
     let directories: TreeSpace[];
     try {
       directories = tree.getDirectories();
-    } catch {
-      throw new StorageError("delete graph is unsafe");
+    } catch (error) {
+      throw new StorageError("delete graph is unsafe", { cause: error });
     }
     for (const child of directories) addEdge(id, child.id);
 
@@ -591,8 +596,14 @@ async function unlinkExternalParents(
     // for a successful delete.
     try {
       await relinkExternalParents(storage, rootId, externalParents, new AbortController().signal);
-    } catch {
-      throw new StorageError("delete graph unlink cleanup is incomplete");
+    } catch (cleanupError) {
+      throw new StorageError("delete graph unlink cleanup is incomplete", {
+        cause: new AggregateError(
+          [error, cleanupError],
+          "delete graph unlink and relink both failed",
+          { cause: error },
+        ),
+      });
     }
     throw error;
   }
@@ -708,7 +719,7 @@ async function deleteRoomDeterministically(
   } catch (error) {
     if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
     if (completedRoomIds.length > 0) {
-      throw new MutationPartialError("delete", completedRoomIds, "room cleanup stopped");
+      throw new MutationPartialError("delete", completedRoomIds, "room cleanup stopped", { cause: error });
     }
     throw error;
   }
@@ -720,13 +731,7 @@ async function deleteRoomDeterministically(
  * may otherwise leave a stale invite visible until the next sync.
  */
 function removeRoomFromLocalStore(client: MatrixClient, roomId: string): void {
-  try {
-    client.store?.removeRoom(roomId);
-  } catch {
-    // Server-side leave/forget already completed; a store implementation that
-    // cannot evict synchronously must not turn authoritative cleanup into a
-    // false failure.
-  }
+  client.store?.removeRoom(roomId);
 }
 
 function isActiveMembership(membership: string): boolean {
@@ -739,11 +744,10 @@ function isRevocableMembership(membership: string | null): boolean {
 
 function safePartialDetail(error: unknown): string | undefined {
   // Provider/Matrix errors can contain response bodies, URLs, or credentials.
-  // StorageError messages are authored by this package and are already
-  // bounded; retain those local policy details so callers still get useful
-  // owner/self-target diagnostics.
+  // StorageError messages are authored by this package; retain those local
+  // policy details so callers still get useful owner/self-target diagnostics.
   if (!(error instanceof StorageError) || error instanceof MutationOutcomeUnknownError) return undefined;
-  return error.message.length <= 256 ? error.message : undefined;
+  return error.message;
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -760,17 +764,11 @@ export async function createVault(
     try {
       tree = await withRateLimitRetry(() => storage.createTree(name, signal), signal);
     } catch (error) {
-      if (
-        error instanceof RoomCleanupIncompleteError ||
-        error instanceof RoomCreationAmbiguousError ||
-        error instanceof MutationOutcomeUnknownError ||
-        (error instanceof Error &&
-          (error as Error & { cleanupIncomplete?: unknown }).cleanupIncomplete === true)
-      ) {
+      if (requiresMutationReconciliation(error)) {
         throw error;
       }
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("create vault failed");
+      throw new StorageError("create vault failed", { cause: error });
     }
     ensureOperationActive(signal);
     return { id: tree.id, name };
@@ -814,7 +812,7 @@ export async function joinVault(
       if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
         membership = null;
       } else {
-        throw new StorageError("join failed");
+        throw new StorageError("join failed", { cause: err });
       }
     }
     if (membership === "join") return { vaultId, joined: true };
@@ -830,7 +828,7 @@ export async function joinVault(
         if (afterForbidden === "join") return { vaultId, joined: true };
       }
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("join failed");
+      throw new StorageError("join failed", { cause: err });
     }
     ensureOperationActive(signal);
     return { vaultId, joined: true };
@@ -886,7 +884,6 @@ export async function listPendingInvites(
   return withOperationDeadline(options, async (signal) => {
     const client = storage.getClient();
     const rooms = client.getRooms();
-    if (rooms.length > MAX_LIST_ITEMS) throw new StorageError("invite list is too large");
     const invites: VaultInfo[] = [];
 
     for (const room of rooms) {
@@ -1012,7 +1009,7 @@ export async function declineInvite(
       // clean decline.
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("decline failed");
+      throw new StorageError("decline failed", { cause: error });
     }
     ensureOperationActive(signal);
     return { vaultId, declined: true };
@@ -1105,6 +1102,7 @@ export async function shareVault(
             "share",
             [...completedRoomIds],
             safePartialDetail(error),
+            { cause: error },
           );
         }
         if (
@@ -1116,7 +1114,7 @@ export async function shareVault(
         ) {
           throw error;
         }
-        throw new StorageError("share failed");
+        throw new StorageError("share failed", { cause: error });
       }
       return { vaultId, userId, role };
     }, operation.signal);
@@ -1194,6 +1192,7 @@ export async function unshareVault(
             "unshare",
             [...completedRoomIds],
             safePartialDetail(error),
+            { cause: error },
           );
         }
         if (
@@ -1204,7 +1203,7 @@ export async function unshareVault(
         ) {
           throw error;
         }
-        throw new StorageError("unshare failed");
+        throw new StorageError("unshare failed", { cause: error });
       }
       return { vaultId, userId, removed: true };
     }, operation.signal);
@@ -1223,9 +1222,9 @@ export async function listMembers(
     const tree = await resolveTree(storage, vaultId, signal);
     try {
       return await withRateLimitRetry(() => storage.listMembers(tree, { signal }), signal);
-    } catch {
+    } catch (error) {
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("list members failed");
+      throw new StorageError("list members failed", { cause: error });
     }
   });
 }
@@ -1243,12 +1242,10 @@ export async function listFiles(
       const files = tree
         .listFiles()
         .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
-      if (files.length > MAX_LIST_ITEMS) throw new StorageError("file list is too large");
       return files.map((f) => ({ id: f.id, name: f.getName() }));
     } catch (error) {
       if (signal.aborted) throw new StorageError("operation cancelled");
-      if (error instanceof StorageError && error.message === "file list is too large") throw error;
-      throw new StorageError("list files failed");
+      throw new StorageError("list files failed", { cause: error });
     }
   });
 }
@@ -1266,7 +1263,6 @@ export async function listSubfolders(
     const directories = tree
       .getDirectories()
       .filter((directory) => !isMarkedTreeDeleted(storage, directory.id));
-    if (directories.length > MAX_LIST_ITEMS) throw new StorageError("folder list is too large");
     return directories.map((d) => ({ id: d.id, name: d.room.name }));
   });
 }
@@ -1284,17 +1280,11 @@ export async function createSubfolder(
     try {
       sub = await withRateLimitRetry(() => storage.createSubtree(tree, name, signal), signal);
     } catch (error) {
-      if (
-        error instanceof RoomCleanupIncompleteError ||
-        error instanceof RoomCreationAmbiguousError ||
-        error instanceof MutationOutcomeUnknownError ||
-        (error instanceof Error &&
-          (error as Error & { cleanupIncomplete?: unknown }).cleanupIncomplete === true)
-      ) {
+      if (requiresMutationReconciliation(error)) {
         throw error;
       }
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("create folder failed");
+      throw new StorageError("create folder failed", { cause: error });
     }
     ensureOperationActive(signal);
     return { id: sub.id, name };
@@ -1321,11 +1311,7 @@ async function renameTree(
           ensureOperationActive(signal);
           const current = storage.getTree(treeId);
           if (current?.room.name === name) return current;
-          try {
-            await storage.refreshRoomState(treeId, { signal });
-          } catch {
-            return null;
-          }
+          await storage.refreshRoomState(treeId, { signal });
           const refreshed = storage.getTree(treeId);
           return refreshed?.room.name === name ? refreshed : null;
         },
@@ -1334,7 +1320,7 @@ async function renameTree(
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("rename failed");
+      throw new StorageError("rename failed", { cause: error });
     }
     return { id: treeId, name };
   }, "mutation");
@@ -1404,7 +1390,7 @@ async function deleteTree(
           error instanceof NonEmptyTreeError
         ) throw error;
         if (error instanceof StorageError) throw error;
-        throw new StorageError("delete failed");
+        throw new StorageError("delete failed", { cause: error });
       }
 
       // Keep external parent links intact until the room deletion succeeds.
@@ -1418,7 +1404,7 @@ async function deleteTree(
           throw error;
         }
         if (error instanceof StorageError) throw error;
-        throw new StorageError("delete failed");
+        throw new StorageError("delete failed", { cause: error });
       }
       try {
         await deleteRoomDeterministically(storage, tree.id, operation.signal);
@@ -1428,13 +1414,19 @@ async function deleteTree(
         // vault would be silently detached from its external parent.
         try {
           await relinkExternalParents(storage, tree.id, graph.externalParents, new AbortController().signal);
-        } catch {
-          throw new StorageError("delete cleanup is incomplete");
+        } catch (cleanupError) {
+          throw new StorageError("delete cleanup is incomplete", {
+            cause: new AggregateError(
+              [error, cleanupError],
+              "delete and external-parent relink both failed",
+              { cause: error },
+            ),
+          });
         }
         if (error instanceof MutationOutcomeUnknownError) throw error;
         if (error instanceof MutationPartialError) throw error;
         if (error instanceof StorageError) throw error;
-        throw new StorageError("delete failed");
+        throw new StorageError("delete failed", { cause: error });
       }
       return { id: treeId, deleted: true };
     }, operation.signal);
@@ -1493,7 +1485,7 @@ export async function renameFile(
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("rename file failed");
+      throw new StorageError("rename file failed", { cause: error });
     }
     return { id: fileId, name };
   }, "mutation");
@@ -1530,11 +1522,11 @@ async function resolveFileVersions(
   let history: FileBranch[];
   try {
     history = await branch.getVersionHistory();
-  } catch {
-    throw new StorageError("could not resolve file version history safely");
+  } catch (error) {
+    throw new StorageError("could not resolve file version history safely", { cause: error });
   }
-  if (!Array.isArray(history) || history.length === 0 || history.length > MAX_FILE_VERSION_CHAIN) {
-    throw new StorageError("file version history is invalid or too large");
+  if (!Array.isArray(history) || history.length === 0) {
+    throw new StorageError("file version history is invalid");
   }
 
   const eventIds = new Set<string>();
@@ -1547,8 +1539,8 @@ async function resolveFileVersions(
     }
     try {
       validateMatrixEventId(version.id, "file version event ID");
-    } catch {
-      throw new StorageError("file version history contains an invalid event ID");
+    } catch (error) {
+      throw new StorageError("file version history contains an invalid event ID", { cause: error });
     }
     if (eventIds.has(version.id)) {
       throw new StorageError("file version history contains a cycle");
@@ -1558,17 +1550,14 @@ async function resolveFileVersions(
     let fileInfo: Awaited<ReturnType<FileBranch["getFileInfo"]>>;
     try {
       fileInfo = await version.getFileInfo();
-    } catch {
-      throw new StorageError("could not resolve encrypted file version safely");
+    } catch (error) {
+      throw new StorageError("could not resolve encrypted file version safely", { cause: error });
     }
     const mediaId = fileInfo?.info?.url;
     if (typeof mediaId !== "string" || mediaId.length === 0) {
       throw new StorageError("encrypted file version has no media identifier");
     }
     mediaIds.add(mediaId);
-    if (mediaIds.size > MAX_FILE_VERSION_CHAIN) {
-      throw new StorageError("file media version history is too large");
-    }
     versions.push({ branch: version, mediaId });
   }
   return versions;
@@ -1610,7 +1599,7 @@ async function deleteFileMedia(
   } catch (error) {
     if (error instanceof MutationOutcomeUnknownError) throw error;
     if (signal?.aborted) throw new StorageError("operation cancelled");
-    throw new StorageError("delete file media failed");
+    throw new StorageError("delete file media failed", { cause: error });
   }
 }
 
@@ -1661,12 +1650,14 @@ export async function deleteFile(
           "delete file",
           completedIds,
           "media was deleted but Matrix event cleanup was cancelled",
+          { cause: error },
         );
       }
       throw new MutationPartialError(
         "delete file",
         completedIds,
         "media was deleted but Matrix event cleanup stopped",
+        { cause: error },
       );
     }
     try {
@@ -1682,7 +1673,7 @@ export async function deleteFile(
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       const detail = "Matrix deletion completed but the inactive file state could not be verified";
-      throw new MutationPartialError("delete file", completedIds, detail);
+      throw new MutationPartialError("delete file", completedIds, detail, { cause: error });
     }
     for (const { branch: version } of versions) {
       markFileDeleted(storage.getClient(), tree.id, version.id);
@@ -1709,7 +1700,7 @@ export async function uploadFile(
       if (error instanceof FileTooLargeError) throw error;
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("upload failed");
+      throw new StorageError("upload failed", { cause: error });
     });
     // The create-file request is acknowledged before the event necessarily
     // arrives in this client's sync timeline. A caller can otherwise report a
@@ -1733,6 +1724,7 @@ export async function uploadFile(
         "upload file",
         [fileId],
         "upload completed but the file could not be observed locally",
+        { cause: error },
       );
     }
     ensureOperationActive(signal);
@@ -1753,9 +1745,9 @@ export async function downloadFile(
     try {
       result = await storage.downloadFile(branch, signal);
     } catch (error) {
-      if (error instanceof UndecryptableFileError) throw error;
+      if (error instanceof StorageError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("download failed");
+      throw new StorageError("download failed", { cause: error });
     }
     ensureOperationActive(signal);
     return {
@@ -1806,34 +1798,16 @@ export async function getFileDetails(
 
     try {
       ensureOperationActive(signal);
-      const { info } = await branch.getFileInfo();
-      if (info) {
-        if (typeof info["mimetype"] === "string") mimetype = info["mimetype"];
-        if (typeof info["size"] === "number") size = info["size"];
-      }
-    } catch {
-      if (signal.aborted) throw new StorageError("operation cancelled");
-      // Partial metadata is fine — UI shows "—" for unknown fields.
-    }
-
-    try {
-      ensureOperationActive(signal);
       const event = await branch.getFileEvent();
-      const content = event.getContent();
-      const infoBlock = content["info"] as Record<string, unknown> | undefined;
-      if (!mimetype && typeof infoBlock?.["mimetype"] === "string") {
-        mimetype = infoBlock["mimetype"];
-      }
-      if (size == null && typeof infoBlock?.["size"] === "number") {
-        size = infoBlock["size"];
-      }
-      const eventAny = event as { getTs?: () => number; origin_server_ts?: number };
-      const ts = eventAny.getTs?.() ?? eventAny.origin_server_ts;
-      createdAt = tsToIso(ts);
+      const metadata = readFileEventMetadata(event.getContent());
+      mimetype = metadata.mimetype;
+      size = metadata.size;
+      createdAt = tsToIso(event.getTs());
       updatedAt = createdAt;
-    } catch {
+    } catch (error) {
       if (signal.aborted) throw new StorageError("operation cancelled");
-      // Same as above.
+      if (error instanceof StorageError) throw error;
+      throw new StorageError("get file details failed", { cause: error });
     }
 
     ensureOperationActive(signal);
@@ -1858,8 +1832,8 @@ async function getTreeDetails(
     createdAt = tsToIso(createEvent?.getTs());
     try {
       memberCount = room.getJoinedMemberCount();
-    } catch {
-      memberCount = null;
+    } catch (error) {
+      throw new StorageError("member count lookup failed", { cause: error });
     }
   }
 

@@ -3,7 +3,6 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
-const MAX_JSON_BYTES = 131_072;
 const MAX_ARCHIVE_BYTES = 134_217_728;
 const NPM_REGISTRY = "https://registry.npmjs.org";
 const NPM_PUBLISH_PREDICATE = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1";
@@ -40,7 +39,7 @@ function readJson(path, label) {
   } catch (error) {
     fail(`${label} cannot be read: ${error.message}`);
   }
-  if (!stat.isFile() || stat.size > MAX_JSON_BYTES) fail(`${label} exceeds the bounded JSON input`);
+  if (!stat.isFile()) fail(`${label} is not a regular file`);
   try {
     return JSON.parse(fs.readFileSync(path, "utf8"));
   } catch (error) {
