@@ -12,6 +12,9 @@ supports Trusted Publishing without a second mutable toolchain installation.
 Dependency installation is always exact-lock and lifecycle-disabled, with funding and audit network
 calls disabled; changing either Node or npm toolchain requires a fresh release-workflow verification.
 
+This document covers SDK publication only. Follow the private [Harness operator workflow](https://github.com/TeleCrypt-io/Harness/blob/main/docs/release.md#required-stage-first-sequence)
+for the canonical development, acceptance, failure-handling, and production boundaries.
+
 Before the first release, an operator must enable and verify the repository's GitHub **immutable
 releases** setting. The Actions token cannot read or change that repository setting, so the
 workflow cannot perform this preflight; it fails closed later unless the resulting Release reports

@@ -111,16 +111,23 @@ Synapse without that extension cannot provide the SDK deletion contract.
 
 ```bash
 npm ci --ignore-scripts --no-fund --no-audit
+npm run test:unit      # unit-only checks; does not start Podman
 npm run synapse:up     # disposable local Synapse/MAS fixture
-npm test
-npm run synapse:down
-# For a complete reset, use ./throwaway_synapse/down.sh --wipe.
+npm test               # full SDK suite, including fixture-backed functional tests
 ```
 
-Tests run against a real local Synapse/MAS fixture in Podman, never against a production server.
-Fixture setup and teardown propagate required Podman failures. During health polling only the
-transient probe chatter is quiet; a timeout emits complete container logs and reports any failure
-to retrieve them.
+The full suite uses the real local Synapse/MAS/Postgres fixture in Podman at `localhost:8008`, never
+a production server. This is the shared fixture for the SDK, CLI, and Web functional/e2e suites;
+start it from this checkout and reuse it for the sibling repositories. Unit tests may use mocks for
+isolated boundaries, but they do not replace the real-stack checks.
+
+If setup or tests fail, preserve the fixture and its diagnostics; do not run
+`npm run synapse:down` before the private Harness investigation is complete. The fixture scripts do
+not provide that workflow; follow the [Harness operator workflow](https://github.com/TeleCrypt-io/Harness/blob/main/docs/release.md#required-stage-first-sequence)
+for the canonical ordering and stopping boundary.
+
+After a successful run, use `npm run synapse:down` for scoped teardown. Use
+`./throwaway_synapse/down.sh --wipe` only when a complete fixture reset is explicitly required.
 
 See [RELEASING.md](./RELEASING.md) for the guarded npm release procedure.
 
