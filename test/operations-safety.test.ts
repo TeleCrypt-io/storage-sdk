@@ -30,7 +30,12 @@ import {
   shareVault,
   unshareVault,
 } from "../src/core/operations.js";
-import { MutationPartialError, RoomCleanupIncompleteError, UndecryptableFileError } from "../src/core/errors.js";
+import {
+  MutationOutcomeUnknownError,
+  MutationPartialError,
+  RoomCleanupIncompleteError,
+  UndecryptableFileError,
+} from "../src/core/errors.js";
 import { waitForCondition } from "../src/core/poll.js";
 import { isFileDeleted, isTreeDeleted } from "../src/deletion-markers.js";
 
@@ -907,7 +912,7 @@ describe("operation safety", () => {
       const pending = joinVault(storage, "!limited:example.test", { timeoutMs: 60_000 });
       await vi.advanceTimersByTimeAsync(0);
       expect(setTimeoutSpy.mock.calls.some((call) => call[1] === expectedDelay)).toBe(true);
-      const assertion = expect(pending).rejects.toThrow("operation cancelled");
+      const assertion = expect(pending).rejects.toBeInstanceOf(MutationOutcomeUnknownError);
       await vi.advanceTimersByTimeAsync(60_000);
       await assertion;
     } finally {

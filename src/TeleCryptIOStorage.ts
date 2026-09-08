@@ -2189,7 +2189,7 @@ export class TeleCryptIOStorage {
               bodyError instanceof ResponseBodyReadError
                 ? new Error(
                     `media error response body could not be read${partial === "" ? "" : `: ${partial}`}`,
-                    { cause: bodyError.cause },
+                    { cause: bodyError },
                   )
                 : bodyError;
             throw new AggregateError(

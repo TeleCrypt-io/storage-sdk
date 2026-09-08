@@ -10,6 +10,7 @@ vi.mock("matrix-encrypt-attachment", () => ({
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { FileTooLargeError, UndecryptableFileError } from "../src/core/errors.js";
 import { MAX_MEDIA_FILE_BYTES, validateCanonicalMatrixUserId } from "../src/core/constants.js";
+import { ResponseBodyReadError } from "../src/core/http.js";
 
 function branch() {
   return {
@@ -248,7 +249,11 @@ describe("media safety bounds", () => {
     }
     expect(caught).toBeInstanceOf(AggregateError);
     expect((caught as AggregateError).errors[0]).toMatchObject({ message: "media download failed: 503" });
-    expect((caught as AggregateError).errors[1]).toBe(cleanupError);
+    const readFailure = (caught as AggregateError).errors[1];
+    expect(readFailure).toMatchObject({ message: "media error response body could not be read" });
+    expect(readFailure.cause).toBeInstanceOf(ResponseBodyReadError);
+    expect(readFailure.cause.cause).toBeInstanceOf(AggregateError);
+    expect(readFailure.cause.cause.errors).toContain(cleanupError);
   });
 
   it("does not mutate an advanced client's transport configuration", () => {

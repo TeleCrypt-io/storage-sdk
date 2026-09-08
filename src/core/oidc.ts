@@ -6,7 +6,6 @@
  * this module under Node is safe; the CLI uses the device-code functions,
  * which are plain fetch calls.
  */
-import { createClient } from "matrix-js-sdk";
 import {
   generateScope,
   type DeviceAuthorizationResponse,
@@ -204,7 +203,7 @@ interface DiagnosticProperty {
 }
 
 function diagnosticKey(key: PropertyKey): string {
-  return typeof key === "symbol" ? key.toString() : key;
+  return String(key);
 }
 
 function diagnosticDisplayKey(key: PropertyKey): string {
@@ -738,39 +737,6 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
   });
 }
 
-function requestUrl(input: RequestInfo | URL): string {
-  if (typeof input === "string") return new URL(input).toString();
-  if (input instanceof URL) return input.toString();
-  return input.url;
-}
-
-/**
- * MatrixClient's OAuth helpers use the SDK HTTP layer for discovery and
- * whoami. Supply a manual-redirect fetch implementation so those calls have
- * the same response cleanup and credential boundary as the direct OAuth calls.
- */
-function boundedMatrixFetch(operation: string, externalSignal?: AbortSignal): typeof fetch {
-  return async (input, init) => {
-    const endpoint = requestUrl(input);
-    return requestWithTimeout(
-      input,
-      { ...init, redirect: "manual" },
-      operation,
-      async (response, requestSignal) => {
-        await assertNoRedirect(response, endpoint, operation);
-        const body = await readResponseText(response, requestSignal, operation);
-        return new Response(body.text, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers,
-        });
-      },
-      OIDC_REQUEST_TIMEOUT_MS,
-      externalSignal,
-    );
-  };
-}
-
 function parseHttpUrl(value: unknown, name: string): URL {
   const text = requireBoundedString(value, name, MAX_OIDC_URL_LENGTH);
   let parsed: URL;
@@ -803,6 +769,11 @@ function isWithinIssuerPath(issuer: URL, endpoint: URL): boolean {
 function matrixAuthMetadataEndpoint(homeserver: URL): string {
   const basePath = homeserver.pathname.replace(/\/+$/u, "");
   return new URL(`${basePath}/_matrix/client/v1/auth_metadata`, homeserver.origin).toString();
+}
+
+function matrixWhoAmIEndpoint(homeserver: URL): string {
+  const basePath = homeserver.pathname.replace(/\/+$/u, "");
+  return new URL(`${basePath}/_matrix/client/v3/account/whoami`, homeserver.origin).toString();
 }
 
 function validateTokenEndpointMetadata(metadata: OidcTokenEndpointMetadata): {
@@ -1092,7 +1063,7 @@ export async function discoverOidcIssuer(
         "discovery",
         response,
         responseText ?? "",
-        "OIDC discovery failed",
+        `OIDC discovery failed (${response.status})`,
       ) as StorageError & { httpStatus: number };
       failure.httpStatus = response.status;
       throw failure;
@@ -1549,14 +1520,16 @@ export async function completeAuthorizationCodeFlow(
       );
     }
     let normalized!: ReturnType<typeof normalizeBearerTokenResponseTokenType>;
+    let grantedScope!: string;
     try {
       validateBearerTokenResponse(body);
       validateTokenBounds(body, "authorization code exchange");
       normalized = normalizeBearerTokenResponseTokenType(body);
-      const grantedScope = normalized.scope;
-      if (typeof grantedScope !== "string" || !scopeMatchesDevice(grantedScope, context.deviceId)) {
+      const normalizedScope = normalized.scope;
+      if (typeof normalizedScope !== "string" || !scopeMatchesDevice(normalizedScope, context.deviceId)) {
         throw new StorageError("OIDC authorization code exchange returned an unexpected granted scope");
       }
+      grantedScope = normalizedScope;
     } catch (error) {
       throw responseValidationFailure(
         "authorization code exchange",
@@ -1668,25 +1641,55 @@ export async function whoAmI(
 ): Promise<{ userId: string; deviceId: string | null }> {
   try {
     const homeserver = parseHttpUrl(homeserverUrl, "homeserver URL");
-    const baseUrl = homeserver.toString();
     requireBoundedString(accessToken, "access token", MAX_OIDC_TOKEN_LENGTH);
-    const client = createClient({
-      baseUrl,
-      accessToken,
-      localTimeoutMs: OIDC_REQUEST_TIMEOUT_MS,
-      fetchFn: boundedMatrixFetch("identity confirmation", signal),
-    });
-    const res = await client.whoami();
-    const userId = validateMatrixUserId(res?.user_id, serverName);
-    if (res.device_id !== undefined && res.device_id !== null) {
+    const endpoint = matrixWhoAmIEndpoint(homeserver);
+    const { response, body, responseText } = await requestWithTimeout(
+      endpoint,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+        redirect: "manual",
+      },
+      "identity confirmation",
+      async (response, requestSignal) => {
+        await assertNoRedirect(response, endpoint, "identity confirmation");
+        if (!response.ok) {
+          const body = await readResponseText(response, requestSignal, "identity confirmation");
+          return { response, body: undefined, responseText: body.text };
+        }
+        const body = await readJsonResponse(response, "identity confirmation", requestSignal);
+        return { response, body: body.value, responseText: body.text };
+      },
+      OIDC_REQUEST_TIMEOUT_MS,
+      signal,
+    );
+    if (!response.ok) {
+      throw providerResponseFailure(
+        "identity confirmation",
+        response,
+        responseText ?? "",
+        `OIDC identity confirmation failed (${response.status})`,
+      );
+    }
+    if (!isRecord(body)) {
+      throw responseValidationFailure(
+        "identity confirmation",
+        response,
+        responseText ?? "",
+        new StorageError("OIDC identity confirmation returned an invalid response"),
+      );
+    }
+    const userId = validateMatrixUserId(body.user_id, serverName);
+    let deviceId: string | null = null;
+    if (body.device_id !== undefined && body.device_id !== null) {
       try {
-        validateMatrixDeviceId(res.device_id);
+        deviceId = validateMatrixDeviceId(body.device_id);
       } catch (error) {
         throw new StorageError("OIDC identity confirmation returned an invalid device ID", { cause: error });
       }
     }
     if (signal?.aborted) throw new OidcRequestCancelledError("identity confirmation");
-    return { userId, deviceId: res.device_id ?? null };
+    return { userId, deviceId };
   } catch (err) {
     if (err instanceof AggregateError) throw err;
     if (signal?.aborted) {
