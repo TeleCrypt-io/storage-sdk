@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -15,7 +20,6 @@ jobs:
     env:
       GIT_CONFIG_NOSYSTEM: "1"
       GIT_CONFIG_SYSTEM: /dev/null
-      GIT_CONFIG_COUNT: "0"
       GIT_CONFIG_PARAMETERS: ""
       GIT_CONFIG_GLOBAL: /tmp/telecrypt-gitconfig
       GIT_NO_REPLACE_OBJECTS: "1"
