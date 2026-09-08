@@ -113,9 +113,17 @@ function run(fixture: Fixture) {
   }
 }
 
-afterEach(() => {
-  if (fixtureDirectory) rmSync(fixtureDirectory, { recursive: true, force: true });
+afterEach(({ task }) => {
+  const directory = fixtureDirectory;
   fixtureDirectory = undefined;
+  if (!directory) return;
+  if (task.result?.state === "fail") {
+    process.stderr.write(
+      `npm provenance test failed; retaining fixture directory for investigation: ${directory}\n`,
+    );
+    return;
+  }
+  rmSync(directory, { recursive: true, force: true });
 });
 
 describe("npm provenance verifier", () => {
