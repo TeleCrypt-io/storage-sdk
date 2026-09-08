@@ -1463,22 +1463,36 @@ export async function completeAuthorizationCodeFlow(
   const key = `${AUTHORIZATION_CONTEXT_PREFIX}${state}`;
   const serialized = store.getItem(key);
   if (!serialized) throw new StorageError("OIDC authorization context is missing or expired");
+  let context!: AuthorizationCodeContext;
+  let validationError: unknown;
   if (serialized.length > MAX_AUTHORIZATION_CONTEXT_LENGTH) {
-    store.removeItem(key);
-    throw new StorageError("OIDC authorization context is too large");
+    validationError = new StorageError("OIDC authorization context is too large");
+  } else {
+    try {
+      context = parseAuthorizationContext(JSON.parse(serialized), state);
+    } catch (error) {
+      validationError = error instanceof StorageError
+        ? error
+        : new StorageError("OIDC authorization context is missing or invalid", { cause: error });
+    }
   }
 
-  let context: AuthorizationCodeContext;
+  // Consume the state before any network exchange. A retry must not replay
+  // the authorization code, even if validation fails. Preserve a validation
+  // failure when storage cleanup fails as well.
   try {
-    context = parseAuthorizationContext(JSON.parse(serialized), state);
-  } catch (error) {
-    if (error instanceof StorageError) throw error;
-    throw new StorageError("OIDC authorization context is missing or invalid", { cause: error });
-  } finally {
-    // Consume the state before any network exchange. A retry must not replay
-    // the authorization code, even if the exchange fails.
     store.removeItem(key);
+  } catch (error) {
+    if (validationError !== undefined) {
+      throw new AggregateError(
+        [validationError, error],
+        "OIDC authorization context validation and cleanup failed",
+        { cause: validationError },
+      );
+    }
+    throw error;
   }
+  if (validationError !== undefined) throw validationError;
 
   try {
     requireBoundedString(code, "authorization code", MAX_OIDC_CODE_LENGTH);

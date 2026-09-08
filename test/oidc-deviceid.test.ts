@@ -29,6 +29,24 @@ class MemoryStorage implements Storage {
   }
 }
 
+class RemoveFailStorage extends MemoryStorage {
+  constructor(private readonly removalError: Error) {
+    super();
+  }
+
+  override removeItem(key: string): void {
+    super.removeItem(key);
+    throw this.removalError;
+  }
+}
+
+class RemoveUndefinedStorage extends MemoryStorage {
+  override removeItem(key: string): void {
+    super.removeItem(key);
+    throw undefined;
+  }
+}
+
 const METADATA = {
   issuer: "https://mas.test",
   authorization_endpoint: "https://mas.test/authorize",
@@ -271,6 +289,72 @@ describe("authorization context replay and tamper protection", () => {
     await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
       "OIDC authorization context is missing or invalid",
     );
+    expect(storage.getItem(key)).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves malformed-context and state-removal failures together", async () => {
+    const removalError = new Error("authorization state cleanup failed");
+    const storage = new RemoveFailStorage(removalError);
+    const { state, key } = await beginForCallback(storage);
+    storage.setItem(key, "{not valid json");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    let caught: unknown;
+    try {
+      await completeAuthorizationCodeFlow("authorization-code", state);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "OIDC authorization context is missing or invalid" }),
+      removalError,
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves oversized-context and state-removal failures together", async () => {
+    const removalError = new Error("oversized authorization state cleanup failed");
+    const storage = new RemoveFailStorage(removalError);
+    const { state, key } = await beginForCallback(storage);
+    storage.setItem(key, "x".repeat(64 * 1024 + 1));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    let caught: unknown;
+    try {
+      await completeAuthorizationCodeFlow("authorization-code", state);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "OIDC authorization context is too large" }),
+      removalError,
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves a cleanup failure that throws undefined", async () => {
+    const storage = new RemoveUndefinedStorage();
+    const { state, key } = await beginForCallback(storage);
+    storage.setItem(key, "{not valid json");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    let caught: unknown;
+    try {
+      await completeAuthorizationCodeFlow("authorization-code", state);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "OIDC authorization context is missing or invalid" }),
+      undefined,
+    ]);
     expect(storage.getItem(key)).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
