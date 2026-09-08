@@ -7,6 +7,8 @@ export default defineConfig({
     // Running them in parallel makes independent tests contend for the same
     // service resources and turns otherwise healthy cases into timeouts.
     fileParallelism: false,
+    bail: 1,
+    retry: 0,
     testTimeout: 30000,
     hookTimeout: 30000,
     exclude: ["**/node_modules/**"],
