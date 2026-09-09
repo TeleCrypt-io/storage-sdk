@@ -1384,11 +1384,6 @@ async function deleteTree(
         assertTreeEmptyForDeletion(storage, tree, activeSpaces);
         graph = validateDeletionGraph(client, tree, ids, removedRooms);
       } catch (error) {
-        if (
-          error instanceof MutationOutcomeUnknownError ||
-          error instanceof MutationPartialError ||
-          error instanceof NonEmptyTreeError
-        ) throw error;
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
       }
@@ -1398,11 +1393,6 @@ async function deleteTree(
       try {
         await unlinkExternalParents(storage, tree.id, graph.externalParents, operation.signal);
       } catch (error) {
-        if (error instanceof MutationOutcomeUnknownError) throw error;
-        if (error instanceof MutationPartialError) throw error;
-        if (error instanceof StorageError && error.message === "delete graph unlink cleanup is incomplete") {
-          throw error;
-        }
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
       }
@@ -1423,8 +1413,6 @@ async function deleteTree(
             ),
           });
         }
-        if (error instanceof MutationOutcomeUnknownError) throw error;
-        if (error instanceof MutationPartialError) throw error;
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
       }

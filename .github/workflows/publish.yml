@@ -131,7 +131,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    permissions: {contents: write}
+    permissions: {contents: write, actions: read}
     outputs:
       release_id: ${{ steps.publish.outputs.release_id }}
     env:
@@ -144,10 +144,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with: {fetch-depth: 0, persist-credentials: false}
-      - uses: actions/download-artifact@v8.0.1
-        with:
-          name: storage-sdk-${{ github.run_id }}-${{ github.sha }}
-          path: release
+      - name: Download the exact tested SDK archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "storage-sdk-${GITHUB_RUN_ID}-${GITHUB_SHA}" \
+            --dir release
       - name: Create or reuse the exact draft Release
         id: publish
         env:
@@ -425,6 +430,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       RELEASE_SHA: ${{ github.sha }}
@@ -436,10 +442,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with: {fetch-depth: 0, persist-credentials: false}
-      - uses: actions/download-artifact@v8.0.1
-        with:
-          name: storage-sdk-${{ github.run_id }}-${{ github.sha }}
-          path: release
+      - name: Download the exact tested SDK archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "storage-sdk-${GITHUB_RUN_ID}-${GITHUB_SHA}" \
+            --dir release
       - uses: actions/setup-node@v7.0.0
         with: {node-version: "24.20.0", registry-url: https://registry.npmjs.org}
       - name: Verify the exact Trusted Publishing toolchain

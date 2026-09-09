@@ -37,7 +37,7 @@ import {
   UndecryptableFileError,
 } from "../src/core/errors.js";
 import { waitForCondition } from "../src/core/poll.js";
-import { isFileDeleted, isTreeDeleted } from "../src/deletion-markers.js";
+import { isFileDeleted, isTreeDeleted, markTreeDeleted } from "../src/deletion-markers.js";
 
 function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
   return {
@@ -833,14 +833,73 @@ describe("operation safety", () => {
     expect(refreshRoomState).toHaveBeenCalledWith(fixture.root.id, expect.anything());
   });
 
+  it("ignores a deleted child reintroduced by a late leave projection", async () => {
+    const child = makeTree("!late-deleted-child:example.test", "Child", false);
+    const root = makeTree("!late-deleted-root:example.test", "Root", true);
+    root.getDirectories = () => [child];
+    const rootRoom = {
+      roomId: root.id,
+      getMyMembership: () => "join",
+      currentState: { getStateEvents: () => [] },
+    };
+    const childRoom = {
+      roomId: child.id,
+      // This is the shape of the late Matrix `rooms.leave` projection: the
+      // room is visible again locally, but it is no longer joined.
+      getMyMembership: () => "leave",
+      currentState: { getStateEvents: () => [] },
+    };
+    const getRooms = vi.fn(() => [rootRoom, childRoom]);
+    const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+    const leave = vi.fn().mockResolvedValue(undefined);
+    const forget = vi.fn().mockResolvedValue(undefined);
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getRoom: (roomId: string) => (roomId === root.id ? rootRoom : roomId === child.id ? childRoom : null),
+      getRooms,
+      unstableGetFileTreeSpace: (roomId: string) => (roomId === root.id ? root : roomId === child.id ? child : null),
+      http: { authedRequest: vi.fn() },
+      leave,
+      forget,
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: (roomId: string) => (roomId === root.id ? root : null),
+      refreshRoomState,
+      listMembers: vi.fn().mockResolvedValue([]),
+      getRoomMembership: vi.fn().mockResolvedValue("join"),
+    } as unknown as TeleCryptIOStorage;
+
+    // The child was successfully deleted, then a late leave sync recreated its
+    // local projection. The deletion marker remains the only local evidence
+    // that this child is already complete and must not block its empty parent.
+    markTreeDeleted(client as never, child.id);
+
+    await expect(deleteVault(storage, root.id)).resolves.toEqual({
+      id: root.id,
+      deleted: true,
+    });
+    expect(refreshRoomState).toHaveBeenCalledTimes(1);
+    expect(refreshRoomState).toHaveBeenCalledWith(root.id, expect.anything());
+    expect(getRooms).not.toHaveBeenCalled();
+    expect(leave).toHaveBeenCalledWith(root.id);
+    expect(forget).toHaveBeenCalledWith(root.id);
+    expect(leave).not.toHaveBeenCalledWith(child.id);
+    expect(forget).not.toHaveBeenCalledWith(child.id);
+  });
+
   it("fails closed on a room refresh error without starting deletion", async () => {
+    const refreshFailure = new Error("room refresh failed");
     const refreshRoomState = vi.fn((roomId: string): Promise<void> => {
-      if (roomId.endsWith("-0:example.test")) throw new Error("room refresh failed");
+      if (roomId.endsWith("-0:example.test")) throw refreshFailure;
       return Promise.resolve();
     });
     const fixture = deletionRefreshFixture(12, refreshRoomState);
 
-    await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toThrow("delete failed");
+    await expect(deleteVault(fixture.storage, fixture.root.id)).rejects.toMatchObject({
+      message: "delete failed",
+      cause: refreshFailure,
+    });
     expect(refreshRoomState.mock.calls.length).toBe(1);
     expect(fixture.client.kick).not.toHaveBeenCalled();
     expect(fixture.client.leave).not.toHaveBeenCalled();

@@ -195,8 +195,13 @@ async function readResponseBodyInternal(
   try {
     reader = response.body.getReader();
   } catch (error) {
-    await cancelResponseBody(response, "response body reader setup", error);
-    throw error;
+    let failure: unknown = error;
+    try {
+      await cancelResponseBody(response, "response body reader setup", error);
+    } catch (cleanupError) {
+      failure = cleanupError;
+    }
+    throw new ResponseBodyReadError(new Uint8Array(), failure);
   }
   let abortCancellation: Promise<void> | undefined;
   const cancelReader = (): void => {
