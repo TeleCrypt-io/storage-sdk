@@ -21,7 +21,8 @@ cd "$(dirname "$0")"
 # shellcheck disable=SC1091
 source ./fixture-common.sh
 
-SYN_IMG="ghcr.io/element-hq/synapse:v1.159.0"
+SYN_GENERATE_IMG="ghcr.io/element-hq/synapse:v1.159.0"
+SYN_IMG="ghcr.io/telecrypt-io/telecrypt-synapse:1.159-tc19"
 MAS_IMG="ghcr.io/element-hq/matrix-authentication-service:1.23.0"
 PROXY_IMG="docker.io/library/caddy:2.11.4-alpine"
 PG_IMG="docker.io/library/postgres:17.11-bookworm"
@@ -121,7 +122,7 @@ if [[ ! -f "$DATA/synapse/homeserver.yaml" ]]; then
     -v "$DATA/synapse:/data:Z" \
     -e SYNAPSE_SERVER_NAME=localhost:8008 \
     -e SYNAPSE_REPORT_STATS=no \
-    "$SYN_IMG" generate
+    "$SYN_GENERATE_IMG" generate
 
   echo "==> appending homeserver.extra.yaml + MAS delegation block"
   cat > "$DATA/mas-delegation.yaml" <<EOF
@@ -137,7 +138,7 @@ EOF
     -v "$PWD/homeserver.extra.yaml:/extra.yaml:ro,Z" \
     -v "$DATA/mas-delegation.yaml:/mas-delegation.yaml:ro,Z" \
     --entrypoint /bin/sh \
-    "$SYN_IMG" -c 'printf "\n# ---- throwaway test overrides ----\n" >> /data/homeserver.yaml && cat /extra.yaml >> /data/homeserver.yaml && cat /mas-delegation.yaml >> /data/homeserver.yaml'
+    "$SYN_GENERATE_IMG" -c 'printf "\n# ---- throwaway test overrides ----\n" >> /data/homeserver.yaml && cat /extra.yaml >> /data/homeserver.yaml && cat /mas-delegation.yaml >> /data/homeserver.yaml'
 fi
 
 # ---------------------------------------------------------------------------
@@ -176,7 +177,8 @@ podman_remove_container_if_present "$SYN"
 echo "==> starting Synapse ($SYN)"
 podman run -d --name "$SYN" --network "$NET" \
   -v "$DATA/synapse:/data:Z" \
-  "$SYN_IMG"
+  --entrypoint python3 \
+  "$SYN_IMG" -m synapse.app.homeserver -c /data/homeserver.yaml
 
 # ---------------------------------------------------------------------------
 # 6. (Re)start the Caddy front door on :8008 — the public "homeserver" URL
