@@ -573,8 +573,9 @@ def check_workflow_operations() -> None:
         'attempt_error="$output.attempts/$attempt.err"',
         'cp "$attempt_output" "$output"',
         'cp "$attempt_error" "$error"',
+        'if replay_capture "$attempt_output" "$attempt_error"; then :; else replay_failed=1; fi',
+        'if replay_capture "$attempt_output" "$attempt_error" true "$attempt_semantic_output" "$attempt_semantic_error"; then :; else replay_failed=1; fi',
         'if test -s "$attempt_error"; then cat "$attempt_error" >&2; fi',
-        'cat "$attempt_file" >&2',
     ):
         if fragment not in retry_function:
             raise ContractError(f"npm retry diagnostics are missing {fragment}")
