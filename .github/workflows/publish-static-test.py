@@ -8,8 +8,10 @@ being present in an unrelated comment is not sufficient to satisfy the contract.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -519,9 +521,10 @@ def check_workflow_operations() -> None:
     for fragment in ('npm publish "./$archive"', "--provenance", "npm audit signatures"):
         if fragment not in publish:
             raise ContractError(f"npm trust boundary is missing {fragment}")
-    for fragment in ('cat "$publish_out" >&2', 'cat "$publish_err" >&2', 'exit "$publish_status"'):
-        if fragment not in publish:
-            raise ContractError(f"npm publish failure output is missing {fragment}")
+    if 'finish_capture "$publish_status" true "$publish_out" "$publish_err"' not in publish:
+        raise ContractError("npm publish must use shared status-preserving diagnostic capture")
+    if 'replay_capture "$publish_out" "$publish_err"' not in publish:
+        raise ContractError("npm publish warning handling must replay complete diagnostics")
     if 'test "$(node --version)" = v24.20.0' not in publish or 'test "$(npm --version)" = 11.19.0' not in publish:
         raise ContractError("the publish job does not verify the exact Trusted Publishing toolchain")
     if "npm install --global npm@" in WORKFLOW:
@@ -606,12 +609,58 @@ def check_workflow_operations() -> None:
         raise ContractError("publication does not perform the final source and Release recheck immediately before PATCH")
 
 
+def check_capture_helper() -> None:
+    """Exercise the shared capture helper's output and status-preservation contract."""
+
+    helper = ROOT / "scripts/capture-diagnostics.sh"
+    evidence_root = Path(os.environ.get("HARNESS_ARTIFACTS_ROOT", tempfile.gettempdir())).resolve()
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    evidence = Path(tempfile.mkdtemp(prefix="storage-sdk-capture-helper-", dir=evidence_root))
+    script = r'''
+set -eu
+source "$1"
+root="$2"
+printf 'success stdout' >"$root/success.out"
+printf 'success stderr' >"$root/success.err"
+if finish_capture 0 true "$root/success.out" "$root/success.err" >"$root/success.replayed" 2>"$root/success.diagnostics"; then :; else exit 11; fi
+test ! -s "$root/success.replayed"
+test "$(cat "$root/success.diagnostics")" = 'success stderr'
+printf 'failure stdout' >"$root/failure.out"
+printf 'failure stderr' >"$root/failure.err"
+if finish_capture 7 true "$root/failure.out" "$root/failure.err" >"$root/failure.replayed" 2>"$root/failure.diagnostics"; then exit 12; else status="$?"; fi
+test "$status" = 7
+test ! -s "$root/failure.replayed"
+test "$(cat "$root/failure.diagnostics")" = 'failure stdoutfailure stderr'
+mkdir "$root/replay-out" "$root/replay-err"
+if finish_capture 7 true "$root/replay-out" "$root/replay-err" >"$root/replay.replayed" 2>"$root/replay.diagnostics"; then exit 13; else status="$?"; fi
+test "$status" = 7
+grep -Fq 'diagnostic stdout replay failed' "$root/replay.diagnostics"
+grep -Fq 'diagnostic stderr replay failed' "$root/replay.diagnostics"
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "capture-helper", str(helper), str(evidence)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    (evidence / "process.stdout").write_text(result.stdout, encoding="utf-8")
+    (evidence / "process.stderr").write_text(result.stderr, encoding="utf-8")
+    (evidence / "process.status").write_text(f"{result.returncode}\n", encoding="utf-8")
+    if result.returncode != 0:
+        raise ContractError(
+            f"shared capture helper behavior mismatch: status={result.returncode}; "
+            f"stdout={result.stdout!r}; stderr={result.stderr!r}; evidence={evidence}"
+        )
+
+
 check_state_machine()
 check_revalidate_jq_predicate()
 check_provenance_retry_model()
 check_provenance_verifier()
 check_package_file_manifest()
 check_workflow_operations()
+check_capture_helper()
 if ".github/workflows/publish-static-test.py" not in VERIFY:
     raise ContractError("verify workflow must run the semantic release check")
 print("SDK release behavioral invariants passed")

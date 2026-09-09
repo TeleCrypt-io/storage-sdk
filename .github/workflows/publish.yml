@@ -627,14 +627,7 @@ jobs:
             publish_out="$RUNNER_TEMP/npm-publish.out"
             publish_err="$publish_out.err"
             if run_captured "$publish_out" "$publish_err" 120 npm publish "./$archive" --access public --provenance --ignore-scripts; then publish_status=0; else publish_status="$?"; fi
-            if test "$publish_status" != 0; then
-              replay_capture "$publish_out" "$publish_err"
-              exit "$publish_status"
-            fi
-            if replay_capture "$publish_out" "$publish_err" false; then :; else
-              replay_status="$?"
-              exit "$replay_status"
-            fi
+            finish_capture "$publish_status" true "$publish_out" "$publish_err"
             if grep -Eqi '(^|[^[:alnum:]_])warn(ing)?([^[:alnum:]_]|$)' "$publish_out" "$publish_err"; then
               replay_capture "$publish_out" "$publish_err"
               exit 1
