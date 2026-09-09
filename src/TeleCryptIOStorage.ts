@@ -88,7 +88,7 @@ export interface FileBranch {
     info: Record<string, unknown>;
     httpUrl: string;
   }>;
-  getFileEvent(): Promise<Pick<MatrixEvent, "getContent" | "getTs">>;
+  getFileEvent(): Promise<Pick<MatrixEvent, "getContent" | "getTs" | "isDecryptionFailure">>;
   getVersionHistory(): Promise<FileBranch[]>;
   createNewVersion(
     name: string,
@@ -495,8 +495,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function isUndecryptableFilePlaceholder(branch: FileBranch): Promise<boolean> {
-  const content = (await branch.getFileEvent()).getContent();
-  return isRecord(content) && content["msgtype"] === "m.file" && content["file"] === undefined;
+  // matrix-js-sdk replaces failed encrypted event content with m.bad.encrypted;
+  // its public failure flag is the authoritative state and avoids guessing
+  // from that display content (or misclassifying malformed plaintext events).
+  return (await branch.getFileEvent()).isDecryptionFailure();
 }
 
 function validateSecretStorageStatus(value: unknown): SecretStorageStatusShape {
@@ -2044,10 +2046,9 @@ export class TeleCryptIOStorage {
     } catch (error) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       if (error instanceof StorageError || error instanceof MatrixError) throw error;
-      // matrix-js-sdk's MSC3089Branch.getFileInfo() reads `file["url"]` off
-      // the raw event content; an undecryptable m.file event is exposed as a
-      // placeholder with no `file` block. Translate only that structural
-      // shape and preserve every other SDK/transport failure unchanged.
+      // matrix-js-sdk's file-info accessor reads an attachment absent from
+      // failed-decryption events. Use its explicit decryption status, not a
+      // guessed content shape; preserve other SDK/transport failures.
       let isPlaceholder = false;
       try {
         isPlaceholder = await isUndecryptableFilePlaceholder(branch);
@@ -2063,9 +2064,9 @@ export class TeleCryptIOStorage {
       }
       throw error;
     }
-    // Also reject an incomplete placeholder if matrix-js-sdk returns one.
+    // Missing metadata alone does not establish a decryption failure.
     if (!info || typeof info.url !== "string") {
-      throw new UndecryptableFileError();
+      throw new StorageError("file metadata is missing a media URL");
     }
     // `info` is the encrypted attachment descriptor. Its shape is owned by
     // matrix-encrypt-attachment and does not carry the plaintext size. The

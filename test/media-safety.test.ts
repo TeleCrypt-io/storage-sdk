@@ -15,7 +15,10 @@ import { ResponseBodyReadError } from "../src/core/http.js";
 function branch() {
   return {
     getFileInfo: vi.fn().mockResolvedValue({ info: { url: "mxc://example.test/media" } }),
-    getFileEvent: vi.fn().mockResolvedValue({ getContent: () => ({ info: {} }) }),
+    getFileEvent: vi.fn().mockResolvedValue({
+      getContent: () => ({ info: {} }),
+      isDecryptionFailure: () => false,
+    }),
   } as never;
 }
 
@@ -138,18 +141,42 @@ describe("media safety bounds", () => {
     await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBe(failure);
   });
 
-  it("translates only the undecryptable file placeholder shape", async () => {
+  it("translates the matrix-js-sdk decryption failure state", async () => {
     const file = branch() as {
       getFileInfo: ReturnType<typeof vi.fn>;
       getFileEvent: ReturnType<typeof vi.fn>;
     };
     file.getFileInfo = vi.fn().mockRejectedValue(new TypeError("matrix file info failed"));
     file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ msgtype: "m.file", body: "secret.txt" }),
+      getContent: () => ({ msgtype: "m.bad.encrypted", body: "unable to decrypt" }),
+      isDecryptionFailure: () => true,
     });
 
     await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBeInstanceOf(
       UndecryptableFileError,
+    );
+  });
+
+  it("preserves a malformed plaintext file event when decryption did not fail", async () => {
+    const failure = new TypeError("matrix file info failed");
+    const file = branch() as {
+      getFileInfo: ReturnType<typeof vi.fn>;
+      getFileEvent: ReturnType<typeof vi.fn>;
+    };
+    file.getFileInfo = vi.fn().mockRejectedValue(failure);
+    file.getFileEvent = vi.fn().mockResolvedValue({
+      getContent: () => ({ msgtype: "m.file", body: "secret.txt" }),
+      isDecryptionFailure: () => false,
+    });
+
+    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBe(failure);
+  });
+
+  it("does not claim decryption failed merely because returned metadata is incomplete", async () => {
+    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
+    file.getFileInfo.mockResolvedValue({ info: {} });
+    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toThrow(
+      "file metadata is missing a media URL",
     );
   });
 
