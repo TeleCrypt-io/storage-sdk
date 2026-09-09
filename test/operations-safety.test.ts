@@ -398,6 +398,19 @@ describe("operation safety", () => {
     tree.listFiles = () => hugeFiles as never;
     tree.getDirectories = () => hugeFolders as never;
     const storage = {
+      getClient: () => ({
+        getRoom: () => ({
+          currentState: {
+            getStateEvents: (eventType: string) =>
+              eventType === EventType.SpaceChild
+                ? hugeFolders.map((folder) => ({
+                    getStateKey: () => folder.id,
+                    getContent: () => ({ via: ["example.test"] }),
+                  }))
+                : [],
+          },
+        }),
+      }),
       getTree: () => tree,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
     } as unknown as TeleCryptIOStorage;
@@ -414,6 +427,19 @@ describe("operation safety", () => {
     tree.getDirectories = getDirectories;
     const refreshRoomState = vi.fn().mockResolvedValue(undefined);
     const storage = {
+      getClient: () => ({
+        getRoom: () => ({
+          currentState: {
+            getStateEvents: (eventType: string) =>
+              eventType === EventType.SpaceChild
+                ? [{
+                    getStateKey: () => "!child:example.test",
+                    getContent: () => ({ via: ["example.test"] }),
+                  }]
+                : [],
+          },
+        }),
+      }),
       getTree: () => tree,
       refreshRoomState,
     } as unknown as TeleCryptIOStorage;
@@ -428,6 +454,31 @@ describe("operation safety", () => {
     expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(
       getDirectories.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("does not list a child whose space relation is inactive", async () => {
+    const child = { id: "!child:example.test", room: { name: "Child" } };
+    const tree = makeTree("!folders:example.test", "Folders", true);
+    tree.getDirectories = () => [child] as never;
+    const storage = {
+      getClient: () => ({
+        getRoom: () => ({
+          currentState: {
+            getStateEvents: (eventType: string) =>
+              eventType === EventType.SpaceChild
+                ? [{
+                    getStateKey: () => child.id,
+                    getContent: () => ({}),
+                  }]
+                : [],
+          },
+        }),
+      }),
+      getTree: () => tree,
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(listSubfolders(storage, tree.id)).resolves.toEqual([]);
   });
 
   it("waits until an uploaded file is active before reporting success", async () => {

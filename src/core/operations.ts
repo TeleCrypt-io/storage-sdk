@@ -1279,8 +1279,7 @@ export async function listSubfolders(
     const tree = await resolveTree(storage, parentId, signal);
     await storage.refreshRoomState(parentId, { signal });
     ensureOperationActive(signal);
-    const directories = tree
-      .getDirectories()
+    const directories = activeTreeDirectories(storage.getClient(), tree)
       .filter((directory) => !isMarkedTreeDeleted(storage, directory.id));
     return directories.map((d) => ({ id: d.id, name: d.room.name }));
   });
