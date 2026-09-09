@@ -290,37 +290,6 @@ async function resolveFile(
   }
 }
 
-function snapshotTreeSpaces(
-  root: TreeSpace,
-  tooLargeMessage = "storage tree is too large",
-): TreeSpace[] {
-  const spaces: TreeSpace[] = [];
-  const seen = new Set<string>();
-  const pending: Array<{ tree: TreeSpace; depth: number }> = [{ tree: root, depth: 0 }];
-  while (pending.length > 0) {
-    const next = pending.pop();
-    if (!next) continue;
-    const { tree, depth } = next;
-    if (seen.has(tree.id)) continue;
-    if (depth > MAX_DELETION_DEPTH || spaces.length >= MAX_DELETION_ROOMS) {
-      throw new StorageError(tooLargeMessage);
-    }
-    seen.add(tree.id);
-    spaces.push(tree);
-    let children: TreeSpace[];
-    try {
-      children = tree.getDirectories();
-    } catch (error) {
-      throw new StorageError("could not enumerate storage space descendants safely", { cause: error });
-    }
-    if (children.length > MAX_DELETION_ROOMS) {
-      throw new StorageError(tooLargeMessage);
-    }
-    for (const child of children) pending.push({ tree: child, depth: depth + 1 });
-  }
-  return spaces;
-}
-
 /**
  * Deleting a tree is deliberately a one-room operation.  File versions are
  * physical Matrix media events, so callers must delete files explicitly and
@@ -432,6 +401,61 @@ function isActiveRelationEvent(event: RelationEvent): boolean {
   );
 }
 
+function activeTreeDirectories(client: MatrixClient, tree: TreeSpace): TreeSpace[] {
+  const childEvents = readRelationEvents(client, tree.id, EventType.SpaceChild);
+  if (childEvents === null) throw new StorageError("delete graph is unsafe");
+  const activeChildIds = new Set<string>();
+  for (const event of childEvents) {
+    if (!isActiveRelationEvent(event)) continue;
+    const childId = relationStateKey(event);
+    if (!childId) throw new StorageError("delete graph is unsafe");
+    activeChildIds.add(childId);
+  }
+  const knownChildren = new Map(
+    tree.getDirectories().map((child) => [child.id, child]),
+  );
+  return [...activeChildIds].map((childId) => {
+    const child = knownChildren.get(childId);
+    if (!child) throw new StorageError("delete graph is unsafe");
+    return child;
+  });
+}
+
+function snapshotTreeSpaces(
+  root: TreeSpace,
+  tooLargeMessage = "storage tree is too large",
+  activeRelationClient?: MatrixClient,
+): TreeSpace[] {
+  const spaces: TreeSpace[] = [];
+  const seen = new Set<string>();
+  const pending: Array<{ tree: TreeSpace; depth: number }> = [{ tree: root, depth: 0 }];
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (!next) continue;
+    const { tree, depth } = next;
+    if (seen.has(tree.id)) continue;
+    if (depth > MAX_DELETION_DEPTH || spaces.length >= MAX_DELETION_ROOMS) {
+      throw new StorageError(tooLargeMessage);
+    }
+    seen.add(tree.id);
+    spaces.push(tree);
+    let children: TreeSpace[];
+    try {
+      children = activeRelationClient
+        ? activeTreeDirectories(activeRelationClient, tree)
+        : tree.getDirectories();
+    } catch (error) {
+      if (error instanceof StorageError) throw error;
+      throw new StorageError("could not enumerate storage space descendants safely", { cause: error });
+    }
+    if (children.length > MAX_DELETION_ROOMS) {
+      throw new StorageError(tooLargeMessage);
+    }
+    for (const child of children) pending.push({ tree: child, depth: depth + 1 });
+  }
+  return spaces;
+}
+
 /**
  * A deleted MSC3089 branch is represented by an authoritative empty state
  * event. Inactive branches with metadata are historical versions, and a
@@ -483,12 +507,7 @@ function validateDeletionGraph(
   for (const id of ids) {
     const tree = client.unstableGetFileTreeSpace(id) as unknown as TreeSpace | null;
     if (!tree) throw new StorageError("delete graph is unsafe");
-    let directories: TreeSpace[];
-    try {
-      directories = tree.getDirectories();
-    } catch (error) {
-      throw new StorageError("delete graph is unsafe", { cause: error });
-    }
+    const directories = activeTreeDirectories(client, tree);
     for (const child of directories) addEdge(id, child.id);
 
     const childEvents = readRelationEvents(client, id, EventType.SpaceChild);
@@ -1370,7 +1389,7 @@ async function deleteTree(
         // part of this operation and must not block deletion merely because
         // their membership is not joined.
         await refreshDeletionRooms(storage, tree.id, operation.signal);
-        const spaces = snapshotTreeSpaces(tree, "delete graph is too large");
+        const spaces = snapshotTreeSpaces(tree, "delete graph is too large", client);
         const activeSpaces = spaces.filter(
           (space) => !removedRooms.has(space.id),
         );

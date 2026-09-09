@@ -888,6 +888,58 @@ describe("operation safety", () => {
     expect(forget).not.toHaveBeenCalledWith(child.id);
   });
 
+  it("ignores an inactive child relation retained by the Matrix tree helper", async () => {
+    const child = makeTree("!unlinked-child:example.test", "Child", false);
+    const root = makeTree("!unlinked-root:example.test", "Root", true);
+    root.getDirectories = () => [child];
+    const inactiveChildEvent = {
+      getStateKey: () => child.id,
+      getContent: () => ({}),
+    };
+    const rootRoom = {
+      roomId: root.id,
+      getMyMembership: () => "join",
+      currentState: {
+        getStateEvents: (eventType: string, stateKey?: string) => {
+          if (eventType !== EventType.SpaceChild) return [];
+          if (stateKey !== undefined && stateKey !== child.id) return null;
+          return stateKey === child.id ? inactiveChildEvent : [inactiveChildEvent];
+        },
+      },
+    };
+    const childRoom = {
+      roomId: child.id,
+      getMyMembership: () => "leave",
+      currentState: { getStateEvents: () => [] },
+    };
+    const leave = vi.fn().mockResolvedValue(undefined);
+    const forget = vi.fn().mockResolvedValue(undefined);
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getRoom: (roomId: string) => (roomId === root.id ? rootRoom : roomId === child.id ? childRoom : null),
+      unstableGetFileTreeSpace: (roomId: string) => (roomId === root.id ? root : roomId === child.id ? child : null),
+      http: { authedRequest: vi.fn() },
+      leave,
+      forget,
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: (roomId: string) => (roomId === root.id ? root : null),
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+      listMembers: vi.fn().mockResolvedValue([]),
+      getRoomMembership: vi.fn().mockResolvedValue("join"),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(deleteVault(storage, root.id)).resolves.toEqual({
+      id: root.id,
+      deleted: true,
+    });
+    expect(leave).toHaveBeenCalledWith(root.id);
+    expect(forget).toHaveBeenCalledWith(root.id);
+    expect(leave).not.toHaveBeenCalledWith(child.id);
+    expect(forget).not.toHaveBeenCalledWith(child.id);
+  });
+
   it("fails closed on a room refresh error without starting deletion", async () => {
     const refreshFailure = new Error("room refresh failed");
     const refreshRoomState = vi.fn((roomId: string): Promise<void> => {
@@ -992,14 +1044,24 @@ describe("operation safety", () => {
       getMembers: () => [],
       getMyMembership: () => "join",
       currentState: {
-        getStateEvents: (_type: string, stateKey: string) => {
-          if (roomId === root.id && stateKey === child.id) {
-            return { getId: () => "$root-child", getContent: () => ({ via: ["example.test"] }) };
+        getStateEvents: (eventType: string, stateKey?: string) => {
+          const events = [];
+          if (roomId === root.id && eventType === EventType.SpaceChild) {
+            events.push({
+              getStateKey: () => child.id,
+              getId: () => "$root-child",
+              getContent: () => ({ via: ["example.test"] }),
+            });
           }
-          if (roomId === child.id && stateKey === root.id) {
-            return { getId: () => "$child-root", getContent: () => ({ via: ["example.test"] }) };
+          if (roomId === child.id && eventType === EventType.SpaceParent) {
+            events.push({
+              getStateKey: () => root.id,
+              getId: () => "$child-root",
+              getContent: () => ({ via: ["example.test"] }),
+            });
           }
-          return null;
+          if (stateKey === undefined) return events;
+          return events.find((event) => event.getStateKey() === stateKey) ?? null;
         },
       },
     });
