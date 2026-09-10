@@ -817,7 +817,7 @@ describe("operation safety", () => {
     await expect(storage.listMembers(tree)).rejects.toThrow("Matrix HTTP transport unavailable");
   });
 
-  it("caps caller-provided Matrix request deadlines", async () => {
+  it("forwards caller-provided Matrix request deadlines", async () => {
     const tree = makeTree("!timeout:example.test", "Timeout", true);
     const authedRequest = vi.fn().mockResolvedValue([]);
     const storage = new TeleCryptIOStorage({
@@ -825,13 +825,13 @@ describe("operation safety", () => {
       http: { authedRequest },
     } as never);
 
-    await storage.refreshRoomState(tree.id, { timeoutMs: Number.MAX_SAFE_INTEGER });
+    await storage.refreshRoomState(tree.id, { timeoutMs: 120_000 });
     expect(authedRequest).toHaveBeenCalledWith(
       "GET",
       `/rooms/${encodeURIComponent(tree.id)}/state`,
       undefined,
       undefined,
-      { prefix: "/_matrix/client/v3", localTimeoutMs: 30_000, abortSignal: undefined },
+      { prefix: "/_matrix/client/v3", localTimeoutMs: 120_000, abortSignal: undefined },
     );
   });
 

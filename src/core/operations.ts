@@ -69,9 +69,9 @@ import type {
 } from "./types.js";
 
 export interface OperationOptions {
-  /** Cancels bounded waits and rate-limit backoff before the next mutation. */
+  /** Cancels waits and rate-limit backoff before the next mutation. */
   signal?: AbortSignal;
-  /** Total wall-clock budget for one mutation, including all descendants. */
+  /** Optional wall-clock budget supplied by the caller. */
   timeoutMs?: number;
 }
 
@@ -87,11 +87,6 @@ const RATE_LIMIT_DEFAULT_DELAY_MS = 15_000;
 // JavaScript timers cannot represent a longer delay reliably. The operation's
 // own deadline remains the authority that stops retrying.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-const MAX_DELETION_ROOMS = 4096;
-const MAX_DELETION_DEPTH = 128;
-const DEFAULT_MUTATION_TIMEOUT_MS = 5 * 60_000;
-const MAX_MUTATION_TIMEOUT_MS = 15 * 60_000;
-
 interface OperationDeadline {
   signal: AbortSignal;
   close: () => void;
@@ -100,19 +95,25 @@ interface OperationDeadline {
 type OperationKind = "read" | "mutation";
 
 function createOperationDeadline(options?: OperationOptions): OperationDeadline {
-  const timeoutMs = options?.timeoutMs ?? DEFAULT_MUTATION_TIMEOUT_MS;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_MUTATION_TIMEOUT_MS) {
+  const timeoutMs = options?.timeoutMs;
+  if (
+    timeoutMs !== undefined &&
+    (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_DELAY_MS)
+  ) {
     throw new StorageError("invalid operation timeout");
   }
   const controller = new AbortController();
   const onAbort = (): void => controller.abort(options?.signal?.reason);
   options?.signal?.addEventListener("abort", onAbort, { once: true });
   if (options?.signal?.aborted) onAbort();
-  const timer = setTimeout(() => controller.abort(new Error("operation timed out")), timeoutMs);
+  const timer =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => controller.abort(new Error("operation timed out")), timeoutMs);
   return {
     signal: controller.signal,
     close: () => {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       options?.signal?.removeEventListener("abort", onAbort);
     },
   };
@@ -423,20 +424,15 @@ function activeTreeDirectories(client: MatrixClient, tree: TreeSpace): TreeSpace
 
 function snapshotTreeSpaces(
   root: TreeSpace,
-  tooLargeMessage = "storage tree is too large",
   activeRelationClient?: MatrixClient,
 ): TreeSpace[] {
   const spaces: TreeSpace[] = [];
   const seen = new Set<string>();
-  const pending: Array<{ tree: TreeSpace; depth: number }> = [{ tree: root, depth: 0 }];
+  const pending: TreeSpace[] = [root];
   while (pending.length > 0) {
-    const next = pending.pop();
-    if (!next) continue;
-    const { tree, depth } = next;
+    const tree = pending.pop();
+    if (!tree) continue;
     if (seen.has(tree.id)) continue;
-    if (depth > MAX_DELETION_DEPTH || spaces.length >= MAX_DELETION_ROOMS) {
-      throw new StorageError(tooLargeMessage);
-    }
     seen.add(tree.id);
     spaces.push(tree);
     let children: TreeSpace[];
@@ -448,10 +444,7 @@ function snapshotTreeSpaces(
       if (error instanceof StorageError) throw error;
       throw new StorageError("could not enumerate storage space descendants safely", { cause: error });
     }
-    if (children.length > MAX_DELETION_ROOMS) {
-      throw new StorageError(tooLargeMessage);
-    }
-    for (const child of children) pending.push({ tree: child, depth: depth + 1 });
+    for (const child of children) pending.push(child);
   }
   return spaces;
 }
@@ -1388,7 +1381,7 @@ async function deleteTree(
         // part of this operation and must not block deletion merely because
         // their membership is not joined.
         await refreshDeletionRooms(storage, tree.id, operation.signal);
-        const spaces = snapshotTreeSpaces(tree, "delete graph is too large", client);
+    const spaces = snapshotTreeSpaces(tree, client);
         const activeSpaces = spaces.filter(
           (space) => !removedRooms.has(space.id),
         );

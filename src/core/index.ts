@@ -4,4 +4,4 @@ export * from "./operations.js";
 export * from "./errors.js";
 export * from "./oidc.js";
 export * from "./constants.js";
-export { isValidName, MAX_NAME_LENGTH, validateName } from "./validation.js";
+export { isValidName, validateName } from "./validation.js";

@@ -334,7 +334,7 @@ interface MatrixHttpTransport {
 function matrixRequestTimeout(options?: MatrixRequestOptions): number {
   const value = options?.timeoutMs ?? options?.localTimeoutMs ?? MATRIX_HTTP_TIMEOUT_MS;
   if (!Number.isFinite(value) || value <= 0) throw new Error("invalid Matrix request timeout");
-  return Math.min(value, MATRIX_HTTP_TIMEOUT_MS);
+  return value;
 }
 
 function matrixRequestSignal(options?: MatrixRequestOptions): AbortSignal | undefined {
