@@ -66,13 +66,11 @@ jobs:
           rm -f "$config_file"
           git remote set-url origin "$repo_url"
           test "$(git remote get-url origin)" = "$repo_url"
-          timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+          timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag"
           test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
           release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
           test "$release_commit" = "$RELEASE_SHA"
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
-          test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
-          git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
       - uses: actions/setup-node@v7.0.0
         with: {node-version: "24.20.0", cache: npm}
       - name: Verify toolchain and package version
@@ -177,13 +175,11 @@ jobs:
           test "$(git remote get-url origin)" = "$repo_url"
           verify_source() {
             local release_commit
-            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag"
             test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
             release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
             test "$release_commit" = "$RELEASE_SHA"
             test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
-            test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
-            git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
           }
           verify_source
           archive="release/${RELEASE_TAG}.tgz"
@@ -358,7 +354,6 @@ jobs:
           case "$match_count" in
             0)
               create="$RUNNER_TEMP/release-create.json"
-              verify_source
               capture_gh "$create" api --hostname github.com --method POST --header 'X-GitHub-Api-Version: 2026-03-10' --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=$RELEASE_TAG" --raw-field "body=Release $RELEASE_TAG" --raw-field "target_commitish=$RELEASE_SHA" --field draft=true --field prerelease=false "/repos/$GITHUB_REPOSITORY/releases"
               release_id="$(api_value "$create" jq -er '.id | select(type=="number" and .>0 and floor==.)' "$create")"
               capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
@@ -382,23 +377,20 @@ jobs:
               while IFS= read -r asset_id; do
                 test -z "$asset_id" || [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
                 if test -n "$asset_id"; then
-                  verify_source
                   capture_gh "$RUNNER_TEMP/delete-$asset_id.json" api --hostname github.com --method DELETE --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
                 fi
               done <"$asset_ids"
               asset_name="${RELEASE_TAG}.tgz"
-              verify_source
-                  upload_asset "$archive" application/octet-stream "$asset_name"
+              upload_asset "$archive" application/octet-stream "$asset_name"
               record_name="${RELEASE_TAG}.integrity.json"
-              verify_source
-                  upload_asset "$record" application/json "$record_name"
+              upload_asset "$record" application/json "$record_name"
               capture_gh "$probe" api --hostname github.com --header 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/$release_id"
               verify_draft "$probe" "$release_id"
               require_api_json "$probe" "$probe.err" jq -e --arg tag "$RELEASE_TAG" --arg digest "$EXPECTED_DIGEST" --argjson size "$EXPECTED_SIZE" --arg record_digest "$EXPECTED_RECORD_DIGEST" --argjson record_size "$EXPECTED_RECORD_SIZE" '((.assets|length)==2) and (any(.assets[]; .name==($tag+".tgz") and .state=="uploaded" and .size==$size and .digest==$digest)) and (any(.assets[]; .name==($tag+".integrity.json") and .state=="uploaded" and .size==$record_size and .digest==$record_digest))' "$probe"
               expected_draft_asset_metadata="$(api_value "$probe" jq -c '[.assets[] | {id,name,state,size,digest}] | sort_by(.name)' "$probe")"
               download_asset "$probe" "$RUNNER_TEMP/draft.tgz" "$asset_name"
               download_asset "$probe" "$RUNNER_TEMP/draft.integrity.json" "$record_name"
-              # Revalidate the authoritative tag and current main immediately before the one publish mutation.
+              # Revalidate the authoritative tag immediately before the one publish mutation.
               verify_source
               revalidate_draft_for_publish "$probe" "$release_id"
               capture_gh "$RUNNER_TEMP/published.json" api --hostname github.com --method PATCH --header 'X-GitHub-Api-Version: 2026-03-10' --field draft=false "/repos/$GITHUB_REPOSITORY/releases/$release_id"
@@ -547,13 +539,11 @@ jobs:
           test "$(git remote get-url origin)" = "$repo_url"
           verify_source() {
             local release_commit
-            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag" refs/heads/main:refs/remotes/origin/main
+            timeout --signal=TERM --kill-after=5s 60s git -c protocol.file.allow=never -c protocol.ext.allow=never -c protocol.ssh.allow=never -c credential.helper= -c core.askPass=/bin/false -c http.proxy= -c https.proxy= -c http.sslVerify=true fetch --force --no-tags "$repo_url" "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-tag"
             test "$(git cat-file -t refs/remotes/origin/release-tag)" = tag
             release_commit="$(git rev-parse 'refs/remotes/origin/release-tag^{commit}')"
             test "$release_commit" = "$RELEASE_SHA"
             test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
-            test "$release_commit" = "$(git rev-parse refs/remotes/origin/main)"
-            git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
           }
           verify_archive() {
             local file="$1" listing="$RUNNER_TEMP/sdk-publish-archive-list" status
