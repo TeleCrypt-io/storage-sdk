@@ -45,7 +45,7 @@ function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
     room: { name },
     isTopLevel,
     getDirectories: () => [],
-    listAllFiles: () => [],
+    listFiles: () => [],
   } as unknown as TreeSpace;
 }
 
@@ -116,29 +116,28 @@ describe("operation safety", () => {
     expect(createSubtree).toHaveBeenCalledTimes(1);
   });
 
-  function deletionFixture(history: Array<{ id: string; mediaId: string }>) {
-    const versions = history.map(({ id, mediaId }) => ({
+  function deletionFixture({ id = "$v1", mediaId = "mxc://example.test/v1" } = {}) {
+    const branch = {
       id,
       isActive: true,
       getFileInfo: vi.fn().mockResolvedValue({ info: { url: mediaId }, httpUrl: "https://matrix.invalid" }),
-    }));
-    versions[0].getVersionHistory = vi.fn().mockResolvedValue(versions);
+    };
     const tree = makeTree("!delete-file:example.test", "Delete file", true);
-    tree.getFile = vi.fn().mockReturnValue(versions[0]);
+    tree.getFile = vi.fn().mockReturnValue(branch);
     const client = {
       http: { authedRequest: vi.fn().mockResolvedValue({}) },
       sendStateEvent: vi.fn().mockResolvedValue({}),
       redactEvent: vi.fn().mockResolvedValue({}),
     };
     const refreshRoomState = vi.fn().mockImplementation(async () => {
-      versions[0]!.isActive = false;
+      tree.getFile = vi.fn().mockReturnValue(null);
     });
     const storage = {
       getTree: () => tree,
       getClient: () => client,
       refreshRoomState,
     } as unknown as TeleCryptIOStorage;
-    return { client, storage, tree, versions, refreshRoomState };
+    return { client, storage, tree, branch, refreshRoomState };
   }
 
   function deletionRefreshFixture(
@@ -147,7 +146,7 @@ describe("operation safety", () => {
   ) {
     const roomIds = Array.from({ length: roomCount }, (_, index) => `!delete-room-${index}:example.test`);
     const root = makeTree(roomIds[0]!, "Delete room", true);
-    root.listAllFiles = () => [{ id: "$remaining", getName: () => "remaining.txt" }] as never;
+    root.listFiles = () => [{ id: "$remaining", getName: () => "remaining.txt" }] as never;
     const rooms = roomIds.map((roomId) => ({
       roomId,
       getMyMembership: () => "join",
@@ -169,11 +168,8 @@ describe("operation safety", () => {
     return { client, root, roomIds, storage };
   }
 
-  it("deletes every version's media before redacting its Matrix events", async () => {
-    const fixture = deletionFixture([
-      { id: "$v2", mediaId: "mxc://example.test/v2" },
-      { id: "$v1", mediaId: "mxc://example.test/v1" },
-    ]);
+  it("deletes the current media before redacting its Matrix event", async () => {
+    const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
 
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).resolves.toEqual({
       id: "$v2",
@@ -183,7 +179,7 @@ describe("operation safety", () => {
       "POST",
       "/io.telecrypt.storage/delete_media",
       undefined,
-      { media_ids: ["mxc://example.test/v2", "mxc://example.test/v1"] },
+      { media_ids: ["mxc://example.test/v1"] },
       {
         prefix: "/_matrix/client/unstable",
         rawResponseBody: true,
@@ -198,10 +194,9 @@ describe("operation safety", () => {
       fixture.tree.id,
       "org.matrix.msc3089.branch",
       {},
-      "$v2",
+      "$v1",
     );
-    expect(fixture.client.redactEvent).toHaveBeenNthCalledWith(2, fixture.tree.id, "$v1");
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(true);
+    expect(fixture.client.redactEvent).toHaveBeenCalledWith(fixture.tree.id, "$v1");
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(true);
   });
 
@@ -215,7 +210,7 @@ describe("operation safety", () => {
       onlyData: true,
       fetchFn: fetchMock as unknown as typeof fetch,
     });
-    const fixture = deletionFixture([{ id: "$v1", mediaId: "mxc://example.test/v1" }]);
+    const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
     (fixture.client as unknown as { http: typeof http }).http = http;
 
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
@@ -263,8 +258,8 @@ describe("operation safety", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("reconciles the inactive file state before reporting deletion success", async () => {
-    const fixture = deletionFixture([{ id: "$v1", mediaId: "mxc://example.test/v1" }]);
+  it("reconciles the removed file state before reporting deletion success", async () => {
+    const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
 
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
       id: "$v1",
@@ -278,96 +273,19 @@ describe("operation safety", () => {
     expect(fixture.refreshRoomState.mock.invocationCallOrder[0]).toBeGreaterThan(
       Math.max(...fixture.client.redactEvent.mock.invocationCallOrder),
     );
-    expect(fixture.versions[0]!.isActive).toBe(false);
-  });
-
-  it("accepts exactly 128 unique media IDs in one deletion request", async () => {
-    const fixture = deletionFixture(
-      Array.from({ length: 128 }, (_, index) => ({
-        id: `$v${index}`,
-        mediaId: `mxc://example.test/v${index}`,
-      })),
-    );
-
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v0")).resolves.toEqual({
-      id: "$v0",
-      deleted: true,
-    });
-
-    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
-    const body = fixture.client.http.authedRequest.mock.calls[0]?.[3] as {
-      media_ids?: unknown;
-    } | undefined;
-    expect(body?.media_ids).toEqual(
-      Array.from({ length: 128 }, (_, index) => `mxc://example.test/v${index}`),
-    );
-    expect(new Set(body?.media_ids as unknown[]).size).toBe(128);
-    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(128);
-    expect(fixture.client.redactEvent).toHaveBeenCalledTimes(128);
-    expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
-      fixture.client.sendStateEvent.mock.invocationCallOrder[0],
-    );
-  });
-
-  it("rejects a cyclic version chain before any media or event mutation", async () => {
-    const fixture = deletionFixture([{ id: "$v2", mediaId: "mxc://example.test/v2" }]);
-    fixture.versions[0].getVersionHistory.mockResolvedValue([
-      fixture.versions[0],
-      fixture.versions[0],
-    ]);
-
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toThrow(
-      "file version history contains a cycle",
-    );
-    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
-    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
-    expect(fixture.client.redactEvent).not.toHaveBeenCalled();
-  });
-
-  it("rejects malformed version event IDs before physical deletion", async () => {
-    const fixture = deletionFixture([{ id: "not-an-event-id", mediaId: "mxc://example.test/v1" }]);
-
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "not-an-event-id")).rejects.toThrow(
-      "file version history contains an invalid event ID",
-    );
-    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
-    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
-    expect(fixture.client.redactEvent).not.toHaveBeenCalled();
   });
 
   it("reports typed partial state when event cleanup fails after media deletion", async () => {
-    const fixture = deletionFixture([
-      { id: "$v2", mediaId: "mxc://example.test/v2" },
-      { id: "$v1", mediaId: "mxc://example.test/v1" },
-    ]);
+    const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
     fixture.client.redactEvent.mockRejectedValueOnce(new Error("redaction failed"));
 
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toMatchObject({
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).rejects.toMatchObject({
       code: "MUTATION_PARTIAL",
       operation: "delete file",
       completedIds: [],
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(false);
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
-  });
-
-  it("includes fully cleaned versions in the typed partial result", async () => {
-    const fixture = deletionFixture([
-      { id: "$v2", mediaId: "mxc://example.test/v2" },
-      { id: "$v1", mediaId: "mxc://example.test/v1" },
-    ]);
-    fixture.client.redactEvent.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("redaction failed"));
-
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).rejects.toMatchObject({
-      code: "MUTATION_PARTIAL",
-      operation: "delete file",
-      completedIds: ["$v2"],
-    });
-    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
-    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(2);
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v2")).toBe(false);
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
   });
 
@@ -481,9 +399,9 @@ describe("operation safety", () => {
     await expect(listSubfolders(storage, tree.id)).resolves.toEqual([]);
   });
 
-  it("waits until an uploaded file is active before reporting success", async () => {
+  it("waits until an uploaded file is visible before reporting success", async () => {
     const tree = makeTree("!upload:example.test", "Upload", true);
-    const file = { id: "$uploaded", isActive: true, getName: () => "nested.txt" };
+    const file = { id: "$uploaded", getName: () => "nested.txt" };
     let visible = false;
     const getFile = vi.fn(() => (visible ? file : null));
     tree.getFile = getFile as never;
@@ -1166,7 +1084,7 @@ describe("operation safety", () => {
 
   it("requires explicit file deletion before deleting a vault", async () => {
     const root = makeTree("!file-bearing:example.test", "WithFile", true);
-    root.listAllFiles = () => [{ id: "$file", getName: () => "payload.bin" }] as never;
+    root.listFiles = () => [{ id: "$file", getName: () => "payload.bin" }] as never;
     const room = {
       roomId: root.id,
       getMyMembership: () => "join",
@@ -1196,7 +1114,7 @@ describe("operation safety", () => {
 
   it("requires explicit file deletion before deleting a folder", async () => {
     const folder = makeTree("!file-bearing-folder:example.test", "WithFile", false);
-    folder.listAllFiles = () => [{ id: "$file", getName: () => "payload.bin" }] as never;
+    folder.listFiles = () => [{ id: "$file", getName: () => "payload.bin" }] as never;
     const room = {
       roomId: folder.id,
       getMyMembership: () => "join",

@@ -15,7 +15,6 @@ function treeWithFile(roomId: string, fileId: string): TreeSpace {
     isTopLevel: true,
     getDirectories: () => [],
     listFiles: () => [file],
-    listAllFiles: () => [file],
     getFile: () => file,
   } as unknown as TreeSpace;
 }

@@ -41,7 +41,6 @@ import {
   StorageError,
 } from "./errors.js";
 import { ConditionTimeoutError, waitForCondition } from "./poll.js";
-import { validateMatrixEventId } from "./constants.js";
 import { validateName } from "./validation.js";
 import {
   getDeletedTreeIds,
@@ -292,10 +291,10 @@ async function resolveFile(
 }
 
 /**
- * Deleting a tree is deliberately a one-room operation.  File versions are
- * physical Matrix media events, so callers must delete files explicitly and
- * observe each result before removing their containing room.  This also
- * prevents a folder/vault delete from silently deleting a nested shared tree.
+ * Deleting a tree is deliberately a one-room operation. Callers must delete
+ * files explicitly and observe each result before removing their containing
+ * room. This also prevents a folder/vault delete from silently deleting a
+ * nested shared tree.
  */
 function assertTreeEmptyForDeletion(
   storage: TeleCryptIOStorage,
@@ -305,13 +304,7 @@ function assertTreeEmptyForDeletion(
   if (spaces.length !== 1) throw new NonEmptyTreeError(tree.id);
   let files: FileBranch[];
   try {
-    files = tree
-      .listAllFiles()
-      .filter(
-        (file) =>
-          !isMarkedFileDeleted(storage, tree.id, file.id) &&
-          !isConfirmedDeletedFile(storage.getClient(), tree.id, file),
-      );
+    files = tree.listFiles().filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
   } catch (error) {
     throw new StorageError("could not enumerate storage files safely", { cause: error });
   }
@@ -447,30 +440,6 @@ function snapshotTreeSpaces(
     for (const child of children) pending.push(child);
   }
   return spaces;
-}
-
-/**
- * A deleted MSC3089 branch is represented by an authoritative empty state
- * event. Inactive branches with metadata are historical versions, and a
- * missing or malformed state cannot prove that the file was deleted.
- */
-function isConfirmedDeletedFile(
-  client: MatrixClient,
-  treeId: string,
-  file: FileBranch,
-): boolean {
-  if (file.isActive) return false;
-  const stateEvents = readRelationEvents(client, treeId, UNSTABLE_MSC3089_BRANCH.name, file.id);
-  if (!stateEvents || stateEvents.length !== 1) return false;
-  const stateEvent = stateEvents[0];
-  if (relationStateKey(stateEvent) !== file.id) return false;
-  const content = stateEvent.getContent?.();
-  return (
-    typeof content === "object" &&
-    content !== null &&
-    !Array.isArray(content) &&
-    Object.keys(content).length === 0
-  );
 }
 
 interface ValidatedDeletionGraph {
@@ -1490,11 +1459,6 @@ export async function renameFile(
   }, "mutation");
 }
 
-interface FileVersionToDelete {
-  branch: FileBranch;
-  mediaId: string;
-}
-
 interface FileDeletionHttpTransport {
   authedRequest: <T>(
     method: Method,
@@ -1503,63 +1467,6 @@ interface FileDeletionHttpTransport {
     body?: unknown,
     options?: { prefix?: string; rawResponseBody?: boolean; abortSignal?: AbortSignal },
   ) => Promise<T>;
-}
-
-/**
- * Resolve the complete encrypted version chain before mutating Matrix.
- *
- * matrix-js-sdk returns the active version first and older versions after it.
- * Treat a repeated event ID as a cycle/invalid relation graph, and bound both
- * the event walk and the media identifiers sent to Synapse. Resolving every
- * media URL first is important: a decryption or relation failure must not leave
- * a partially deleted file chain.
- */
-async function resolveFileVersions(
-  branch: FileBranch,
-  signal?: AbortSignal,
-): Promise<FileVersionToDelete[]> {
-  let history: FileBranch[];
-  try {
-    history = await branch.getVersionHistory();
-  } catch (error) {
-    throw new StorageError("could not resolve file version history safely", { cause: error });
-  }
-  if (!Array.isArray(history) || history.length === 0) {
-    throw new StorageError("file version history is invalid");
-  }
-
-  const eventIds = new Set<string>();
-  const mediaIds = new Set<string>();
-  const versions: FileVersionToDelete[] = [];
-  for (const version of history) {
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    if (!version || typeof version.id !== "string") {
-      throw new StorageError("file version history is invalid");
-    }
-    try {
-      validateMatrixEventId(version.id, "file version event ID");
-    } catch (error) {
-      throw new StorageError("file version history contains an invalid event ID", { cause: error });
-    }
-    if (eventIds.has(version.id)) {
-      throw new StorageError("file version history contains a cycle");
-    }
-    eventIds.add(version.id);
-
-    let fileInfo: Awaited<ReturnType<FileBranch["getFileInfo"]>>;
-    try {
-      fileInfo = await version.getFileInfo();
-    } catch (error) {
-      throw new StorageError("could not resolve encrypted file version safely", { cause: error });
-    }
-    const mediaId = fileInfo?.info?.url;
-    if (typeof mediaId !== "string" || mediaId.length === 0) {
-      throw new StorageError("encrypted file version has no media identifier");
-    }
-    mediaIds.add(mediaId);
-    versions.push({ branch: version, mediaId });
-  }
-  return versions;
 }
 
 function requireFileDeletionTransport(client: MatrixClient): FileDeletionHttpTransport {
@@ -1611,37 +1518,43 @@ export async function deleteFile(
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
-    const versions = await resolveFileVersions(branch, signal);
-    const mediaIds = [...new Set(versions.map(({ mediaId }) => mediaId))];
-    await deleteFileMedia(storage, mediaIds, signal);
+    let fileInfo: Awaited<ReturnType<FileBranch["getFileInfo"]>>;
+    try {
+      fileInfo = await branch.getFileInfo();
+    } catch (error) {
+      throw new StorageError("could not resolve encrypted file safely", { cause: error });
+    }
+    const mediaId = fileInfo?.info?.url;
+    if (typeof mediaId !== "string" || mediaId.length === 0) {
+      throw new StorageError("encrypted file has no media identifier");
+    }
+    await deleteFileMedia(storage, [mediaId], signal);
 
     const completedIds: string[] = [];
     try {
       const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
       if (!client) throw new StorageError("Matrix client unavailable");
-      for (const { branch: version } of versions) {
-        await withRateLimitRetry(
-          () =>
-            withMatrixMutationAbort(
-              client,
-              () => client.sendStateEvent(tree.id, UNSTABLE_MSC3089_BRANCH.name, {}, version.id),
-              signal,
-              "delete file state",
-            ),
-          signal,
-        );
-        await withRateLimitRetry(
-          () =>
-            withMatrixMutationAbort(
-              client,
-              () => client.redactEvent(tree.id, version.id),
-              signal,
-              "delete file event",
-            ),
-          signal,
-        );
-        completedIds.push(version.id);
-      }
+      await withRateLimitRetry(
+        () =>
+          withMatrixMutationAbort(
+            client,
+            () => client.sendStateEvent(tree.id, UNSTABLE_MSC3089_BRANCH.name, {}, branch.id),
+            signal,
+            "delete file state",
+          ),
+        signal,
+      );
+      await withRateLimitRetry(
+        () =>
+          withMatrixMutationAbort(
+            client,
+            () => client.redactEvent(tree.id, branch.id),
+            signal,
+            "delete file event",
+          ),
+        signal,
+      );
+      completedIds.push(branch.id);
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) {
@@ -1665,18 +1578,16 @@ export async function deleteFile(
           await storage.refreshRoomState(tree.id, { signal });
           ensureOperationActive(signal);
           const current = tree.getFile(fileId);
-          return !current || !current.isActive ? true : null;
+          return !current ? true : null;
         },
         { timeoutMs: 15000, signal },
       );
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
-      const detail = "Matrix deletion completed but the inactive file state could not be verified";
+      const detail = "Matrix deletion completed but the file state could not be verified";
       throw new MutationPartialError("delete file", completedIds, detail, { cause: error });
     }
-    for (const { branch: version } of versions) {
-      markFileDeleted(storage.getClient(), tree.id, version.id);
-    }
+    markFileDeleted(storage.getClient(), tree.id, branch.id);
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
   }, "mutation");
@@ -1713,7 +1624,7 @@ export async function uploadFile(
           await storage.refreshRoomState(tree.id, { signal });
           ensureOperationActive(signal);
           const file = tree.getFile(fileId);
-          return file?.isActive ? file : null;
+          return file ?? null;
         },
         { timeoutMs: 15000, signal },
       );

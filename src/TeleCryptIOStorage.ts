@@ -68,7 +68,6 @@ export interface TreeSpace {
   setPermissions(userId: string, role: string): Promise<void>;
   getFile(fileEventId: string): FileBranch | null;
   listFiles(): FileBranch[];
-  listAllFiles(): FileBranch[];
   createFile(
     name: string,
     encryptedContents: ArrayBuffer | Uint8Array,
@@ -79,8 +78,6 @@ export interface TreeSpace {
 
 export interface FileBranch {
   readonly id: string;
-  readonly version: number;
-  readonly isActive: boolean;
   getName(): string;
   setName(name: string): Promise<void>;
   delete(): Promise<void>;
@@ -89,13 +86,6 @@ export interface FileBranch {
     httpUrl: string;
   }>;
   getFileEvent(): Promise<Pick<MatrixEvent, "getContent" | "getTs" | "isDecryptionFailure">>;
-  getVersionHistory(): Promise<FileBranch[]>;
-  createNewVersion(
-    name: string,
-    encryptedContents: ArrayBuffer | Uint8Array,
-    info: Record<string, unknown>,
-    additionalContent?: Record<string, unknown>,
-  ): Promise<{ event_id: string }>;
 }
 
 export interface CreateTeleCryptIOStorageOptions {

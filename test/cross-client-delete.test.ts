@@ -41,10 +41,6 @@ function makeFixture(
 
   const branch = {
     id: FILE_ID,
-    get isActive() {
-      return localBranchContent.active === true;
-    },
-    version: 1,
     getName: () => "cross-client.txt",
     setName: vi.fn(),
     delete: vi.fn(),
@@ -53,10 +49,7 @@ function makeFixture(
       httpUrl: "https://matrix.example.test/media",
     }),
     getFileEvent: vi.fn(),
-    getVersionHistory: vi.fn(),
-    createNewVersion: vi.fn(),
   } as unknown as FileBranch;
-  (branch.getVersionHistory as ReturnType<typeof vi.fn>).mockResolvedValue([branch]);
 
   const room = {
     roomId: ROOM_ID,
@@ -76,8 +69,8 @@ function makeFixture(
     room: { name: "Cross-client vault" },
     isTopLevel: true,
     getDirectories: () => [],
-    listAllFiles: () => [branch],
-    getFile: () => branch,
+    listFiles: () => shared.branchPresent && Object.keys(localBranchContent).length === 0 ? [] : [branch],
+    getFile: () => shared.branchPresent && Object.keys(localBranchContent).length === 0 ? null : branch,
   } as unknown as TreeSpace;
 
   const client: Record<string, unknown> = {

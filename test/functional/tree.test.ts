@@ -1,5 +1,5 @@
 // 1.10 restarts a client with the same persistent crypto store. Node has no
-// native IndexedDB, so provide the same per-file polyfill as versions.test.
+// native IndexedDB, so provide the per-file polyfill used by restart tests.
 import "fake-indexeddb/auto";
 import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";

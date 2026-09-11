@@ -19,7 +19,7 @@ is maintained in its own repository.
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.5.28
+npm install @telecrypt-io/storage@0.6.0
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
@@ -91,20 +91,19 @@ a file tree using Matrix primitives:
 | Vault | A Space (room marked as a file tree) |
 | Folder | A child Space |
 | File | An event pointing at encrypted uploaded content |
-| Version | A newer event superseding the old |
 | Sharing | Room invitation |
 | Permissions | Power levels |
 
 ### Deletion
 
 Vaults and folders are deleted only when they are empty. Delete each file first; deleting a file
-also removes its complete Matrix version chain and reports a typed partial result if cleanup stops
-after some versions. Delete empty child folders before deleting their parent. A nonempty delete
+also removes its encrypted media object before redacting its Matrix event. Delete empty child
+folders before deleting their parent. A nonempty delete
 fails with `NonEmptyTreeError`, so a shared or nested tree is never removed implicitly.
 
 Encryption uses the same scheme as Matrix attachments (AES-CTR with a per-file key, keys
 distributed via the room's Megolm session). File deletion uses TeleCrypt's authenticated Synapse
-storage extension to remove the local media and thumbnail objects before Matrix redaction; stock
+storage extension to remove the local media object before Matrix redaction; stock
 Synapse without that extension cannot provide the SDK deletion contract.
 
 ## Development
