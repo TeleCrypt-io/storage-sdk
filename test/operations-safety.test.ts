@@ -275,6 +275,18 @@ describe("operation safety", () => {
     );
   });
 
+  it("accepts a redacted inactive branch as confirmed deletion", async () => {
+    const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
+    fixture.refreshRoomState.mockImplementation(async () => {
+      fixture.tree.getFile = vi.fn().mockReturnValue({ id: "$v1", isActive: false });
+    });
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
+      deleted: true,
+    });
+  });
+
   it("reports typed partial state when event cleanup fails after media deletion", async () => {
     const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
     fixture.client.redactEvent.mockRejectedValueOnce(new Error("redaction failed"));

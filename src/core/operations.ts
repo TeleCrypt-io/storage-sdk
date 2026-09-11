@@ -1578,7 +1578,10 @@ export async function deleteFile(
           await storage.refreshRoomState(tree.id, { signal });
           ensureOperationActive(signal);
           const current = tree.getFile(fileId);
-          return !current ? true : null;
+          // Matrix SDK keeps a redacted branch event in room state as an
+          // inactive branch. Treat both an absent branch and that redacted
+          // inactive branch as confirmed deletion.
+          return !current || current.isActive === false ? true : null;
         },
         { timeoutMs: 15000, signal },
       );

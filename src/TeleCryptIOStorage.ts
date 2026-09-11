@@ -78,6 +78,8 @@ export interface TreeSpace {
 
 export interface FileBranch {
   readonly id: string;
+  /** Matrix SDK keeps a redacted branch in state as an inactive object. */
+  readonly isActive?: boolean;
   getName(): string;
   setName(name: string): Promise<void>;
   delete(): Promise<void>;
