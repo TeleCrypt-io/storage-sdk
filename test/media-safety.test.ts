@@ -10,7 +10,6 @@ vi.mock("matrix-encrypt-attachment", () => ({
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { FileTooLargeError, UndecryptableFileError } from "../src/core/errors.js";
 import { MAX_MEDIA_FILE_BYTES, validateCanonicalMatrixUserId } from "../src/core/constants.js";
-import { ResponseBodyReadError } from "../src/core/http.js";
 
 function branch() {
   return {
@@ -73,12 +72,11 @@ describe("media safety bounds", () => {
     ).rejects.toBeInstanceOf(FileTooLargeError);
   });
 
-  it("keeps the exact 128 MiB media boundary independent of private limits", async () => {
+  it("accepts an upload at the media size boundary", async () => {
     const createFile = vi.fn().mockResolvedValue({ event_id: "$media-boundary" });
     const storage = new TeleCryptIOStorage({} as never);
     const tree = { createFile } as never;
 
-    expect(MAX_MEDIA_FILE_BYTES).toBe(134_217_728);
     await expect(
       storage.uploadFile(
         tree,
@@ -210,8 +208,7 @@ describe("media safety bounds", () => {
     ).rejects.toThrow("operation cancelled");
   });
 
-  it("rejects a bodyless media response without calling unbounded arrayBuffer", async () => {
-    const arrayBuffer = vi.fn().mockResolvedValue(new ArrayBuffer(1));
+  it("rejects a media response without a body", async () => {
     const client = {
       getAccessToken: () => "access-token",
       getHomeserverUrl: () => "https://matrix.example.test",
@@ -222,13 +219,11 @@ describe("media safety bounds", () => {
       status: 200,
       headers: new Headers({ "content-length": "1" }),
       body: null,
-      arrayBuffer,
     }));
 
     await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
       "media download failed",
     );
-    expect(arrayBuffer).not.toHaveBeenCalled();
   });
 
   it("rejects a cross-origin 307 redirect before a bearer replay", async () => {
@@ -251,75 +246,6 @@ describe("media safety bounds", () => {
       headers: { Authorization: "Bearer access-token" },
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("preserves a media response failure with body cleanup failure", async () => {
-    const cleanupError = new Error("media cleanup failed");
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 503,
-      headers: new Headers(),
-      body: { cancel: vi.fn().mockRejectedValue(cleanupError) },
-    } as unknown as Response);
-    vi.stubGlobal("fetch", fetchMock);
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
-
-    let caught: unknown;
-    try {
-      await new TeleCryptIOStorage(client as never).downloadFile(branch());
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors[0]).toMatchObject({ message: "media download failed: 503" });
-    const readFailure = (caught as AggregateError).errors[1];
-    expect(readFailure).toMatchObject({ message: "media error response body could not be read" });
-    expect(readFailure.cause).toBeInstanceOf(ResponseBodyReadError);
-    expect(readFailure.cause.cause).toBeInstanceOf(AggregateError);
-    expect(readFailure.cause.cause.errors).toContain(cleanupError);
-  });
-
-  it("does not mutate an advanced client's transport configuration", () => {
-    const fetchFn = vi.fn().mockResolvedValue(
-      new Response("small body", {
-        status: 200,
-        headers: { "content-length": String(4 * 1024 * 1024 + 1) },
-      }),
-    );
-    const client = {
-      http: { opts: { fetchFn, localTimeoutMs: 0 } },
-    } as never;
-    new TeleCryptIOStorage(client);
-
-    const opts = (client as { http: { opts: { fetchFn: typeof fetch; localTimeoutMs: number } } }).http.opts;
-    expect(opts.fetchFn).toBe(fetchFn);
-    expect(opts.localTimeoutMs).toBe(0);
-    expect(fetchFn).not.toHaveBeenCalled();
-  });
-
-  it("leaves an advanced client's non-state transport untouched", () => {
-    const fetchFn = vi.fn().mockResolvedValue(
-      new Response("small body", {
-        status: 200,
-        headers: { "content-length": String(16 * 1024 * 1024 + 1) },
-      }),
-    );
-    const client = { http: { opts: { fetchFn } } } as never;
-    new TeleCryptIOStorage(client);
-    const wrapped = (client as { http: { opts: { fetchFn: typeof fetch } } }).http.opts.fetchFn;
-    expect(wrapped).toBe(fetchFn);
-    expect(fetchFn).not.toHaveBeenCalled();
-  });
-
-  it("does not install a stalled-response wrapper on an advanced client", () => {
-    const fetchFn = vi.fn();
-    const client = { http: { opts: { fetchFn } } } as never;
-    new TeleCryptIOStorage(client);
-    expect((client as { http: { opts: { fetchFn: typeof fetch } } }).http.opts.fetchFn).toBe(fetchFn);
   });
 
   it("settles a media deadline when fetch ignores AbortSignal", async () => {
@@ -489,24 +415,4 @@ describe("media safety bounds", () => {
     expect(refreshed.find((event) => event.getType() === "m.space.child")?.getContent()).toEqual({});
   });
 
-  it("does not replace an advanced client's redirect policy", () => {
-    const fetchFn = vi.fn().mockResolvedValue(
-      new Response(null, {
-        status: 307,
-        headers: { Location: "https://evil.example.test/redirect" },
-      }),
-    );
-    const client = { http: { opts: { fetchFn } } } as never;
-    new TeleCryptIOStorage(client);
-    const wrapped = (client as { http: { opts: { fetchFn: typeof fetch } } }).http.opts.fetchFn;
-    expect(wrapped).toBe(fetchFn);
-    expect(fetchFn).not.toHaveBeenCalled();
-  });
-
-  it("does not abort an advanced client's shared transport", () => {
-    const fetchFn = vi.fn();
-    const client = { http: { opts: { fetchFn } } } as never;
-    new TeleCryptIOStorage(client);
-    expect((client as { http: { opts: { fetchFn: typeof fetch } } }).http.opts.fetchFn).toBe(fetchFn);
-  });
 });

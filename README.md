@@ -12,14 +12,14 @@ Files are encrypted on the client before upload. The server stores only opaque c
 never holds the decryption keys. Shared vaults let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
-This repository publishes the library package from annotated exact-version tags whose resulting
-GitHub Release is immutable, with NPM Trusted Publishing/OIDC provenance. The command-line client
-is maintained in its own repository.
+This repository publishes the library package from annotated version tags using npm Trusted
+Publishing. GitHub Releases identify the corresponding source version. The command-line client is
+maintained in its own repository.
 
 ## Install
 
 ```bash
-npm install @telecrypt-io/storage@0.6.0
+npm install @telecrypt-io/storage
 ```
 
 This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
@@ -120,15 +120,12 @@ a production server. This is the shared fixture for the SDK, CLI, and Web functi
 start it from this checkout and reuse it for the sibling repositories. Unit tests may use mocks for
 isolated boundaries, but they do not replace the real-stack checks.
 
-If setup or tests fail, preserve the fixture and its diagnostics; do not run
-`npm run synapse:down` before the private Harness investigation is complete. The fixture scripts do
-not provide that workflow; follow the [Harness operator workflow](https://github.com/TeleCrypt-io/Harness/blob/main/docs/release.md#required-stage-first-sequence)
-for the canonical ordering and stopping boundary.
+If setup or tests fail, inspect the relevant logs, then run `npm run synapse:down` when finished.
 
 After a successful run, use `npm run synapse:down` for scoped teardown. Use
 `./throwaway_synapse/down.sh --wipe` only when a complete fixture reset is explicitly required.
 
-See [RELEASING.md](./RELEASING.md) for the guarded npm release procedure.
+See [RELEASING.md](./RELEASING.md) for the npm release procedure.
 
 ## Licence
 

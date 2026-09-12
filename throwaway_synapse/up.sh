@@ -176,6 +176,7 @@ podman run -d --name "$MAS" --network "$NET" \
 podman_remove_container_if_present "$SYN"
 echo "==> starting Synapse ($SYN)"
 podman run -d --name "$SYN" --network "$NET" \
+  --no-healthcheck \
   -v "$DATA/synapse:/data:Z" \
   --entrypoint python3 \
   "$SYN_IMG" -m synapse.app.homeserver -c /data/homeserver.yaml

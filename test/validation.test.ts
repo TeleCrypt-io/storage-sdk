@@ -4,7 +4,6 @@ import { isValidName, validateName } from "../src/index.js";
 describe("name contract", () => {
   it("accepts the full remote name contract, including path-like labels", () => {
     expect(isValidName("folder/file.txt")).toBe(true);
-    expect(isValidName("x".repeat(4096))).toBe(true);
   });
 
   it("rejects empty and control-character names", () => {

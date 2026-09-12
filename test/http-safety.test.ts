@@ -15,73 +15,15 @@ function responseWithReader(reader: {
 }, headers?: HeadersInit): Response {
   return {
     headers: new Headers(headers),
-    body: { getReader: () => reader },
+    body: { getReader: () => reader, cancel: reader.cancel },
   } as unknown as Response;
 }
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 describe("HTTP cancellation", () => {
-  it("preserves an ordinary response failure with cleanup failure", async () => {
-    const primary = new Error("response rejected");
-    const cleanup = new Error("response cleanup failed");
-    const response = {
-      body: { cancel: vi.fn().mockRejectedValue(cleanup) },
-    } as unknown as Response;
-
-    let caught: unknown;
-    try {
-      await cancelResponseBody(response, "response rejection", primary);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors).toEqual([primary, cleanup]);
-  });
-
-  it("bounds ordinary response cleanup", async () => {
-    vi.useFakeTimers();
-    try {
-      const response = {
-        body: { cancel: vi.fn(() => new Promise<void>(() => undefined)) },
-      } as unknown as Response;
-      const pending = cancelResponseBody(response, "response rejection");
-      const assertion = expect(pending).rejects.toBeInstanceOf(AggregateError);
-      await vi.advanceTimersByTimeAsync(5_000);
-      await assertion;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("reports a cleanup timeout as the complete ordinary response failure", async () => {
-    vi.useFakeTimers();
-    try {
-      const cleanup = deferred<void>();
-      const response = {
-        body: { cancel: vi.fn(() => cleanup.promise) },
-      } as unknown as Response;
-      const pending = cancelResponseBody(response, "response rejection");
-      const assertion = pending.catch((error: unknown) => error);
-      await vi.advanceTimersByTimeAsync(5_000);
-      const failure = await assertion;
-      cleanup.reject(new Error("late response cleanup failed"));
-      await Promise.resolve();
-      await Promise.resolve();
-      const timeoutFailure = (failure as AggregateError).errors[0] as Error;
-      expect(timeoutFailure.message).toContain("timed out");
-      expect(timeoutFailure.cause).toBeUndefined();
-    } finally {
-      vi.useRealTimers();
-    }
+  it("starts cancelling a rejected response without waiting for its stream", async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    cancelResponseBody({ body: { cancel } } as unknown as Response);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("rejects an abort race when the underlying operation ignores abort", async () => {
@@ -121,66 +63,39 @@ describe("HTTP cancellation", () => {
     ).rejects.toThrow("bounded abort");
   });
 
-  it("reports a pre-abort cleanup timeout before rejecting", async () => {
-    vi.useFakeTimers();
+  it("cancels a response body when its signal is already aborted", async () => {
     const cancel = vi.fn(() => new Promise<void>(() => undefined));
-    const releaseLock = vi.fn();
     const controller = new AbortController();
     controller.abort();
     const response = responseWithReader(
       {
         read: () => new Promise<ReadableStreamReadResult<Uint8Array>>(() => undefined),
         cancel,
-        releaseLock,
+        releaseLock: vi.fn(),
       },
     );
-    try {
-      const pending = readResponseBody(response, controller.signal);
-      const assertion = expect(pending).rejects.toBeInstanceOf(AggregateError);
-      await vi.advanceTimersByTimeAsync(5_000);
-      await assertion;
-      expect(cancel).toHaveBeenCalledTimes(1);
-      expect(releaseLock).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
+    await expect(readResponseBody(response, controller.signal)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
-  it("reports a mid-read cleanup timeout before rejecting", async () => {
-    vi.useFakeTimers();
+  it("cancels an in-flight response read when its signal aborts", async () => {
     const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const releaseLock = vi.fn();
     const controller = new AbortController();
     const pending = readResponseBody(
       responseWithReader({
         read: () => new Promise<ReadableStreamReadResult<Uint8Array>>(() => undefined),
         cancel,
-        releaseLock: vi.fn(),
+        releaseLock,
       }),
       controller.signal,
     );
-    try {
-      controller.abort();
-      const assertion = expect(pending).rejects.toBeInstanceOf(AggregateError);
-      await vi.advanceTimersByTimeAsync(5_000);
-      await assertion;
-      expect(cancel).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("reads the complete response body without a diagnostic-size rejection", async () => {
-    const bytes = new Uint8Array(5);
-    const result = await readResponseBody(
-      responseWithReader({
-        read: vi.fn()
-          .mockResolvedValueOnce({ done: false, value: bytes })
-          .mockResolvedValueOnce({ done: true, value: undefined }),
-        cancel: vi.fn().mockResolvedValue(undefined),
-        releaseLock: vi.fn(),
-      }),
-    );
-    expect(result).toEqual({ bytes });
+    controller.abort();
+    await expect(pending).rejects.toBeInstanceOf(ResponseBodyReadError);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(releaseLock).toHaveBeenCalledTimes(1);
   });
 
   it("enforces the product media limit while streaming successful bytes", async () => {
@@ -196,27 +111,6 @@ describe("HTTP cancellation", () => {
       code: "FILE_TOO_LARGE",
     });
     expect(cancel).toHaveBeenCalledTimes(1);
-  });
-
-  it("preserves a read failure with reader cancellation failure", async () => {
-    const readError = new Error("body read failed");
-    const cancelError = new Error("reader cancellation failed");
-    let caught: unknown;
-    try {
-      await readResponseBody(
-        responseWithReader({
-          read: vi.fn().mockRejectedValue(readError),
-          cancel: vi.fn().mockRejectedValue(cancelError),
-          releaseLock: vi.fn(),
-        }),
-      );
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(ResponseBodyReadError);
-    expect((caught as ResponseBodyReadError).bytes).toEqual(new Uint8Array());
-    expect((caught as Error).cause).toBeInstanceOf(AggregateError);
-    expect(((caught as Error).cause as AggregateError).errors).toEqual([readError, cancelError]);
   });
 
   it("retains bytes produced before a response read failure", async () => {

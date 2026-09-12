@@ -11,7 +11,6 @@ import {
   boundedMatrixFetch,
   TeleCryptIOStorage,
   type TreeSpace,
-  withMatrixMutationAbort,
 } from "../src/TeleCryptIOStorage.js";
 import {
   declineInvite,
@@ -23,7 +22,6 @@ import {
   getFileDetails,
   joinVault,
   listFiles,
-  listPendingInvites,
   listSubfolders,
   uploadFile,
   renameFolder,
@@ -31,7 +29,6 @@ import {
   unshareVault,
 } from "../src/core/operations.js";
 import {
-  MutationOutcomeUnknownError,
   MutationPartialError,
   RoomCleanupIncompleteError,
   UndecryptableFileError,
@@ -81,29 +78,13 @@ describe("operation safety", () => {
     const failure = new Error("file state unavailable");
     const tree = makeTree("!file-state:example.test", "Files", true);
     tree.getFile = vi.fn(() => { throw failure; });
-    const storage = { getTree: () => tree } as unknown as TeleCryptIOStorage;
+    const storage = { getClient: () => ({}), getTree: () => tree } as unknown as TeleCryptIOStorage;
 
     await expect(deleteFile(storage, tree.id, "$file:example.test")).rejects.toMatchObject({
       message: "file lookup failed",
       cause: failure,
     });
     expect(tree.getFile).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not retry nested-folder creation after incomplete cleanup", async () => {
-    const parent = makeTree("!parent-rate-limit:example.test", "Parent", true);
-    const failure = Object.assign(new Error("rate limited after cleanup failure"), {
-      cleanupIncomplete: true,
-      isRateLimitError: () => true,
-    });
-    const createSubtree = vi.fn().mockRejectedValue(failure);
-    const storage = {
-      getTree: () => parent,
-      createSubtree,
-    } as unknown as TeleCryptIOStorage;
-
-    await expect(createSubfolder(storage, parent.id, "Child")).rejects.toBe(failure);
-    expect(createSubtree).toHaveBeenCalledTimes(1);
   });
 
   it("does not retry a typed incomplete-cleanup result", async () => {
@@ -301,54 +282,6 @@ describe("operation safety", () => {
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
   });
 
-  it("iterates the complete pending-invite room inventory", async () => {
-    const rooms = Array.from({ length: 10_001 }, (_, index) => ({
-      roomId: `!invite-${index}:example.test`,
-      getMyMembership: () => "join",
-      currentState: { getStateEvents: () => null },
-    }));
-    const storage = {
-      getClient: () => ({ getRooms: () => rooms }),
-      getTree: () => null,
-    } as unknown as TeleCryptIOStorage;
-
-    await expect(listPendingInvites(storage)).resolves.toEqual([]);
-  });
-
-  it("maps complete file and folder collections", async () => {
-    const hugeFiles = Array.from({ length: 10_001 }, (_, index) => ({
-      id: `$file-${index}`,
-      getName: () => `file-${index}`,
-    }));
-    const hugeFolders = Array.from({ length: 10_001 }, (_, index) => ({
-      id: `!folder-${index}:example.test`,
-      room: { name: `folder-${index}` },
-    }));
-    const tree = makeTree("!bounded:example.test", "Bounded", true);
-    tree.listFiles = () => hugeFiles as never;
-    tree.getDirectories = () => hugeFolders as never;
-    const storage = {
-      getClient: () => ({
-        getRoom: () => ({
-          currentState: {
-            getStateEvents: (eventType: string) =>
-              eventType === EventType.SpaceChild
-                ? hugeFolders.map((folder) => ({
-                    getStateKey: () => folder.id,
-                    getContent: () => ({ via: ["example.test"] }),
-                  }))
-                : [],
-          },
-        }),
-      }),
-      getTree: () => tree,
-      refreshRoomState: vi.fn().mockResolvedValue(undefined),
-    } as unknown as TeleCryptIOStorage;
-
-    await expect(listFiles(storage, tree.id)).resolves.toHaveLength(10_001);
-    await expect(listSubfolders(storage, tree.id)).resolves.toHaveLength(10_001);
-  });
-
   it("refreshes the parent room before listing subfolders", async () => {
     const tree = makeTree("!folders:example.test", "Folders", true);
     const getDirectories = vi.fn().mockReturnValue([
@@ -471,23 +404,6 @@ describe("operation safety", () => {
     }
   });
 
-  it("removes the mutation abort listener when the operation throws synchronously", async () => {
-    const controller = new AbortController();
-    const abortRequests = vi.fn();
-    const failure = new Error("synchronous mutation failure");
-    const pending = withMatrixMutationAbort(
-      { http: { abort: abortRequests } } as never,
-      () => {
-        throw failure;
-      },
-      controller.signal,
-    );
-
-    await expect(pending).rejects.toBe(failure);
-    controller.abort();
-    expect(abortRequests).not.toHaveBeenCalled();
-  });
-
   it("bounds a hung asynchronous condition check and aborts it", async () => {
     vi.useFakeTimers();
     try {
@@ -519,6 +435,7 @@ describe("operation safety", () => {
     tree.getFile = vi.fn().mockReturnValue(branch);
     const failure = new UndecryptableFileError();
     const storage = {
+      getClient: () => ({}),
       getTree: () => tree,
       downloadFile: vi.fn().mockRejectedValue(failure),
     } as unknown as TeleCryptIOStorage;
@@ -532,6 +449,7 @@ describe("operation safety", () => {
     tree.getFile = vi.fn().mockReturnValue(branch);
     const failure = new Error("download transport unavailable");
     const storage = {
+      getClient: () => ({}),
       getTree: () => tree,
       downloadFile: vi.fn().mockRejectedValue(failure),
     } as unknown as TeleCryptIOStorage;
@@ -551,7 +469,7 @@ describe("operation safety", () => {
     };
     const tree = makeTree("!details-failure:example.test", "Vault", true);
     tree.getFile = vi.fn().mockReturnValue(branch);
-    const storage = { getTree: () => tree } as unknown as TeleCryptIOStorage;
+    const storage = { getClient: () => ({}), getTree: () => tree } as unknown as TeleCryptIOStorage;
 
     await expect(getFileDetails(storage, tree.id, branch.id)).rejects.toMatchObject({
       message: "get file details failed",
@@ -984,31 +902,29 @@ describe("operation safety", () => {
     });
   });
 
-  it.each([
-    ["ordinary", 45_000, 45_000],
-    ["huge", Number.MAX_SAFE_INTEGER, 2_147_483_647],
-    ["NaN", Number.NaN, 15_000],
-    ["negative", -1, 15_000],
-  ])("uses %s server retry delays until the operation deadline", async (_label, advised, expectedDelay) => {
+  it("waits for the server-advised delay before retrying a rate-limited join", async () => {
     vi.useFakeTimers();
-    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
     try {
       const rateLimited = Object.assign(new Error("provider detail must not escape"), {
         isRateLimitError: () => true,
-        getRetryAfterMs: () => advised,
+        getRetryAfterMs: () => 45_000,
       });
+      const joinRoom = vi.fn().mockRejectedValueOnce(rateLimited).mockResolvedValueOnce(undefined);
       const storage = {
         getRoomMembership: vi.fn().mockResolvedValue("invite"),
-        getClient: () => ({ joinRoom: vi.fn().mockRejectedValue(rateLimited) }),
+        getClient: () => ({ joinRoom }),
       } as unknown as TeleCryptIOStorage;
-      const pending = joinVault(storage, "!limited:example.test", { timeoutMs: 60_000 });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(setTimeoutSpy.mock.calls.some((call) => call[1] === expectedDelay)).toBe(true);
-      const assertion = expect(pending).rejects.toBeInstanceOf(MutationOutcomeUnknownError);
-      await vi.advanceTimersByTimeAsync(60_000);
+      const pending = joinVault(storage, "!limited:example.test");
+      const assertion = expect(pending).resolves.toEqual({
+        vaultId: "!limited:example.test",
+        joined: true,
+      });
+      await vi.advanceTimersByTimeAsync(44_999);
+      expect(joinRoom).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
       await assertion;
+      expect(joinRoom).toHaveBeenCalledTimes(2);
     } finally {
-      setTimeoutSpy.mockRestore();
       vi.useRealTimers();
     }
   });

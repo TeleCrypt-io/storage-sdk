@@ -34,7 +34,7 @@ import {
 } from "./core/errors.js";
 import {
   MAX_MEDIA_FILE_BYTES,
-  MAX_MATRIX_IDENTIFIER_LENGTH,
+  MAX_MATRIX_IDENTIFIER_BYTES,
   validateCanonicalMatrixUserId,
   validateMatrixDeviceId,
   validateMatrixEventId,
@@ -174,9 +174,6 @@ const MEDIA_TIMEOUT_MS = 30000;
 const MATRIX_HTTP_TIMEOUT_MS = 30000;
 const CLEANUP_TIMEOUT_MS = 30000;
 const RECOVERY_CRYPTO_TIMEOUT_MS = 60000;
-const MAX_MEDIA_REDIRECTS = 5;
-const MAX_MATRIX_TOKEN_LENGTH = 8192;
-const MAX_MIMETYPE_LENGTH = 255;
 
 function cloneCryptoCallbacks(callbacks?: CryptoCallbacks): CryptoCallbacks {
   // MatrixClient retains this object for the lifetime of the client. Keep the
@@ -190,7 +187,6 @@ function cloneCryptoCallbacks(callbacks?: CryptoCallbacks): CryptoCallbacks {
  * If cancellation arrives after the mutation starts, the outcome is explicitly
  * unknown: the caller must reconcile and may safely retry idempotent work. */
 export function withMatrixMutationAbort<T>(
-  _client: MatrixClient,
   operation: () => Promise<T>,
   signal?: AbortSignal,
   operationName = "Matrix mutation",
@@ -286,7 +282,7 @@ export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
           (response.status >= 300 && response.status < 400)
         ) {
           const failure = new Error("Matrix redirect rejected");
-          await cancelResponseBody(response, "Matrix redirect", failure);
+          cancelResponseBody(response);
           throw failure;
         }
         return await readMatrixResponse(
@@ -350,7 +346,6 @@ function validateHomeserverUrl(value: string): URL {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value.length > 2048 ||
     value.trim() !== value ||
     /[\s\u0000-\u001f\u007f]/.test(value)
   ) {
@@ -380,7 +375,6 @@ function validateMatrixToken(value: string | null): asserts value is string {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value.length > MAX_MATRIX_TOKEN_LENGTH ||
     value.trim() !== value ||
     /[\s\u0000-\u001f\u007f]/.test(value)
   ) {
@@ -392,7 +386,7 @@ function validateMatrixIdentifier(value: string, name: string): void {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value.length > MAX_MATRIX_IDENTIFIER_LENGTH ||
+    new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
     /[\s\u0000-\u001f\u007f]/.test(value)
   ) {
     throw new Error(`invalid Matrix ${name}`);
@@ -407,7 +401,6 @@ function validateMimetype(value: string): void {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value.length > MAX_MIMETYPE_LENGTH ||
     /[\u0000-\u001f\u007f]/.test(value) ||
     !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:\s*;\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=[^;\r\n]+)*$/.test(
       value,
@@ -615,7 +608,7 @@ function parseMatrixStateResponse(value: unknown): Record<string, unknown>[] {
     }
     validateMatrixIdentifier(event.type, "state event type");
     if (
-      event.state_key.length > MAX_MATRIX_IDENTIFIER_LENGTH ||
+      new TextEncoder().encode(event.state_key).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
       /[\s\u0000-\u001f\u007f]/.test(event.state_key)
     ) {
       throw new Error("invalid Matrix state event key");
@@ -653,30 +646,13 @@ function isGoneRoomError(error: unknown): boolean {
   );
 }
 
-function throwWithCleanupDetail(error: unknown, roomId: string, cleanupError?: unknown): never {
-  const cleanupCause = cleanupError === undefined
-    ? error
-    : new AggregateError([error, cleanupError], "operation and room cleanup failed", { cause: error });
-  const cleanup = new RoomCleanupIncompleteError(roomId, cleanupCause);
-  if (error instanceof Error) {
-    try {
-      Object.defineProperty(error, "cleanupIncomplete", {
-        value: true,
-        enumerable: false,
-      });
-      Object.defineProperty(error, "cleanupError", {
-        value: cleanup,
-        enumerable: false,
-      });
-    } catch {
-      // A non-extensible provider error cannot carry the cleanup marker. Throw
-      // the existing typed cleanup error and retain the provider error as cause
-      // so callers cannot mistake the mutation for a safe retry.
-      throw cleanup;
-    }
-    throw error;
-  }
-  throw cleanup;
+function throwWithCleanupDetail(error: unknown, roomId: string, cleanupError: unknown): never {
+  const cause = new AggregateError(
+    [error, cleanupError],
+    "operation and room cleanup failed",
+    { cause: error },
+  );
+  throw new RoomCleanupIncompleteError(roomId, cause);
 }
 
 /**
@@ -1365,7 +1341,6 @@ export class TeleCryptIOStorage {
     if (
       typeof recoveryKey !== "string" ||
       recoveryKey.length === 0 ||
-      recoveryKey.length > 256 ||
       /[^A-Za-z0-9 ]/.test(recoveryKey)
     ) {
       throw new RecoveryRestoreError();
@@ -1537,23 +1512,21 @@ export class TeleCryptIOStorage {
   }
 
   /** Cleans up only a room created by this operation and reports incomplete cleanup. */
-  private async cleanupCreatedRoom(roomId: string, _signal?: AbortSignal): Promise<void> {
+  private async cleanupCreatedRoom(roomId: string): Promise<void> {
     // Cleanup is compensating work. It must not inherit the caller's already
     // aborted deadline, or a timed-out create could never even attempt leave.
     const cleanupSignal = new AbortController().signal;
-    let incomplete = false;
     let safeToForget = true;
     const failures: unknown[] = [];
     try {
       await TeleCryptIOStorage.withTimeout(
-        withMatrixMutationAbort(this.client, () => this.client.leave(roomId), cleanupSignal),
+        withMatrixMutationAbort(() => this.client.leave(roomId), cleanupSignal),
         CLEANUP_TIMEOUT_MS,
         "room leave cleanup",
         cleanupSignal,
       );
     } catch (error) {
       if (!isGoneRoomError(error)) {
-        incomplete = true;
         failures.push(error);
         // A timed-out or failed leave may still be in flight. Do not race a
         // forget request against it; the caller must retry cleanup later.
@@ -1563,19 +1536,18 @@ export class TeleCryptIOStorage {
     if (safeToForget) {
       try {
         await TeleCryptIOStorage.withTimeout(
-          withMatrixMutationAbort(this.client, () => this.client.forget(roomId), cleanupSignal),
+          withMatrixMutationAbort(() => this.client.forget(roomId), cleanupSignal),
           CLEANUP_TIMEOUT_MS,
           "room forget cleanup",
           cleanupSignal,
         );
       } catch (error) {
         if (!isGoneRoomError(error)) {
-          incomplete = true;
           failures.push(error);
         }
       }
     }
-    if (incomplete) {
+    if (failures.length > 0) {
       const cause = failures.length === 1
         ? failures[0]
         : new AggregateError(failures, "room cleanup failed");
@@ -1602,7 +1574,7 @@ export class TeleCryptIOStorage {
     const getSender = (event as { getSender?: () => string | null }).getSender;
     if (!currentUserId || typeof getSender !== "function" || getSender() !== currentUserId) return false;
     const eventId = validateMatrixEventId(event.getId(), "state event ID");
-    await withMatrixMutationAbort(this.client, () => this.client.redactEvent(roomId, eventId), signal);
+    await withMatrixMutationAbort(() => this.client.redactEvent(roomId, eventId), signal);
     return true;
   }
 
@@ -1622,7 +1594,6 @@ export class TeleCryptIOStorage {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     const response = await TeleCryptIOStorage.withMutationTimeout(
       withMatrixMutationAbort(
-        this.client,
         () => this.client.createRoom(this.treeRoomOptions(name)),
         signal,
         `${operation} room creation`,
@@ -1650,7 +1621,7 @@ export class TeleCryptIOStorage {
       return await this.waitForTreeSpace(roomId, operation, signal);
     } catch (error) {
       try {
-        await this.cleanupCreatedRoom(roomId, signal);
+        await this.cleanupCreatedRoom(roomId);
       } catch (cleanupError) {
         throwWithCleanupDetail(error, roomId, cleanupError);
       }
@@ -1712,7 +1683,6 @@ export class TeleCryptIOStorage {
         parentLinkAttempted = true;
         const parentLink = await TeleCryptIOStorage.withMutationTimeout(
           withMatrixMutationAbort(
-            this.client,
             () =>
               this.client.sendStateEvent(
                 currentParent.id,
@@ -1734,7 +1704,6 @@ export class TeleCryptIOStorage {
         childLinkAttempted = true;
         const childLink = await TeleCryptIOStorage.withMutationTimeout(
           withMatrixMutationAbort(
-            this.client,
             () =>
               this.client.sendStateEvent(
                 tree.id,
@@ -1766,7 +1735,6 @@ export class TeleCryptIOStorage {
         // Reconcile and retry these idempotent relation updates with a fresh
         // signal, then report incomplete cleanup if they cannot be verified.
         const compensationSignal = new AbortController().signal;
-        let rollbackIncomplete = false;
         const cleanupFailures: unknown[] = [];
         // A sendStateEvent rejection is ambiguous: the homeserver may have
         // committed the event before the client observed a transport error.
@@ -1779,7 +1747,6 @@ export class TeleCryptIOStorage {
             if (parentLinkEventId) {
               await TeleCryptIOStorage.withTimeout(
                 withMatrixMutationAbort(
-                  this.client,
                   () => this.client.redactEvent(currentParent.id, parentLinkEventId!),
                   compensationSignal,
                 ),
@@ -1803,7 +1770,6 @@ export class TeleCryptIOStorage {
                   );
                 })
               ) {
-                rollbackIncomplete = true;
                 cleanupFailures.push(new Error("parent link rollback could not be verified"));
               }
             } else {
@@ -1812,12 +1778,10 @@ export class TeleCryptIOStorage {
               // Without an event ID, a missing link after one refresh does not
               // prove that a request which timed out will never commit.
               if (!removed) {
-                rollbackIncomplete = true;
                 cleanupFailures.push(new Error("parent link rollback could not be verified"));
               }
             }
           } catch (cleanupError) {
-            rollbackIncomplete = true;
             cleanupFailures.push(cleanupError);
           }
         }
@@ -1826,7 +1790,6 @@ export class TeleCryptIOStorage {
             if (childLinkEventId) {
               await TeleCryptIOStorage.withTimeout(
                 withMatrixMutationAbort(
-                  this.client,
                   () => this.client.redactEvent(tree.id, childLinkEventId!),
                   compensationSignal,
                 ),
@@ -1850,28 +1813,25 @@ export class TeleCryptIOStorage {
                   );
                 })
               ) {
-                rollbackIncomplete = true;
                 cleanupFailures.push(new Error("child link rollback could not be verified"));
               }
             } else {
               await this.refreshRoomState(tree.id, { signal: compensationSignal });
               const removed = await this.removeParentLink(tree.id, currentParent.id, compensationSignal);
               if (!removed) {
-                rollbackIncomplete = true;
                 cleanupFailures.push(new Error("child link rollback could not be verified"));
               }
             }
           } catch (cleanupError) {
-            rollbackIncomplete = true;
             cleanupFailures.push(cleanupError);
           }
         }
         try {
-          await this.cleanupCreatedRoom(tree.id, effectiveSignal);
+          await this.cleanupCreatedRoom(tree.id);
         } catch (cleanupError) {
           cleanupFailures.push(cleanupError);
         }
-        if (rollbackIncomplete || cleanupFailures.length > 0) {
+        if (cleanupFailures.length > 0) {
           const cleanupCause = cleanupFailures.length === 1
             ? cleanupFailures[0]
             : new AggregateError(cleanupFailures, "tree creation cleanup failed");
@@ -1998,7 +1958,6 @@ export class TeleCryptIOStorage {
     let response: { event_id?: unknown };
     try {
       response = await withMatrixMutationAbort(
-        this.client,
         () =>
           tree.createFile(
             name,
@@ -2117,7 +2076,7 @@ export class TeleCryptIOStorage {
     else signal?.addEventListener("abort", abortExternal, { once: true });
     let ciphertext: ArrayBuffer;
     try {
-      for (let redirect = 0; ; redirect += 1) {
+      for (;;) {
         const res = await raceWithAbort(
           fetch(currentUrl, {
             redirect: "manual",
@@ -2133,32 +2092,28 @@ export class TeleCryptIOStorage {
         if ([301, 302, 303, 307, 308].includes(res.status)) {
           let redirectError: Error | undefined;
           let nextUrl: URL | undefined;
-          if (redirect >= MAX_MEDIA_REDIRECTS) {
-            redirectError = new Error("media download redirect limit exceeded");
+          const location = res.headers.get("location");
+          if (!location) {
+            redirectError = new Error("media download redirect missing location");
           } else {
-            const location = res.headers.get("location");
-            if (!location) {
-              redirectError = new Error("media download redirect missing location");
-            } else {
-              try {
-                nextUrl = new URL(location, currentUrl);
-              } catch (error) {
-                redirectError = new Error("media download redirect is invalid", { cause: error });
-              }
-              if (
-                nextUrl &&
-                ((nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") ||
-                  nextUrl.username !== "" ||
-                  nextUrl.password !== "")
-              ) {
-                redirectError = new Error("media download redirect is invalid");
-              }
-              if (nextUrl && nextUrl.origin !== trustedOrigin) {
-                redirectError = new Error("media download redirect crossed origin");
-              }
+            try {
+              nextUrl = new URL(location, currentUrl);
+            } catch (error) {
+              redirectError = new Error("media download redirect is invalid", { cause: error });
+            }
+            if (
+              nextUrl &&
+              ((nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") ||
+                nextUrl.username !== "" ||
+                nextUrl.password !== "")
+            ) {
+              redirectError = new Error("media download redirect is invalid");
+            }
+            if (nextUrl && nextUrl.origin !== trustedOrigin) {
+              redirectError = new Error("media download redirect crossed origin");
             }
           }
-          await cancelResponseBody(res, "media redirect", redirectError);
+          cancelResponseBody(res);
           if (redirectError) throw redirectError;
           currentUrl = nextUrl!;
           continue;

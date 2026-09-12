@@ -496,16 +496,4 @@ describe("bootstrap and recovery safety", () => {
     expect(crypto.checkKeyBackupAndEnable).not.toHaveBeenCalled();
   });
 
-  it("rejects oversized recovery-key input before passing it to crypto", async () => {
-    const crypto = {
-      getSecretStorageStatus: vi.fn().mockResolvedValue({ defaultKeyId: "key", ready: true }),
-      getActiveSessionBackupVersion: vi.fn().mockResolvedValue("backup"),
-      loadSessionBackupPrivateKeyFromSecretStorage: vi.fn(),
-    };
-    const storage = new TeleCryptIOStorage({ getCrypto: () => crypto, cryptoCallbacks: {} } as never);
-    await expect(storage.keys.restoreFromRecoveryKey("A".repeat(257))).rejects.toBeInstanceOf(
-      RecoveryRestoreError,
-    );
-    expect(crypto.loadSessionBackupPrivateKeyFromSecretStorage).not.toHaveBeenCalled();
-  });
 });

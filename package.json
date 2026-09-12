@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "license": "BUSL-1.1",
   "type": "module",
   "packageManager": "npm@11.19.0",
@@ -25,12 +25,10 @@
     "node": "24.20.0"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "scripts": {
     "build": "tsc",
-    "typecheck:tests": "tsc -p tsconfig.test.json",
     "lint": "eslint src test --ext .ts",
     "test": "vitest run",
     "test:unit": "vitest run --config vitest.unit.config.ts",

@@ -1,17 +1,15 @@
 /** Maximum plaintext media body accepted by the non-streaming SDK surface. */
 export const MAX_MEDIA_FILE_BYTES = 128 * 1024 * 1024;
 
-/** Matrix's canonical identifier bounds used at authenticated-client boundaries. */
-export const MAX_MATRIX_USER_ID_BYTES = 255;
-export const MAX_MATRIX_DEVICE_ID_LENGTH = 128;
-export const MAX_MATRIX_IDENTIFIER_LENGTH = 512;
+/** Matrix IDs and state-event strings are limited by UTF-8 bytes, not JS characters. */
+export const MAX_MATRIX_IDENTIFIER_BYTES = 255;
 
 const MATRIX_SERVER_NAME_PATTERN = "(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9.-]+)(?::\\d{1,5})?";
 const MATRIX_SERVER_NAME_REGEXP = new RegExp(`^${MATRIX_SERVER_NAME_PATTERN}$`);
 const MATRIX_USER_ID_PATTERN = new RegExp(`^@([A-Za-z0-9._=+\\-/]+):(${MATRIX_SERVER_NAME_PATTERN})$`);
-const MATRIX_DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
+const MATRIX_DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]+$/;
 const MATRIX_ROOM_ID_PATTERN = new RegExp(`^![A-Za-z0-9._~+\\/-]+:${MATRIX_SERVER_NAME_PATTERN}$`);
-const MATRIX_EVENT_ID_PATTERN = /^\$[A-Za-z0-9._~:/+\-]{1,511}$/;
+const MATRIX_EVENT_ID_PATTERN = /^\$[A-Za-z0-9._~:/+\-]+$/;
 
 /**
  * Validates a new/current Matrix identity and binds its server name exactly to
@@ -22,7 +20,7 @@ const MATRIX_EVENT_ID_PATTERN = /^\$[A-Za-z0-9._~:/+\-]{1,511}$/;
 export function validateCanonicalMatrixUserId(value: unknown, serverName: unknown): string {
   if (
     typeof value !== "string" ||
-    new TextEncoder().encode(value).byteLength > MAX_MATRIX_USER_ID_BYTES
+    new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES
   ) {
     throw new Error("invalid Matrix user ID");
   }
@@ -37,7 +35,7 @@ export function validateCanonicalMatrixUserId(value: unknown, serverName: unknow
 }
 
 export function validateMatrixDeviceId(value: unknown): string {
-  if (typeof value !== "string" || value.length > MAX_MATRIX_DEVICE_ID_LENGTH || !MATRIX_DEVICE_ID_PATTERN.test(value)) {
+  if (typeof value !== "string" || !MATRIX_DEVICE_ID_PATTERN.test(value)) {
     throw new Error("invalid Matrix device ID");
   }
   return value;
@@ -46,7 +44,7 @@ export function validateMatrixDeviceId(value: unknown): string {
 export function validateMatrixRoomId(value: unknown, name = "room ID"): string {
   if (
     typeof value !== "string" ||
-    value.length > MAX_MATRIX_IDENTIFIER_LENGTH ||
+    new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
     !MATRIX_ROOM_ID_PATTERN.test(value)
   ) {
     throw new Error(`invalid Matrix ${name}`);
@@ -57,7 +55,7 @@ export function validateMatrixRoomId(value: unknown, name = "room ID"): string {
 export function validateMatrixEventId(value: unknown, name = "event ID"): string {
   if (
     typeof value !== "string" ||
-    value.length > MAX_MATRIX_IDENTIFIER_LENGTH ||
+    new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
     !MATRIX_EVENT_ID_PATTERN.test(value)
   ) {
     throw new Error(`invalid Matrix ${name}`);

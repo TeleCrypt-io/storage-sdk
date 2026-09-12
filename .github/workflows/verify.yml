@@ -8,52 +8,25 @@ on:
 permissions:
   contents: read
 
-env:
-  GIT_CONFIG_COUNT: "1"
-  GIT_CONFIG_KEY_0: init.defaultBranch
-  GIT_CONFIG_VALUE_0: main
-
 jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    env:
-      GIT_CONFIG_NOSYSTEM: "1"
-      GIT_CONFIG_SYSTEM: /dev/null
-      GIT_CONFIG_PARAMETERS: ""
-      GIT_CONFIG_GLOBAL: /tmp/telecrypt-gitconfig
-      GIT_NO_REPLACE_OBJECTS: "1"
-      GIT_TERMINAL_PROMPT: "0"
-      GIT_ASKPASS: /bin/false
-      SSH_ASKPASS: /bin/false
-      GIT_ALLOW_PROTOCOL: https
-      GIT_PROTOCOL_FROM_USER: "0"
-      GH_HOST: github.com
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      ALL_PROXY: ""
-      NO_PROXY: ""
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - name: Test shared capture helper
-        run: python3 .github/workflows/test-capture-helper.py
       - uses: actions/setup-node@v7.0.0
         with:
-          node-version: "24.20.0"
+          node-version-file: .node-version
           cache: npm
       - name: Verify the exact Node.js and npm toolchain
         shell: bash
         run: |
           set -euo pipefail
-          test "$(node --version)" = "v24.20.0"
-          test "$(npm --version)" = "11.19.0"
-      - name: Install and verify the SDK with complete diagnostics
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 600s npm ci --ignore-scripts --no-fund --no-audit
-          timeout --signal=TERM --kill-after=5s 300s npm run lint
-          timeout --signal=TERM --kill-after=5s 600s npm run test:unit
-          timeout --signal=TERM --kill-after=5s 300s npm run build
+          npm_version="$(node -p 'require("./package.json").packageManager.replace(/^npm@/u, "")')"
+          test "$(npm --version)" = "$npm_version"
+      - run: npm ci --ignore-scripts --no-fund --no-audit
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run build

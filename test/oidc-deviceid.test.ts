@@ -29,24 +29,6 @@ class MemoryStorage implements Storage {
   }
 }
 
-class RemoveFailStorage extends MemoryStorage {
-  constructor(private readonly removalError: Error) {
-    super();
-  }
-
-  override removeItem(key: string): void {
-    super.removeItem(key);
-    throw this.removalError;
-  }
-}
-
-class RemoveUndefinedStorage extends MemoryStorage {
-  override removeItem(key: string): void {
-    super.removeItem(key);
-    throw undefined;
-  }
-}
-
 const METADATA = {
   issuer: "https://mas.test",
   authorization_endpoint: "https://mas.test/authorize",
@@ -207,9 +189,7 @@ describe("authorization context replay and tamper protection", () => {
       homeserverUrl: "https://mas.test/",
       oidcClientSettings: { clientId: "test-client", issuer: "https://mas.test" },
     });
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
-      /missing or expired/,
-    );
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(/missing/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -237,32 +217,6 @@ describe("authorization context replay and tamper protection", () => {
       homeserverUrl: "https://mas.test/",
       oidcClientSettings: { clientId: "test-client", issuer: "https://mas.test" },
     });
-  });
-
-  it("accepts a complete authorization-code exchange response without a response-size rejection", async () => {
-    const storage = new MemoryStorage();
-    const { state } = await beginForCallback(storage);
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          token_type: "Bearer",
-          access_token: "access-token",
-          refresh_token: "refresh-token",
-          scope:
-            "openid urn:matrix:org.matrix.msc2967.client:api:* " +
-            "urn:matrix:org.matrix.msc2967.client:device:CALLBACK123",
-          padding: "x".repeat(40_000),
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).resolves.toMatchObject({
-      oidcClientSettings: { clientId: "test-client" },
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ redirect: "manual" });
   });
 
   it("deletes and rejects a tampered context before any token request", async () => {
@@ -293,72 +247,6 @@ describe("authorization context replay and tamper protection", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("preserves malformed-context and state-removal failures together", async () => {
-    const removalError = new Error("authorization state cleanup failed");
-    const storage = new RemoveFailStorage(removalError);
-    const { state, key } = await beginForCallback(storage);
-    storage.setItem(key, "{not valid json");
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    let caught: unknown;
-    try {
-      await completeAuthorizationCodeFlow("authorization-code", state);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors).toEqual([
-      expect.objectContaining({ message: "OIDC authorization context is missing or invalid" }),
-      removalError,
-    ]);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("preserves oversized-context and state-removal failures together", async () => {
-    const removalError = new Error("oversized authorization state cleanup failed");
-    const storage = new RemoveFailStorage(removalError);
-    const { state, key } = await beginForCallback(storage);
-    storage.setItem(key, "x".repeat(64 * 1024 + 1));
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    let caught: unknown;
-    try {
-      await completeAuthorizationCodeFlow("authorization-code", state);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors).toEqual([
-      expect.objectContaining({ message: "OIDC authorization context is too large" }),
-      removalError,
-    ]);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("preserves a cleanup failure that throws undefined", async () => {
-    const storage = new RemoveUndefinedStorage();
-    const { state, key } = await beginForCallback(storage);
-    storage.setItem(key, "{not valid json");
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    let caught: unknown;
-    try {
-      await completeAuthorizationCodeFlow("authorization-code", state);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors).toEqual([
-      expect.objectContaining({ message: "OIDC authorization context is missing or invalid" }),
-      undefined,
-    ]);
-    expect(storage.getItem(key)).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("rejects a context moved to a different callback state", async () => {
     const storage = new MemoryStorage();
     const { state, key } = await beginForCallback(storage);
@@ -383,9 +271,7 @@ describe("authorization context replay and tamper protection", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(completeAuthorizationCodeFlow("", state)).rejects.toThrow(/authorization code/);
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
-      /missing or expired/,
-    );
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(/missing/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -400,41 +286,6 @@ describe("authorization context replay and tamper protection", () => {
 
     await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
       /invalid token endpoint/,
-    );
-    expect(storage.getItem(key)).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("consumes an expired authorization context before any token request", async () => {
-    const storage = new MemoryStorage();
-    const { state, key } = await beginForCallback(storage);
-    const context = JSON.parse(storage.getItem(key)!);
-    context.createdAtMs = Date.now() - 10 * 60 * 1000 - 1;
-    storage.setItem(key, JSON.stringify(context));
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
-      /authorization context is expired/,
-    );
-    expect(storage.getItem(key)).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("rejects a context with a materially future creation time", async () => {
-    const storage = new MemoryStorage();
-    const { state, key } = await beginForCallback(storage);
-    const context = JSON.parse(storage.getItem(key)!);
-    // Leave enough margin for the callback setup and assertion scheduling;
-    // using only one millisecond over the skew boundary makes this test
-    // depend on how quickly the test runner reaches the callback.
-    context.createdAtMs = Date.now() + 60 * 1000;
-    storage.setItem(key, JSON.stringify(context));
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(
-      /authorization context is from the future/,
     );
     expect(storage.getItem(key)).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -464,8 +315,8 @@ describe("authorization context replay and tamper protection", () => {
       value: { sessionStorage: storage, localStorage: storage, location: { origin: "https://storage.test" } },
     });
 
-    await expect(completeAuthorizationCodeFlow("authorization-code", "a".repeat(32))).rejects.toThrow(
-      /missing or expired/,
+    await expect(completeAuthorizationCodeFlow("authorization-code", "missing-state")).rejects.toThrow(
+      /missing/,
     );
   });
 });

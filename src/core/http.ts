@@ -25,8 +25,6 @@ export interface ResponseBodyOptions {
   abortError?: () => Error;
 }
 
-const RESPONSE_CLEANUP_TIMEOUT_MS = 5_000;
-
 function abortError(): DOMException {
   return new DOMException("The operation was aborted", "AbortError");
 }
@@ -73,84 +71,25 @@ export function raceWithAbort<T>(
   });
 }
 
-function combineCleanupFailures(
-  primaryError: unknown | undefined,
-  cleanupFailures: readonly unknown[],
-  message: string,
-): AggregateError {
-  const errors = primaryError === undefined ? [...cleanupFailures] : [primaryError, ...cleanupFailures];
-  return new AggregateError(errors, message, {
-    cause: primaryError ?? cleanupFailures[0],
-  });
-}
-
-async function runBoundedCleanup(
-  cleanup: () => PromiseLike<void> | void,
-  operation: string,
-): Promise<void> {
-  const pending = Promise.resolve().then(cleanup);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => {
-        reject(new Error(`${operation} cleanup timed out`));
-      },
-      RESPONSE_CLEANUP_TIMEOUT_MS,
-    );
-  });
+function startCancellation(cancel: () => PromiseLike<unknown> | unknown): void {
   try {
-    await Promise.race([pending, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    void Promise.resolve(cancel()).catch(() => {});
+  } catch {
+    // Cleanup must not delay or replace the operation result.
   }
 }
 
-/** Await cleanup for a response that is being rejected before its body is read. */
-export async function cancelResponseBody(
-  response: Response,
-  operation: string,
-  primaryError?: unknown,
-): Promise<void> {
-  if (!response.body) return;
-  try {
-    await runBoundedCleanup(() => response.body!.cancel(), `${operation} response`);
-  } catch (error) {
-    throw combineCleanupFailures(
-      primaryError,
-      [error],
-      primaryError === undefined
-        ? `${operation} response cleanup was incomplete`
-        : `${operation} failed and response cleanup was incomplete`,
-    );
-  }
+/** Start discarding a rejected response without waiting for provider cleanup. */
+export function cancelResponseBody(response: Response): void {
+  if (response.body) startCancellation(() => response.body!.cancel());
 }
 
-async function cancelReaderAndRelease(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  operation: string,
-  primaryError?: unknown,
-): Promise<void> {
-  const cleanupFailures: unknown[] = [];
-  try {
-    await runBoundedCleanup(() => reader.cancel(), `${operation} reader cancellation`);
-  } catch (error) {
-    cleanupFailures.push(error);
-  }
-  // Cancellation is awaited before releasing the reader, so cleanup failures
-  // stay part of the current operation instead of mutating a later error.
+function cancelReaderAndRelease(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  startCancellation(() => reader.cancel());
   try {
     reader.releaseLock();
-  } catch (error) {
-    cleanupFailures.push(error);
-  }
-  if (cleanupFailures.length > 0) {
-    throw combineCleanupFailures(
-      primaryError,
-      cleanupFailures,
-      primaryError === undefined
-        ? `${operation} reader cleanup was incomplete`
-        : `${operation} failed and reader cleanup was incomplete`,
-    );
+  } catch {
+    // The reader may still have a pending read; the caller's error remains authoritative.
   }
 }
 
@@ -160,19 +99,9 @@ async function readResponseBodyInternal(
   options: ResponseBodyOptions = {},
   maxBytes?: number,
 ): Promise<ResponseBody> {
-  const cancelAbortedResponse = async (failure: Error): Promise<void> => {
-    if (!response.body) return;
-    let reader: ReadableStreamDefaultReader<Uint8Array>;
-    try {
-      reader = response.body.getReader();
-    } catch (error) {
-      throw combineCleanupFailures(failure, [error], "response reader setup failed after abort");
-    }
-    await cancelReaderAndRelease(reader, "response body", failure);
-  };
   if (signal?.aborted) {
     const failure = options.abortError?.() ?? abortError();
-    await cancelAbortedResponse(failure);
+    cancelResponseBody(response);
     throw failure;
   }
   if (
@@ -185,7 +114,7 @@ async function readResponseBodyInternal(
     const contentLength = response.headers.get("content-length");
     if (contentLength !== null && /^\d+$/u.test(contentLength) && Number(contentLength) > maxBytes) {
       const tooLarge = new FileTooLargeError();
-      await cancelResponseBody(response, "media response", tooLarge);
+      cancelResponseBody(response);
       throw tooLarge;
     }
   }
@@ -195,17 +124,14 @@ async function readResponseBodyInternal(
   try {
     reader = response.body.getReader();
   } catch (error) {
-    let failure: unknown = error;
-    try {
-      await cancelResponseBody(response, "response body reader setup", error);
-    } catch (cleanupError) {
-      failure = cleanupError;
-    }
-    throw new ResponseBodyReadError(new Uint8Array(), failure);
+    cancelResponseBody(response);
+    throw new ResponseBodyReadError(new Uint8Array(), error);
   }
-  let abortCancellation: Promise<void> | undefined;
+  let cancellationStarted = false;
   const cancelReader = (): void => {
-    abortCancellation ??= runBoundedCleanup(() => reader.cancel(), "response body reader");
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    startCancellation(() => reader.cancel());
   };
   const chunks: Uint8Array<ArrayBuffer>[] = [];
   let bytesRead = 0;
@@ -258,34 +184,11 @@ async function readResponseBodyInternal(
   } catch (error) {
     if (signal?.aborted) {
       const failure = new ResponseBodyReadError(joinBytes(chunks, bytesRead), error);
-      const cleanupFailures: unknown[] = [];
-      if (abortCancellation) {
-        try {
-          await abortCancellation;
-        } catch (cleanupError) {
-          cleanupFailures.push(cleanupError);
-        }
-      }
-      try {
-        reader.releaseLock();
-      } catch (cleanupError) {
-        cleanupFailures.push(cleanupError);
-      }
-      if (cleanupFailures.length > 0) {
-        throw combineCleanupFailures(
-          failure,
-          cleanupFailures,
-          "response body read failed and reader cleanup was incomplete",
-        );
-      }
+      cancelReader();
+      try { reader.releaseLock(); } catch { /* Pending reads release with cancellation. */ }
       throw failure;
     }
-    try {
-      await cancelReaderAndRelease(reader, "response body", error);
-    } catch (cleanupError) {
-      if (error instanceof FileTooLargeError) throw cleanupError;
-      throw new ResponseBodyReadError(joinBytes(chunks, bytesRead), cleanupError);
-    }
+    cancelReaderAndRelease(reader);
     if (error instanceof FileTooLargeError) throw error;
     throw new ResponseBodyReadError(joinBytes(chunks, bytesRead), error);
   }

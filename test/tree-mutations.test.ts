@@ -113,7 +113,6 @@ describe("tree mutations", () => {
     const controller = new AbortController();
     let release!: () => void;
     const pending = withMatrixMutationAbort(
-      {} as never,
       () => new Promise<string>((resolve) => {
         release = () => resolve("committed");
       }),
@@ -273,8 +272,9 @@ describe("tree mutations", () => {
     );
   });
 
-  it("cleans the exact child and partial parent link when linking fails", async () => {
-    const child = tree("!child-failed:example.test", "Child", false);
+  it("reports incomplete cleanup after an ambiguous child link", async () => {
+    const childRoom = { currentState: { getStateEvents: vi.fn(() => []) } };
+    const child = { ...tree("!child-failed:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
     const parentRoom = {
       currentState: {
         setStateEvents: vi.fn(),
@@ -294,7 +294,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => [{ roomId: parent.id }, { roomId: child.id }],
-      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : null),
+      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : roomId === child.id ? childRoom : null),
       createRoom: vi.fn(async () => ({ room_id: child.id })),
       unstableGetFileTreeSpace: vi.fn((roomId: string) => trees.get(roomId) ?? null),
       sendStateEvent: vi.fn()
@@ -307,7 +307,17 @@ describe("tree mutations", () => {
     };
     const storage = new TeleCryptIOStorage(client as never);
 
-    await expect(storage.createSubtree(parent, "Child")).rejects.toThrow("parent link failed");
+    let caught: unknown;
+    try {
+      await storage.createSubtree(parent, "Child");
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RoomCleanupIncompleteError);
+    expect(caught).toMatchObject({ code: "ROOM_CLEANUP_INCOMPLETE", roomId: child.id });
+    const cause = (caught as Error).cause as AggregateError;
+    expect(cause.errors[0]).toMatchObject({ message: "parent link failed" });
+    expect(cause.errors[1]).toMatchObject({ message: "child link rollback could not be verified" });
     expect(client.redactEvent).toHaveBeenCalledWith(parent.id, "$parent-link");
     expect(client.leave).toHaveBeenCalledWith(child.id);
     expect(client.forget).toHaveBeenCalledWith(child.id);
@@ -399,7 +409,11 @@ describe("tree mutations", () => {
     } catch (error) {
       caught = error;
     }
-    expect(caught).toMatchObject({ message: "ambiguous parent link failure", cleanupIncomplete: true });
+    expect(caught).toMatchObject({
+      name: "RoomCleanupIncompleteError",
+      code: "ROOM_CLEANUP_INCOMPLETE",
+      roomId: child.id,
+    });
     expect(client.redactEvent).not.toHaveBeenCalled();
     expect(client.leave).toHaveBeenCalledWith(child.id);
     expect(client.forget).toHaveBeenCalledWith(child.id);
@@ -514,16 +528,18 @@ describe("tree mutations", () => {
       caught = error;
     }
     expect(caught).toMatchObject({
-      message: "post-link refresh failed",
-      cleanupIncomplete: true,
+      name: "RoomCleanupIncompleteError",
+      code: "ROOM_CLEANUP_INCOMPLETE",
+      roomId: child.id,
     });
     expect(client.redactEvent).toHaveBeenCalledWith(child.id, "$child-link");
     expect(client.leave).toHaveBeenCalledWith(child.id);
     expect(client.forget).toHaveBeenCalledWith(child.id);
   });
 
-  it("preserves the link failure and attaches incomplete cleanup detail", async () => {
-    const child = tree("!child-redact-failed:example.test", "Child", false);
+  it("wraps a failed room cleanup with the original and cleanup errors", async () => {
+    const childRoom = { currentState: { getStateEvents: vi.fn(() => []) } };
+    const child = { ...tree("!child-redact-failed:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
     const parentRoom = {
       currentState: {
         setStateEvents: vi.fn(),
@@ -542,7 +558,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => [{ roomId: parent.id }, { roomId: child.id }],
-      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : null),
+      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : roomId === child.id ? childRoom : null),
       createRoom: vi.fn(async () => ({ room_id: child.id })),
       unstableGetFileTreeSpace: vi.fn((roomId: string) => (roomId === parent.id ? parent : child)),
       sendStateEvent: vi.fn()
@@ -561,17 +577,12 @@ describe("tree mutations", () => {
     } catch (error) {
       caught = error;
     }
-    expect(caught).toMatchObject({
-      message: "parent link failed",
-      cleanupIncomplete: true,
-      cleanupError: {
-        name: "RoomCleanupIncompleteError",
-        code: "ROOM_CLEANUP_INCOMPLETE",
-        roomId: child.id,
-      } satisfies Partial<RoomCleanupIncompleteError>,
-    });
-    expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toBe("parent link failed");
+    expect(caught).toBeInstanceOf(RoomCleanupIncompleteError);
+    expect(caught).toMatchObject({ code: "ROOM_CLEANUP_INCOMPLETE", roomId: child.id });
+    const cause = (caught as Error).cause as AggregateError;
+    expect(cause.errors[0]).toMatchObject({ message: "parent link failed" });
+    expect(cause.errors[1]).toBeInstanceOf(AggregateError);
+    expect((cause.errors[1] as AggregateError).errors.map(String)).toContain("Error: redaction failed");
   });
 
   it.each(["leave", "forget"] as const)("surfaces %s cleanup failures", async (failedStep) => {

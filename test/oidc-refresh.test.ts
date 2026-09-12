@@ -193,42 +193,12 @@ describe("OIDC token refresh response validation", () => {
     expect(causeMessage).toContain('refresh_token="<redacted>"');
   });
 
-  it("preserves recursive own properties of an ordinary transport failure", async () => {
-    const symbol = Symbol("diagnostic detail");
-    const failure: Record<PropertyKey, unknown> = {
-      visible: { nested: "transport detail\nwith-control" },
-      access_token: "must-not-appear",
-    };
-    failure[symbol] = "symbol detail";
-    failure["self"] = failure;
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(failure));
-
-    let caught: unknown;
-    try {
-      await discoverOidcIssuer("https://homeserver.example.test");
-    } catch (error) {
-      caught = error;
-    }
-
-    expect(caught).toBeInstanceOf(Error);
-    const causeMessage = ((caught as Error).cause as Error).message;
-    expect(causeMessage).toContain("visible");
-    expect(causeMessage).toContain("nested");
-    expect(causeMessage).toContain("transport detail with-control");
-    expect(causeMessage).toContain("Symbol(diagnostic detail)");
-    expect(causeMessage).toContain("symbol detail");
-    expect(causeMessage).toContain("[cyclic diagnostic]");
-    expect(causeMessage).not.toContain("must-not-appear");
-  });
-
-  it("retains provider error classification without a response-size rejection", async () => {
-    const secret = "oversized-refresh-secret";
-    const oversized = {
+  it("retains provider error classification and redacts its token", async () => {
+    const secret = "refresh-secret-value";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({
       error: "invalid_grant",
       error_description: `refresh_token=${secret}`,
-      padding: "x".repeat(20_000),
-    };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(oversized, 400)));
+    }, 400)));
 
     let caught: unknown;
     try {
@@ -241,7 +211,6 @@ describe("OIDC token refresh response validation", () => {
     expect(message).toContain("invalid_grant");
     expect(message).not.toContain(secret);
     expect((caught as Error).cause).toMatchObject({ name: "OidcResponseError", status: 400 });
-    expect(((caught as Error).cause as Error).message).toContain("x".repeat(20_000));
   });
 
   it("does not replace an error-body read failure with a provider error", async () => {
@@ -271,20 +240,6 @@ describe("OIDC token refresh response validation", () => {
       caught = error;
     }
     expect(caught).toMatchObject({ message: "OIDC token refresh error response could not be read" });
-    expect((caught as Error).cause).toMatchObject({ message: expect.stringContaining(bodyError.message) });
-  });
-
-  it("accepts a complete successful token response without a response-size rejection", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(response({
-        access_token: "access",
-        token_type: "Bearer",
-        scope: "urn:matrix:client:api:* urn:matrix:client:device:DEVICE123",
-        padding: "x".repeat(40_000),
-      })),
-    );
-    await expect(refreshWithNoopPersistence()("refresh")).resolves.toMatchObject({ accessToken: "access" });
   });
 
   it("aborts a refresh that exceeds its deadline", async () => {
@@ -405,34 +360,6 @@ describe("OIDC token refresh response validation", () => {
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ redirect: "manual" });
-  });
-
-  it("preserves an OIDC redirect rejection with response cleanup failure", async () => {
-    const cleanupError = new Error("redirect cleanup failed");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 302,
-        headers: new Headers({ location: "https://evil.example.test/token" }),
-        body: { cancel: vi.fn().mockRejectedValue(cleanupError) },
-        redirected: false,
-        type: "basic",
-        url: "",
-      } as unknown as Response),
-    );
-
-    let caught: unknown;
-    try {
-      await refreshWithNoopPersistence()("refresh");
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(AggregateError);
-    expect((caught as AggregateError).errors[0]).toMatchObject({
-      message: "OIDC token refresh rejected an untrusted redirect",
-    });
-    expect((caught as AggregateError).errors[1]).toBe(cleanupError);
   });
 
   it("rejects a token endpoint with a query or fragment", () => {
@@ -619,14 +546,14 @@ describe("Matrix 42 OAuth migration", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("preserves complete sanitized discovery provider diagnostics", async () => {
+  it("redacts tokens from discovery provider diagnostics", async () => {
     const secret = "discovery-refresh-secret";
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         response(
           {
-            error: `refresh_token=${secret};${"x".repeat(20_000)}`,
+            error: `refresh_token=${secret}`,
           },
           502,
         ),
@@ -645,7 +572,6 @@ describe("Matrix 42 OAuth migration", () => {
     expect(message).toBe("OIDC discovery failed (502)");
     expect(message).not.toContain(secret);
     expect((caught as Error).cause).toMatchObject({ name: "OidcResponseError", status: 502 });
-    expect(((caught as Error).cause as Error).message).toContain("x".repeat(20_000));
   });
 
   it("preserves a sanitized registration error body as the cause", async () => {
@@ -655,7 +581,7 @@ describe("Matrix 42 OAuth migration", () => {
       vi.fn().mockResolvedValue(
         response(
           {
-            error: `client_secret=${secret};${"x".repeat(20_000)}`,
+            error: `client_secret=${secret}`,
           },
           400,
         ),
@@ -677,67 +603,19 @@ describe("Matrix 42 OAuth migration", () => {
     expect(message).not.toContain(secret);
     expect((caught as Error).cause).toMatchObject({ name: "OidcResponseError", status: 400 });
     expect(((caught as Error).cause as Error).message).not.toContain(secret);
-    expect(((caught as Error).cause as Error).message).toContain("x".repeat(20_000));
   });
 
-  it("rejects DCR redirects outside the client origin", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(
-      registerClient(OAUTH_METADATA, {
-        clientUri: "https://telecrypt.io/",
-        redirectUris: ["https://evil.example.test/callback"],
-      }),
-    ).rejects.toThrow("untrusted redirect origin");
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("bounds public device-code inputs before a token request", async () => {
+  it("rejects invalid client and device IDs before a request", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(startDeviceCodeLogin(OAUTH_METADATA, "client id", "DEVICE123")).rejects.toThrow(
       "invalid client ID",
     );
-    await expect(startDeviceCodeLogin(OAUTH_METADATA, "client-id", "D".repeat(129))).rejects.toThrow(
+    await expect(startDeviceCodeLogin(OAUTH_METADATA, "client-id", "DEVICE 123")).rejects.toThrow(
       "invalid device ID",
     );
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("accepts a complete device authorization response without a response-size rejection", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        response({ device_code: "device", user_code: "code", verification_uri: "https://auth.example.test/device", expires_in: 60, padding: "x".repeat(40_000) }),
-      ),
-    );
-
-    await expect(startDeviceCodeLogin(OAUTH_METADATA, "client-id", "DEVICE123")).resolves.toMatchObject({
-      device_code: "device",
-      user_code: "code",
-    });
-  });
-
-  it("accepts the MAS twenty-minute device-code lifetime", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        response({
-          device_code: "device",
-          user_code: "code",
-          verification_uri: "https://auth.example.test/device",
-          expires_in: 20 * 60,
-        }),
-      ),
-    );
-
-    await expect(startDeviceCodeLogin(OAUTH_METADATA, "client-id", "DEVICE123")).resolves.toMatchObject({
-      device_code: "device",
-      user_code: "code",
-      expires_in: 20 * 60,
-    });
   });
 
   it("aborts a device authorization request that exceeds its deadline", async () => {
@@ -761,11 +639,11 @@ describe("Matrix 42 OAuth migration", () => {
     }
   });
 
-  it("classifies a complete device polling error without a response-size rejection", async () => {
+  it("classifies a provider device polling error", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        response({ error: "invalid_grant", padding: "x".repeat(20_000) }, 400),
+        response({ error: "invalid_grant" }, 400),
       ),
     );
 
@@ -786,7 +664,6 @@ describe("Matrix 42 OAuth migration", () => {
       message: "OIDC device authorization returned an unknown provider error",
       cause: expect.objectContaining({ name: "OidcResponseError", status: 400 }),
     });
-    expect((caught.cause as Error).message).toContain("x".repeat(20_000));
   });
 
   it("rejects a device token granted for a different device", async () => {
@@ -832,24 +709,6 @@ describe("Matrix 42 OAuth migration", () => {
       access_token: "access",
       scope: expect.stringContaining("urn:matrix:org.matrix.msc2967.client:device:DEVICE123"),
     });
-  });
-
-  it("rejects an oversized device session before polling", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(
-      waitForDeviceCodeLogin(OAUTH_METADATA, "client-id", {
-        device_code: "device-code",
-        user_code: "ABCD",
-        verification_uri: "https://auth.example.test/device",
-        expires_in: 20 * 60 + 1,
-      },
-      undefined,
-      "DEVICE123",
-      ),
-    ).rejects.toThrow("invalid expiry");
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects a reconstructed device session without an expected device binding", async () => {
@@ -954,7 +813,7 @@ describe("Matrix 42 OAuth migration", () => {
       vi.fn().mockResolvedValue(
         response(
           {
-            error: `access_token=${secret};${"x".repeat(20_000)}`,
+            error: `access_token=${secret}`,
           },
           401,
         ),

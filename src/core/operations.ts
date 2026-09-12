@@ -173,9 +173,7 @@ function requiresMutationReconciliation(error: unknown): boolean {
   return (
     error instanceof MutationOutcomeUnknownError ||
     error instanceof RoomCreationAmbiguousError ||
-    error instanceof RoomCleanupIncompleteError ||
-    (error instanceof Error &&
-      (error as Error & { cleanupIncomplete?: unknown }).cleanupIncomplete === true)
+    error instanceof RoomCleanupIncompleteError
   );
 }
 
@@ -252,7 +250,6 @@ async function resolveTree(
 }
 
 function isMarkedTreeDeleted(storage: TeleCryptIOStorage, treeId: string): boolean {
-  if (typeof storage.getClient !== "function") return false;
   return isTreeDeleted(storage.getClient(), treeId);
 }
 
@@ -261,7 +258,6 @@ function isMarkedFileDeleted(
   treeId: string,
   fileId: string,
 ): boolean {
-  if (typeof storage.getClient !== "function") return false;
   return isFileDeleted(storage.getClient(), treeId, fileId);
 }
 
@@ -545,12 +541,12 @@ async function unlinkExternalParents(
       // the relation update.
       mutationAttempted = true;
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(client, () => client.sendStateEvent(parentId, EventType.SpaceChild, {}, rootId), signal),
+        () => withMatrixMutationAbort(() => client.sendStateEvent(parentId, EventType.SpaceChild, {}, rootId), signal),
         signal,
       );
       if (signal?.aborted) throw new StorageError("operation cancelled");
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(client, () => client.sendStateEvent(rootId, EventType.SpaceParent, {}, parentId), signal),
+        () => withMatrixMutationAbort(() => client.sendStateEvent(rootId, EventType.SpaceParent, {}, parentId), signal),
         signal,
       );
       await storage.refreshRoomState(parentId, { signal });
@@ -602,11 +598,11 @@ async function relinkExternalParents(
   for (const parentId of externalParents) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     await withRateLimitRetry(
-      () => withMatrixMutationAbort(client, () => client.sendStateEvent(parentId, EventType.SpaceChild, { via: [via] }, rootId), signal),
+      () => withMatrixMutationAbort(() => client.sendStateEvent(parentId, EventType.SpaceChild, { via: [via] }, rootId), signal),
       signal,
     );
     await withRateLimitRetry(
-      () => withMatrixMutationAbort(client, () => client.sendStateEvent(rootId, EventType.SpaceParent, { via: [via] }, parentId), signal),
+      () => withMatrixMutationAbort(() => client.sendStateEvent(rootId, EventType.SpaceParent, { via: [via] }, parentId), signal),
       signal,
     );
     await storage.refreshRoomState(parentId, { signal });
@@ -659,7 +655,7 @@ async function deleteRoomDeterministically(
       }
       try {
         await withRateLimitRetry(
-          () => withMatrixMutationAbort(client, () => client.kick(roomId, member.userId, "Room deleted"), signal),
+          () => withMatrixMutationAbort(() => client.kick(roomId, member.userId, "Room deleted"), signal),
           signal,
         );
         markRoomMutationComplete();
@@ -682,7 +678,7 @@ async function deleteRoomDeterministically(
     const ownMembership = await storage.getRoomMembership(roomId, undefined, { signal });
     if (ownMembership === "join" || ownMembership === "invite" || ownMembership === "knock") {
       try {
-        await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.leave(roomId), signal), signal);
+        await withRateLimitRetry(() => withMatrixMutationAbort(() => client.leave(roomId), signal), signal);
         markRoomMutationComplete();
       } catch (error) {
         if (!isGoneError(error)) throw error;
@@ -690,7 +686,7 @@ async function deleteRoomDeterministically(
     }
 
     try {
-      await withRateLimitRetry(() => withMatrixMutationAbort(client, () => client.forget(roomId), signal), signal);
+      await withRateLimitRetry(() => withMatrixMutationAbort(() => client.forget(roomId), signal), signal);
       markRoomMutationComplete();
     } catch (error) {
       if (!isGoneError(error)) throw error;
@@ -799,7 +795,7 @@ export async function joinVault(
     if (membership === "join") return { vaultId, joined: true };
     try {
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(storage.getClient(), () => storage.getClient().joinRoom(vaultId), signal),
+        () => withMatrixMutationAbort(() => storage.getClient().joinRoom(vaultId), signal),
         signal,
       );
     } catch (err) {
@@ -959,7 +955,7 @@ export async function declineInvite(
       }
       try {
         await withRateLimitRetry(
-          () => withMatrixMutationAbort(client, () => client.leave(vaultId), signal),
+          () => withMatrixMutationAbort(() => client.leave(vaultId), signal),
           signal,
         );
       } catch (error) {
@@ -972,7 +968,7 @@ export async function declineInvite(
       }
       try {
         await withRateLimitRetry(
-          () => withMatrixMutationAbort(client, () => client.forget(vaultId), signal),
+          () => withMatrixMutationAbort(() => client.forget(vaultId), signal),
           signal,
         );
       } catch (error) {
@@ -1014,7 +1010,6 @@ export async function shareVault(
     ensureOperationActive(operation.signal);
     const tree = await resolveTree(storage, vaultId, operation.signal);
     const pending = withTreeMutation(storage.getClient(), async () => {
-      const client = storage.getClient();
       try {
         ensureOperationActive(operation.signal);
         await storage.refreshRoomState(tree.id, { signal: operation.signal });
@@ -1042,7 +1037,7 @@ export async function shareVault(
           if (isActiveMembership(currentMembership ?? "")) continue;
           try {
             await withRateLimitRetry(
-              () => withMatrixMutationAbort(client, () => space.invite(userId), operation.signal),
+              () => withMatrixMutationAbort(() => space.invite(userId), operation.signal),
               operation.signal,
             );
             completedRoomIds.add(space.id);
@@ -1071,7 +1066,7 @@ export async function shareVault(
             throw new StorageError("share will not demote an existing owner");
           }
           await withRateLimitRetry(
-            () => withMatrixMutationAbort(client, () => space.setPermissions(userId, role), operation.signal),
+            () => withMatrixMutationAbort(() => space.setPermissions(userId, role), operation.signal),
             operation.signal,
           );
           completedRoomIds.add(space.id);
@@ -1148,7 +1143,6 @@ export async function unshareVault(
             await withRateLimitRetry(
               () =>
                 withMatrixMutationAbort(
-                  storage.getClient(),
                   () => storage.getClient().kick(space.id, userId, "unshared"),
                   operation.signal,
                 ),
@@ -1281,9 +1275,8 @@ async function renameTree(
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     try {
-      const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
       await withRateLimitRetry(
-        () => client ? withMatrixMutationAbort(client, () => tree.setName(name), signal) : tree.setName(name),
+        () => withMatrixMutationAbort(() => tree.setName(name), signal),
         signal,
       );
       await waitForCondition(
@@ -1434,9 +1427,8 @@ export async function renameFile(
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
     try {
-      const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
       await withRateLimitRetry(
-        () => client ? withMatrixMutationAbort(client, () => branch.setName(name), signal) : branch.setName(name),
+        () => withMatrixMutationAbort(() => branch.setName(name), signal),
         signal,
       );
       // `setName` resolves when the homeserver accepts the state event, but a
@@ -1488,7 +1480,6 @@ async function deleteFileMedia(
     await withRateLimitRetry(
       () =>
         withMatrixMutationAbort(
-          client,
           () =>
             http.authedRequest(
               Method.Post,
@@ -1532,12 +1523,10 @@ export async function deleteFile(
 
     const completedIds: string[] = [];
     try {
-      const client = typeof storage.getClient === "function" ? storage.getClient() : undefined;
-      if (!client) throw new StorageError("Matrix client unavailable");
+      const client = storage.getClient();
       await withRateLimitRetry(
         () =>
           withMatrixMutationAbort(
-            client,
             () => client.sendStateEvent(tree.id, UNSTABLE_MSC3089_BRANCH.name, {}, branch.id),
             signal,
             "delete file state",
@@ -1547,7 +1536,6 @@ export async function deleteFile(
       await withRateLimitRetry(
         () =>
           withMatrixMutationAbort(
-            client,
             () => client.redactEvent(tree.id, branch.id),
             signal,
             "delete file event",
