@@ -18,18 +18,27 @@ const MATRIX_EVENT_ID_PATTERN = /^\$[A-Za-z0-9._~:/+\-]+$/;
  * backend hostname that differs from the user-visible Matrix server name.
  */
 export function validateCanonicalMatrixUserId(value: unknown, serverName: unknown): string {
+  const userId = validateMatrixUserId(value);
+  if (typeof serverName !== "string" || !MATRIX_SERVER_NAME_REGEXP.test(serverName)) {
+    throw new Error("invalid Matrix server name");
+  }
+  const match = userId.match(MATRIX_USER_ID_PATTERN);
+  if (!match || match[2].toLowerCase() !== serverName.toLowerCase()) {
+    throw new Error("invalid Matrix user ID for this homeserver");
+  }
+  return userId;
+}
+
+/** Validates a Matrix user ID without binding it to a particular homeserver. */
+export function validateMatrixUserId(value: unknown): string {
   if (
     typeof value !== "string" ||
     new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES
   ) {
     throw new Error("invalid Matrix user ID");
   }
-  if (typeof serverName !== "string" || !MATRIX_SERVER_NAME_REGEXP.test(serverName)) {
-    throw new Error("invalid Matrix server name");
-  }
-  const match = value.match(MATRIX_USER_ID_PATTERN);
-  if (!match || match[2].toLowerCase() !== serverName.toLowerCase()) {
-    throw new Error("invalid Matrix user ID for this homeserver");
+  if (!MATRIX_USER_ID_PATTERN.test(value)) {
+    throw new Error("invalid Matrix user ID");
   }
   return value;
 }

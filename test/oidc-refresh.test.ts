@@ -574,6 +574,28 @@ describe("Matrix 42 OAuth migration", () => {
     expect((caught as Error).cause).toMatchObject({ name: "OidcResponseError", status: 502 });
   });
 
+  it("keeps status and sanitized body when successful discovery JSON is invalid", async () => {
+    const secret = "discovery-access-secret";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({
+      ...OAUTH_METADATA,
+      token_endpoint: "https://other.example.test/token",
+      access_token: secret,
+    })));
+
+    let caught: unknown;
+    try {
+      await discoverOidcIssuer("https://homeserver.example.test");
+    } catch (error) {
+      caught = error;
+    }
+
+    const diagnostic = (caught as Error).cause as Error;
+    expect(diagnostic).toMatchObject({ name: "OidcResponseError", status: 200 });
+    expect(diagnostic.message).toContain('"token_endpoint"');
+    expect(diagnostic.message).toContain('"access_token":"<redacted>"');
+    expect(diagnostic.message).not.toContain(secret);
+  });
+
   it("preserves a sanitized registration error body as the cause", async () => {
     const secret = "registration-client-secret";
     vi.stubGlobal(
@@ -883,6 +905,28 @@ describe("Matrix 42 OAuth migration", () => {
     await expect(
       whoAmI("https://homeserver.example.test:8448", "access-token", "homeserver.example.test:8448"),
     ).rejects.toThrow("foreign user ID");
+  });
+
+  it("keeps status and sanitized body when a successful whoami response has a foreign identity", async () => {
+    const secret = "whoami-access-secret";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({
+      user_id: "@alice:other.example.test",
+      device_id: "DEVICE123",
+      access_token: secret,
+    })));
+
+    let caught: unknown;
+    try {
+      await whoAmI("https://homeserver.example.test", "access-token", "homeserver.example.test");
+    } catch (error) {
+      caught = error;
+    }
+
+    const diagnostic = (caught as Error).cause as Error;
+    expect(diagnostic).toMatchObject({ name: "OidcResponseError", status: 200 });
+    expect(diagnostic.message).toContain('"user_id":"<redacted>"');
+    expect(diagnostic.message).toContain('"access_token":"<redacted>"');
+    expect(diagnostic.message).not.toContain(secret);
   });
 
   it.each([

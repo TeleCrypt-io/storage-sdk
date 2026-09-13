@@ -537,7 +537,7 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
   });
 }
 
-function parseHttpUrl(value: unknown, name: string): URL {
+function parseHttpUrl(value: unknown, name: string, allowQuery = false): URL {
   const text = requireOpaqueString(value, name);
   let parsed: URL;
   try {
@@ -551,7 +551,7 @@ function parseHttpUrl(value: unknown, name: string): URL {
     (parsed.protocol === "http:" && !isLoopbackHostname(parsed.hostname)) ||
     parsed.username !== "" ||
     parsed.password !== "" ||
-    parsed.search !== "" ||
+    (!allowQuery && parsed.search !== "") ||
     parsed.hash !== "" ||
     (parsed.toString() !== text && !isRootWithoutSlash)
   ) {
@@ -564,6 +564,22 @@ function isWithinIssuerPath(issuer: URL, endpoint: URL): boolean {
   if (issuer.pathname === "/") return true;
   const prefix = issuer.pathname.endsWith("/") ? issuer.pathname : `${issuer.pathname}/`;
   return endpoint.pathname === issuer.pathname || endpoint.pathname.startsWith(prefix);
+}
+
+/** Validates an endpoint against the configured homeserver and optional issuer path. */
+export function assertOidcEndpoint(
+  value: unknown,
+  trustedHomeserver: string,
+  name: string,
+  issuer?: URL,
+  allowQuery = false,
+): string {
+  const homeserver = parseHttpUrl(trustedHomeserver, "homeserver URL");
+  const endpoint = parseHttpUrl(value, name, allowQuery);
+  if (endpoint.origin !== homeserver.origin || (issuer && !isWithinIssuerPath(issuer, endpoint))) {
+    throw new StorageError(`${name} must remain on the configured OIDC origin and issuer path`);
+  }
+  return endpoint.toString();
 }
 
 function matrixAuthMetadataEndpoint(homeserver: URL): string {
@@ -850,7 +866,11 @@ export async function discoverOidcIssuer(
       throw failure;
     }
     ensureOidcNotCancelled(signal, "discovery");
-    return validateTrustedAuthMetadata(body);
+    try {
+      return validateTrustedAuthMetadata(body);
+    } catch (error) {
+      throw responseValidationFailure("discovery", response, responseText ?? "", error);
+    }
   } catch (err) {
     if (err instanceof AggregateError) throw err;
     throw formatProviderFailure("discovery", err);
@@ -1442,13 +1462,23 @@ export async function whoAmI(
         new StorageError("OIDC identity confirmation returned an invalid response"),
       );
     }
-    const userId = validateMatrixUserId(body.user_id, serverName);
+    let userId: string;
+    try {
+      userId = validateMatrixUserId(body.user_id, serverName);
+    } catch (error) {
+      throw responseValidationFailure("identity confirmation", response, responseText ?? "", error);
+    }
     let deviceId: string | null = null;
     if (body.device_id !== undefined && body.device_id !== null) {
       try {
         deviceId = validateMatrixDeviceId(body.device_id);
       } catch (error) {
-        throw new StorageError("OIDC identity confirmation returned an invalid device ID", { cause: error });
+        throw responseValidationFailure(
+          "identity confirmation",
+          response,
+          responseText ?? "",
+          new StorageError("OIDC identity confirmation returned an invalid device ID", { cause: error }),
+        );
       }
     }
     if (signal?.aborted) throw new OidcRequestCancelledError("identity confirmation");

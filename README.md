@@ -5,7 +5,7 @@
 End-to-end encrypted file storage and sharing, built on Matrix.
 
 The current public TeleCrypt architecture, responsibilities, and product limits are authoritative at
-[telecrypt.io/llms.txt](https://telecrypt.io/llms.txt). This README documents this SDK's package API
+[telecrypt-io.github.io/llms-authority/llms.txt](https://telecrypt-io.github.io/llms-authority/llms.txt). This README documents this SDK's package API
 and development workflow.
 
 Files are encrypted on the client before upload. The server stores only opaque ciphertext and

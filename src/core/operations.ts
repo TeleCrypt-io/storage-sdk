@@ -43,7 +43,6 @@ import {
 import { ConditionTimeoutError, waitForCondition } from "./poll.js";
 import { validateName } from "./validation.js";
 import {
-  getDeletedTreeIds,
   isFileDeleted,
   isTreeDeleted,
   markFileDeleted,
@@ -295,9 +294,7 @@ async function resolveFile(
 function assertTreeEmptyForDeletion(
   storage: TeleCryptIOStorage,
   tree: TreeSpace,
-  spaces: readonly TreeSpace[],
 ): void {
-  if (spaces.length !== 1) throw new NonEmptyTreeError(tree.id);
   let files: FileBranch[];
   try {
     files = tree.listFiles().filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
@@ -305,38 +302,72 @@ function assertTreeEmptyForDeletion(
     throw new StorageError("could not enumerate storage files safely", { cause: error });
   }
   if (files.length > 0) throw new NonEmptyTreeError(tree.id);
+
+  const childEvents = readRelationEvents(storage.getClient(), tree.id, EventType.SpaceChild);
+  if (childEvents === null) throw new StorageError("could not enumerate storage folders safely");
+  for (const event of childEvents) {
+    if (!isActiveRelationEvent(event)) continue;
+    const childId = relationStateKey(event);
+    if (!childId) throw new StorageError("could not enumerate storage folders safely");
+    if (!isTreeDeleted(storage.getClient(), childId)) throw new NonEmptyTreeError(tree.id);
+  }
 }
 
 async function refreshDeletionRooms(
   storage: TeleCryptIOStorage,
   rootId: string,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<string[]> {
   const client = storage.getClient();
-  const http = (client as unknown as { http?: { authedRequest?: unknown } }).http;
-  // A real MatrixClient always exposes its authenticated HTTP transport. A
-  // client without one cannot prove that its local relation graph is current.
-  if (typeof http?.authedRequest !== "function") {
-    throw new StorageError("delete graph refresh is unavailable");
-  }
   await storage.refreshRoomState(rootId, { signal });
   if (signal?.aborted) throw new StorageError("operation cancelled");
 
-  // The refreshed root owns its parent relation. Verify its one supported
-  // external parent directly; unrelated local rooms are outside this deletion.
   const parentEvents = readRelationEvents(client, rootId, EventType.SpaceParent);
-  if (parentEvents === null) throw new StorageError("delete graph is unsafe");
+  if (parentEvents === null) throw new StorageError("could not enumerate storage parent safely");
   const parentIds = new Set<string>();
   for (const event of parentEvents) {
     if (!isActiveRelationEvent(event)) continue;
     const parentId = relationStateKey(event);
-    if (!parentId) throw new StorageError("delete graph is unsafe");
+    if (!parentId) throw new StorageError("could not enumerate storage parent safely");
     if (parentId !== rootId) parentIds.add(parentId);
   }
-  if (parentIds.size > 1) throw new StorageError("delete graph is unsafe");
-  const parentId = parentIds.values().next().value;
-  if (parentId) await storage.refreshRoomState(parentId, { signal });
+  if (parentIds.size > 1) throw new StorageError("storage room has multiple parents");
+  const parents = [...parentIds];
+  if (parents[0]) {
+    await storage.refreshRoomState(parents[0], { signal });
+    const childEvents = readRelationEvents(client, parents[0], EventType.SpaceChild, rootId);
+    if (
+      childEvents === null ||
+      !childEvents.some(
+        (event) => isActiveRelationEvent(event) && relationStateKey(event, rootId) === rootId,
+      )
+    ) {
+      throw new StorageError("storage parent relation is inconsistent");
+    }
+  }
   if (signal?.aborted) throw new StorageError("operation cancelled");
+  return parents;
+}
+
+function snapshotTreeSpaces(root: TreeSpace): TreeSpace[] {
+  const spaces: TreeSpace[] = [];
+  const seen = new Set<string>();
+  const pending = [root];
+  while (pending.length > 0) {
+    const tree = pending.pop();
+    if (!tree || seen.has(tree.id)) continue;
+    seen.add(tree.id);
+    spaces.push(tree);
+    let children: TreeSpace[];
+    try {
+      children = tree.getDirectories();
+    } catch (error) {
+      if (error instanceof StorageError) throw error;
+      throw new StorageError("could not enumerate storage folders", { cause: error });
+    }
+    pending.push(...children);
+  }
+  return spaces;
 }
 
 async function refreshTreeSpaces(
@@ -393,136 +424,20 @@ function isActiveRelationEvent(event: RelationEvent): boolean {
 
 function activeTreeDirectories(client: MatrixClient, tree: TreeSpace): TreeSpace[] {
   const childEvents = readRelationEvents(client, tree.id, EventType.SpaceChild);
-  if (childEvents === null) throw new StorageError("delete graph is unsafe");
+  if (childEvents === null) throw new StorageError("storage folder state is unavailable");
   const activeChildIds = new Set<string>();
   for (const event of childEvents) {
     if (!isActiveRelationEvent(event)) continue;
     const childId = relationStateKey(event);
-    if (!childId) throw new StorageError("delete graph is unsafe");
+    if (!childId) throw new StorageError("storage folder state is inconsistent");
     activeChildIds.add(childId);
   }
-  const knownChildren = new Map(
-    tree.getDirectories().map((child) => [child.id, child]),
-  );
+  const knownChildren = new Map(tree.getDirectories().map((child) => [child.id, child]));
   return [...activeChildIds].map((childId) => {
     const child = knownChildren.get(childId);
-    if (!child) throw new StorageError("delete graph is unsafe");
+    if (!child) throw new StorageError("storage folder state is inconsistent");
     return child;
   });
-}
-
-function snapshotTreeSpaces(
-  root: TreeSpace,
-  activeRelationClient?: MatrixClient,
-): TreeSpace[] {
-  const spaces: TreeSpace[] = [];
-  const seen = new Set<string>();
-  const pending: TreeSpace[] = [root];
-  while (pending.length > 0) {
-    const tree = pending.pop();
-    if (!tree) continue;
-    if (seen.has(tree.id)) continue;
-    seen.add(tree.id);
-    spaces.push(tree);
-    let children: TreeSpace[];
-    try {
-      children = activeRelationClient
-        ? activeTreeDirectories(activeRelationClient, tree)
-        : tree.getDirectories();
-    } catch (error) {
-      if (error instanceof StorageError) throw error;
-      throw new StorageError("could not enumerate storage space descendants safely", { cause: error });
-    }
-    for (const child of children) pending.push(child);
-  }
-  return spaces;
-}
-
-interface ValidatedDeletionGraph {
-  externalParents: string[];
-}
-
-/**
- * Deletion is intentionally narrower than MSC3089TreeSpace.delete(): a local
- * child graph is not proof that the rooms are exclusively owned by this tree.
- * Validate every observed edge in both directions and reject any parent or
- * child edge outside the exact deletion set before the first mutation.
- */
-function validateDeletionGraph(
-  client: MatrixClient,
-  root: TreeSpace,
-  ids: Set<string>,
-  deletedRooms: ReadonlySet<string>,
-): ValidatedDeletionGraph {
-  const edges = new Set<string>();
-  const externalParents: string[] = [];
-  const addEdge = (parentId: string, childId: string): void => {
-    if (deletedRooms.has(childId)) return;
-    if (!ids.has(childId)) throw new StorageError("delete graph is unsafe");
-    edges.add(`${parentId}\u0000${childId}`);
-  };
-
-  for (const id of ids) {
-    const tree = client.unstableGetFileTreeSpace(id) as unknown as TreeSpace | null;
-    if (!tree) throw new StorageError("delete graph is unsafe");
-    const directories = activeTreeDirectories(client, tree);
-    for (const child of directories) addEdge(id, child.id);
-
-    const childEvents = readRelationEvents(client, id, EventType.SpaceChild);
-    if (childEvents === null) throw new StorageError("delete graph is unsafe");
-    for (const event of childEvents) {
-      if (!isActiveRelationEvent(event)) continue;
-      const childId = relationStateKey(event);
-      if (!childId) throw new StorageError("delete graph is unsafe");
-      addEdge(id, childId);
-    }
-  }
-
-  for (const edge of edges) {
-    const separator = edge.indexOf("\u0000");
-    const parentId = edge.slice(0, separator);
-    const childId = edge.slice(separator + 1);
-    const childLink = readRelationEvents(client, parentId, EventType.SpaceChild, childId);
-    const parentLink = readRelationEvents(client, childId, EventType.SpaceParent, parentId);
-    if (
-      !childLink?.some(
-        (event) => isActiveRelationEvent(event) && relationStateKey(event, childId) === childId,
-      ) ||
-      !parentLink?.some(
-        (event) => isActiveRelationEvent(event) && relationStateKey(event, parentId) === parentId,
-      )
-    ) {
-      throw new StorageError("delete graph is unsafe");
-    }
-  }
-
-  for (const id of ids) {
-    const parentEvents = readRelationEvents(client, id, EventType.SpaceParent);
-    if (parentEvents === null) throw new StorageError("delete graph is unsafe");
-    for (const event of parentEvents) {
-      if (!isActiveRelationEvent(event)) continue;
-      const parentId = relationStateKey(event);
-      if (!parentId) throw new StorageError("delete graph is unsafe");
-      if (!ids.has(parentId)) {
-        if (id !== root.id || externalParents.includes(parentId)) {
-          throw new StorageError("delete graph is unsafe");
-        }
-        const childLink = readRelationEvents(client, parentId, EventType.SpaceChild, id);
-        if (
-          !childLink?.some(
-            (candidate) => isActiveRelationEvent(candidate) && relationStateKey(candidate, id) === id,
-          )
-        ) {
-          throw new StorageError("delete graph is unsafe");
-        }
-        externalParents.push(parentId);
-      }
-    }
-  }
-
-  if (!ids.has(root.id)) throw new StorageError("delete graph is unsafe");
-  if (externalParents.length > 1) throw new StorageError("delete graph is unsafe");
-  return { externalParents };
 }
 
 async function unlinkExternalParents(
@@ -637,9 +552,9 @@ async function deleteRoomDeterministically(
   try {
     const client = storage.getClient();
     const tree = storage.getTree(roomId);
-    if (!tree) throw new StorageError("delete graph is unsafe");
+    if (!tree) throw new StorageError("storage room is unavailable for deletion");
     const self = client.getUserId();
-    if (!self) throw new StorageError("delete graph is unsafe");
+    if (!self) throw new StorageError("Matrix user identity is unavailable");
     const members = await storage.listMembers(tree, { signal });
     if (members.some((member) => member.userId !== self && member.role === "owner" &&
         (member.membership === "join" || member.membership === "invite" || member.membership === "knock"))) {
@@ -1332,39 +1247,19 @@ async function deleteTree(
       if (isTreeDeleted(client, treeId)) return { id: treeId, deleted: true };
 
       const tree = await resolveTree(storage, treeId, operation.signal);
-      // Read reconciliation state after this operation reaches the single
-      // client queue; a preceding delete may have populated the set while we
-      // were waiting for its turn.
-      const removedRooms = getDeletedTreeIds(client);
-      let graph: ValidatedDeletionGraph;
+      let externalParents: string[];
       try {
-        // Re-read the candidate graph and any external parents it identifies
-        // before taking the immutable graph snapshot. Unrelated rooms are not
-        // part of this operation and must not block deletion merely because
-        // their membership is not joined.
-        await refreshDeletionRooms(storage, tree.id, operation.signal);
-    const spaces = snapshotTreeSpaces(tree, client);
-        const activeSpaces = spaces.filter(
-          (space) => !removedRooms.has(space.id),
-        );
-        const ids = new Set(activeSpaces.map((space) => space.id));
-        if (!ids.has(tree.id)) {
-          if (removedRooms.has(tree.id)) {
-            return { id: treeId, deleted: true };
-          }
-          throw new StorageError("delete graph is unsafe");
-        }
-        assertTreeEmptyForDeletion(storage, tree, activeSpaces);
-        graph = validateDeletionGraph(client, tree, ids, removedRooms);
+        // Deletion owns one room. Refresh its current state and its one
+        // supported parent before checking files/folders or changing links.
+        externalParents = await refreshDeletionRooms(storage, tree.id, operation.signal);
+        assertTreeEmptyForDeletion(storage, tree);
       } catch (error) {
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
       }
 
-      // Keep external parent links intact until the room deletion succeeds.
-      // Unlinking first would silently detach a live vault on failure.
       try {
-        await unlinkExternalParents(storage, tree.id, graph.externalParents, operation.signal);
+        await unlinkExternalParents(storage, tree.id, externalParents, operation.signal);
       } catch (error) {
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
@@ -1372,11 +1267,8 @@ async function deleteTree(
       try {
         await deleteRoomDeterministically(storage, tree.id, operation.signal);
       } catch (error) {
-        // The root is still live when its relation is removed. If deletion then
-        // fails, restore both sides before reporting failure; otherwise a live
-        // vault would be silently detached from its external parent.
         try {
-          await relinkExternalParents(storage, tree.id, graph.externalParents, new AbortController().signal);
+          await relinkExternalParents(storage, tree.id, externalParents, new AbortController().signal);
         } catch (cleanupError) {
           throw new StorageError("delete cleanup is incomplete", {
             cause: new AggregateError(

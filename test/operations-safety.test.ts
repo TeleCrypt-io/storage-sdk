@@ -149,6 +149,52 @@ describe("operation safety", () => {
     return { client, root, roomIds, storage };
   }
 
+  function linkedEmptyFolderFixture() {
+    const root = makeTree("!nested-empty:example.test", "Empty", false);
+    const externalId = "!external-parent:example.test";
+    const active = { via: ["example.test"] };
+    const links = new Map<string, object>([["child", active], ["parent", active]]);
+    const events: string[] = [];
+    const rootRoom = {
+      roomId: root.id,
+      currentState: {
+        getStateEvents: (eventType: string, stateKey?: string) => {
+          if (eventType !== EventType.SpaceParent || (stateKey !== undefined && stateKey !== externalId)) return [];
+          return [{ getStateKey: () => externalId, getContent: () => links.get("parent") }];
+        },
+      },
+    };
+    const externalRoom = {
+      roomId: externalId,
+      currentState: {
+        getStateEvents: (eventType: string, stateKey?: string) => {
+          if (eventType !== EventType.SpaceChild || (stateKey !== undefined && stateKey !== root.id)) return [];
+          return [{ getStateKey: () => root.id, getContent: () => links.get("child") }];
+        },
+      },
+    };
+    const rooms = new Map([[root.id, rootRoom], [externalId, externalRoom]]);
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getDomain: () => "example.test",
+      getRoom: (roomId: string) => rooms.get(roomId) ?? null,
+      sendStateEvent: vi.fn(async (roomId: string, eventType: string, content: object) => {
+        events.push(`state:${roomId}:${eventType}`);
+        links.set(eventType === EventType.SpaceChild ? "child" : "parent", content);
+      }),
+      leave: vi.fn(async () => { events.push("leave"); }),
+      forget: vi.fn(async () => { events.push("forget"); }),
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: () => root,
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+      listMembers: vi.fn().mockResolvedValue([]),
+      getRoomMembership: vi.fn().mockResolvedValue("join"),
+    } as unknown as TeleCryptIOStorage;
+    return { root, externalId, links, events, client, storage };
+  }
+
   it("deletes the current media before redacting its Matrix event", async () => {
     const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
 
@@ -695,7 +741,7 @@ describe("operation safety", () => {
     expect(authedRequest).toHaveBeenCalledTimes(2);
   });
 
-  it("refreshes only deletion-graph rooms before any mutation", async () => {
+  it("checks only the room being deleted before rejecting remaining files", async () => {
     const refreshRoomState = vi.fn(async () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 2));
     });
@@ -713,7 +759,7 @@ describe("operation safety", () => {
     expect(isTreeDeleted(fixture.client as never, fixture.root.id)).toBe(false);
   });
 
-  it("does not let an unrelated invite block deletion graph refresh", async () => {
+  it("does not inspect unrelated rooms when deleting a tree", async () => {
     const refreshRoomState = vi.fn().mockResolvedValue(undefined);
     const fixture = deletionRefreshFixture(1, refreshRoomState);
     const unrelated = {
@@ -732,14 +778,18 @@ describe("operation safety", () => {
     expect(refreshRoomState).toHaveBeenCalledWith(fixture.root.id, expect.anything());
   });
 
-  it("ignores a deleted child reintroduced by a late leave projection", async () => {
+  it("ignores a confirmed deleted child still linked from the room", async () => {
     const child = makeTree("!late-deleted-child:example.test", "Child", false);
     const root = makeTree("!late-deleted-root:example.test", "Root", true);
     root.getDirectories = () => [child];
     const rootRoom = {
       roomId: root.id,
       getMyMembership: () => "join",
-      currentState: { getStateEvents: () => [] },
+      currentState: {
+        getStateEvents: (eventType: string) => eventType === EventType.SpaceChild
+          ? [{ getStateKey: () => child.id, getContent: () => ({ via: ["example.test"] }) }]
+          : [],
+      },
     };
     const childRoom = {
       roomId: child.id,
@@ -1070,7 +1120,7 @@ describe("operation safety", () => {
     expect(forget).not.toHaveBeenCalled();
   });
 
-  it("refuses a tree with multiple child folders before partial deletion is possible", async () => {
+  it("refuses a room with nested folders before mutating it", async () => {
     const root = makeTree("!partial-delete-root:example.test", "Root", true);
     const first = makeTree("!partial-delete-first:example.test", "First", false);
     const second = makeTree("!partial-delete-second:example.test", "Second", false);
@@ -1139,142 +1189,50 @@ describe("operation safety", () => {
     expect(forget).not.toHaveBeenCalled();
   });
 
-  it("fails closed without mutating a folder shared by an external parent", async () => {
-    const child = makeTree("!shared-child:example.test", "Child", false);
-    const root = makeTree("!shared-root:example.test", "Root", true);
-    root.getDirectories = () => [child];
-    const externalId = "!external-parent:example.test";
-    const events = new Map<string, object>([
-      [
-        `${EventType.SpaceChild}\u0000${child.id}`,
-        { getStateKey: () => child.id, getContent: () => ({ via: ["example.test"] }) },
-      ],
-      [
-        `${EventType.SpaceParent}\u0000${root.id}`,
-        { getStateKey: () => root.id, getContent: () => ({ via: ["example.test"] }) },
-      ],
-      [
-        `${EventType.SpaceChild}\u0000${externalId}\u0000${child.id}`,
-        { getStateKey: () => child.id, getContent: () => ({ via: ["example.test"] }) },
-      ],
-    ]);
-    const makeRoom = (roomId: string) => ({
-      roomId,
-      getMembers: () => [],
-      getMyMembership: () => "join",
-      currentState: {
-        getStateEvents: (eventType: string, stateKey?: string) => {
-          if (stateKey !== undefined) return events.get(`${eventType}\u0000${stateKey}`) ?? null;
-          return [...events.entries()]
-            .filter(([key]) => key.startsWith(`${eventType}\u0000${roomId}\u0000`) || (roomId === root.id && key === `${eventType}\u0000${child.id}`) || (roomId === child.id && key === `${eventType}\u0000${root.id}`))
-            .map(([, event]) => event);
-        },
-      },
-    });
-    const rooms = new Map([
-      [root.id, makeRoom(root.id)],
-      [child.id, makeRoom(child.id)],
-      [externalId, makeRoom(externalId)],
-    ]);
-    const client = {
-      getUserId: () => "@owner:example.test",
-      getRoom: (roomId: string) => rooms.get(roomId) ?? null,
-      getRooms: () => [...rooms.values()],
-      unstableGetFileTreeSpace: (roomId: string) =>
-        roomId === root.id ? root : roomId === child.id ? child : null,
-      kick: vi.fn(),
-      leave: vi.fn(),
-      forget: vi.fn(),
-      redactEvent: vi.fn(),
-      http: {
-        authedRequest: vi.fn(async (_method: string, path: string) =>
-          path.endsWith("/joined_rooms")
-            ? { joined_rooms: [root.id] }
-            : path.endsWith("/members")
-            ? { chunk: [] }
-            : path.includes("m.room.power_levels")
-              ? {}
-              : [],
-        ),
-      },
-    };
+  it("unlinks one parent before deleting an empty room", async () => {
+    const fixture = linkedEmptyFolderFixture();
 
-    await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).rejects.toMatchObject({
-      code: "NON_EMPTY_TREE",
-      treeId: root.id,
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).resolves.toEqual({
+      id: fixture.root.id,
+      deleted: true,
     });
-    expect(client.kick).not.toHaveBeenCalled();
-    expect(client.leave).not.toHaveBeenCalled();
-    expect(client.forget).not.toHaveBeenCalled();
-    expect(client.redactEvent).not.toHaveBeenCalled();
+    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(2);
+    expect(fixture.events).toEqual([
+      `state:${fixture.externalId}:${EventType.SpaceChild}`,
+      `state:${fixture.root.id}:${EventType.SpaceParent}`,
+      "leave",
+      "forget",
+    ]);
+    expect(fixture.links.get("child")).toEqual({});
+    expect(fixture.links.get("parent")).toEqual({});
   });
 
-  it("unlinks one validated external parent only after child deletion", async () => {
-    const child = makeTree("!nested-child:example.test", "Child", false);
-    const root = makeTree("!nested-root:example.test", "Root", false);
-    const externalId = "!external-parent:example.test";
-    root.getDirectories = () => [child];
-    const eventMap = new Map<string, { getStateKey: () => string; getContent: () => object }>();
-    const put = (roomId: string, eventType: string, stateKey: string, content: object) => {
-      eventMap.set(`${roomId}\u0000${eventType}\u0000${stateKey}`, {
-        getStateKey: () => stateKey,
-        getContent: () => content,
-      });
-    };
-    put(externalId, EventType.SpaceChild, root.id, { via: ["example.test"] });
-    put(root.id, EventType.SpaceParent, externalId, { via: ["example.test"] });
-    put(root.id, EventType.SpaceChild, child.id, { via: ["example.test"] });
-    put(child.id, EventType.SpaceParent, root.id, { via: ["example.test"] });
-    const makeRoom = (roomId: string) => ({
-      roomId,
-      getMembers: () => [],
-      getMyMembership: () => "join",
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: (eventType: string, stateKey?: string) => {
-          const prefix = `${roomId}\u0000${eventType}\u0000`;
-          if (stateKey !== undefined) return eventMap.get(`${prefix}${stateKey}`) ?? null;
-          return [...eventMap.entries()]
-            .filter(([key]) => key.startsWith(prefix))
-            .map(([, event]) => event);
-        },
-      },
-    });
-    const rooms = new Map([
-      [root.id, makeRoom(root.id)],
-      [child.id, makeRoom(child.id)],
-      [externalId, makeRoom(externalId)],
-    ]);
-    const client = {
-      getUserId: () => "@owner:example.test",
-      getRoom: (roomId: string) => rooms.get(roomId) ?? null,
-      getRooms: () => [...rooms.values()],
-      unstableGetFileTreeSpace: (roomId: string) =>
-        roomId === root.id ? root : roomId === child.id ? child : null,
-      sendStateEvent: vi.fn(async (roomId: string, eventType: string, content: object, stateKey: string) => {
-        put(roomId, eventType, stateKey, content);
-      }),
-      leave: vi.fn().mockResolvedValue(undefined),
-      forget: vi.fn().mockResolvedValue(undefined),
-      http: {
-        authedRequest: vi.fn(async (_method: string, path: string) =>
-          path.endsWith("/joined_rooms")
-            ? { joined_rooms: [root.id] }
-            : path.endsWith("/members")
-            ? { chunk: [] }
-            : path.includes("m.room.power_levels")
-              ? {}
-              : [],
-        ),
-      },
-    };
+  it("relinks its parent if deleting the unlinked room fails", async () => {
+    const fixture = linkedEmptyFolderFixture();
+    fixture.client.forget.mockRejectedValue(new Error("forget failed"));
 
-    await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).rejects.toMatchObject({
-      code: "NON_EMPTY_TREE",
-      treeId: root.id,
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "delete",
+      completedIds: [fixture.root.id],
     });
-    expect(client.sendStateEvent).not.toHaveBeenCalled();
-    expect(client.forget).not.toHaveBeenCalled();
+    expect(fixture.links.get("child")).toEqual({ via: ["example.test"] });
+    expect(fixture.links.get("parent")).toEqual({ via: ["example.test"] });
+    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(4);
+  });
+
+  it("rejects a mismatched parent relation before changing either side", async () => {
+    const fixture = linkedEmptyFolderFixture();
+    fixture.links.set("child", {});
+
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).rejects.toThrow(
+      "storage parent relation is inconsistent",
+    );
+    expect(fixture.links.get("child")).toEqual({});
+    expect(fixture.links.get("parent")).toEqual({ via: ["example.test"] });
+    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
+    expect(fixture.client.leave).not.toHaveBeenCalled();
+    expect(fixture.client.forget).not.toHaveBeenCalled();
   });
 
   it("rolls back a partial external unlink before reporting failure", async () => {
