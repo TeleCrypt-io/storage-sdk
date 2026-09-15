@@ -59,9 +59,9 @@ scopes, Matrix user/device identities, redirects, and complete response bodies a
 they are returned. Network-bound helpers accept `AbortSignal` where cancellation is meaningful; token
 refresh uses a public client and persists the resulting token pair through the caller's callback.
 
-The command-line client is sourced by
-[`TeleCrypt-io/storage-cli`](https://github.com/TeleCrypt-io/storage-cli). The static web
-application is sourced by
+The command-line client is sourced from the
+[`cli/` package in `TeleCrypt-io/storage.telecrypt.io`](https://github.com/TeleCrypt-io/storage.telecrypt.io/tree/main/cli).
+The static web application is sourced by
 [`TeleCrypt-io/storage.telecrypt.io`](https://github.com/TeleCrypt-io/storage.telecrypt.io).
 
 ### 0.5 OIDC migration
