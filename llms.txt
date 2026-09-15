@@ -1,6 +1,6 @@
 # TeleCrypt.io
 
 The sole public authority for current TeleCrypt project facts, architecture, responsibilities,
-principles, limits, and user-visible behavior is https://telecrypt-io.github.io/llms-authority/llms.txt.
+principles, limits, and user-visible behavior is https://www.telecrypt.io/llms.txt.
 
 Repository-specific SDK usage and development instructions remain in README.md and RELEASING.md.
