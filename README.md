@@ -2,17 +2,9 @@
 
 [![npm](https://img.shields.io/npm/v/@telecrypt-io/storage)](https://www.npmjs.com/package/@telecrypt-io/storage)
 
-End-to-end encrypted file storage and sharing, built on Matrix.
-
-The current public TeleCrypt architecture, responsibilities, and product limits are authoritative at
-[www.telecrypt.io/llms.txt](https://www.telecrypt.io/llms.txt). This README documents the package API
-and user-visible storage behavior.
-
-Files are encrypted on the client before upload. The server stores only opaque ciphertext and
-never holds the decryption keys. Shared vaults let multiple people add and read files, and a
-Recovery Key restores your files on a new device — even if you lose the original.
-
-The command-line client is maintained in the [`cli/` package](https://github.com/TeleCrypt-io/storage.telecrypt.io/tree/main/cli).
+A JavaScript/TypeScript SDK for encrypted Matrix file trees, based on
+[MSC3089](https://github.com/matrix-org/matrix-spec-proposals/pull/3089), an open and currently
+unmerged Matrix proposal.
 
 ## Install
 
@@ -20,98 +12,79 @@ The command-line client is maintained in the [`cli/` package](https://github.com
 npm install @telecrypt-io/storage
 ```
 
-This gives you the `TeleCryptIOStorage` library and its browser-safe `core` API.
+## Browser quick start
 
-## Quick start
-
-**Library:**
+The example below starts with an authenticated OIDC session. Obtain `userId`, `accessToken`, and
+`deviceId` from that completed session. `baseUrl` and `serverName` must come from trusted
+application configuration for the same Matrix deployment; do not accept them from an untrusted
+request.
 
 ```ts
 import { TeleCryptIOStorage } from "@telecrypt-io/storage";
 import * as core from "@telecrypt-io/storage/core";
 
+// baseUrl/serverName come from trusted application configuration.
+// userId/accessToken/deviceId come from completed OIDC authentication.
 const storage = await TeleCryptIOStorage.create({
-  baseUrl, userId, accessToken, deviceId,
+  baseUrl, serverName, userId, accessToken, deviceId,
 });
-const vault = await core.createVault(storage, "Photos");
-await core.uploadFile(storage, vault.id, "cat.jpg", bytes, "image/jpeg");
+try {
+  const vault = await core.createVault(storage, "Example");
+  const file = await core.uploadFile(
+    storage, vault.id, "hello.txt",
+    new TextEncoder().encode("Hello"), "text/plain",
+  );
+  const downloaded = await core.downloadFile(storage, vault.id, file.id);
+  console.log(new TextDecoder().decode(downloaded.bytes));
+} finally {
+  storage.getClient().stopClient();
+}
 ```
 
-The recommended constructors configure the Matrix client with the SDK's manual-redirect transport
-and finite request deadline. The public `new TeleCryptIOStorage(client)` constructor is
-an advanced escape hatch: it does not rewrite matrix-js-sdk internals. Callers using it must build
-the client through matrix-js-sdk's supported `createClient` options (`fetchFn` and
-`localTimeoutMs`) and remain responsible for the safety of other Matrix SDK requests. SDK methods
-that need the authenticated transport fail closed when it is unavailable; they do not silently
-install a private transport configuration.
+`TeleCryptIOStorage.create` initializes the Matrix client and its persistent browser crypto store
+by default. Browser persistence uses IndexedDB and the Matrix Rust crypto WASM runtime, so this
+example assumes a browser environment. OIDC discovery, login, refresh, and the corresponding
+`createFromOidc` inputs are exported from `@telecrypt-io/storage/core`.
 
-Same-name vault/folder creation is serialized within one `TeleCryptIOStorage` instance, but
-each call creates a distinct room. Display names are labels, not identities, and Matrix
-provides no server-side room-creation idempotency key.
+The example creates retained Matrix rooms and encrypted media. Delete its file and then its empty
+vault when finished; cleanup is part of the operation, not an automatic consequence of stopping
+the client.
 
-## OIDC API
+## Storage model and behavior
 
-The SDK owns the browser authorization-code PKCE context in `sessionStorage` and provides device-code,
-discovery, dynamic registration, identity confirmation, and refresh helpers. OAuth metadata, token
-scopes, Matrix user/device identities, redirects, and complete response bodies are validated before
-they are returned. Network-bound helpers accept `AbortSignal` where cancellation is meaningful; token
-refresh uses a public client and persists the resulting token pair through the caller's callback.
+The SDK maps the file tree to Matrix primitives defined by MSC3089:
 
-The command-line client is sourced from the
-[`cli/` package in `TeleCrypt-io/storage.telecrypt.io`](https://github.com/TeleCrypt-io/storage.telecrypt.io/tree/main/cli).
-The static web application is sourced by
-[`TeleCrypt-io/storage.telecrypt.io`](https://github.com/TeleCrypt-io/storage.telecrypt.io).
+- A vault is a Matrix Space room marked as a file tree.
+- A folder is a child Space in that tree.
+- A file is a Matrix event referring to encrypted uploaded content.
+- Sharing uses Matrix room invitations and permissions use Matrix power levels.
 
-### 0.5 OIDC migration
+Vault, folder, and file IDs are opaque Matrix room and event IDs. Names are display labels: two
+objects with the same name are still distinct, and a name is not an idempotency key.
 
-Version 0.5 targets Matrix JS SDK 42 and the stable Matrix OAuth metadata endpoint. Existing
-integrations must use the current `createFromOidc` options and pass the confirmed Matrix user ID,
-device ID, and access token returned by the login flow. Replace old Matrix SDK OIDC imports and
-private HTTP discovery with `discoverOidcIssuer`, `registerClient`, the device-code or PKCE flow
-helpers, and `whoAmI` from `core/oidc`; the discovery URL is the stable
-`/_matrix/client/v1/auth_metadata` endpoint. Refresh integration uses
-`buildTokenRefreshFunction` as the current `tokenRefreshFunction` callback and must persist the
-returned token pair before reporting success. The SDK no longer carries pre-0.5 compatibility
-paths, so no adapter-side shim is required or supported. Discovery accepts providers that omit
-`revocation_endpoint`; revocation is only an opportunistic cleanup path after refresh persistence
-fails. Device-code sessions retain their requested device ID in-process; callers that reconstruct a
-session must pass its expected device ID to `waitForDeviceCodeLogin`. `buildTokenRefreshFunction`
-always requires the expected device ID because a reconstructed refresh callback has no safe implicit
-binding. Returned OAuth scopes are rejected unless they match that intended Matrix device exactly.
+File bytes are encrypted in the client before upload with Matrix attachment encryption (AES-CTR
+and a per-file key distributed through the room's Megolm session). The server stores encrypted
+media and Matrix events, but encryption does not hide all room, event, or other metadata from the
+server or users who can read the room.
 
-## How it works
+Recovery is explicit. Use `core.setupRecovery(storage)` to create a recovery key and keep that key
+securely; use `core.restoreRecovery(storage, recoveryKey)` on a new device. Losing the recovery key
+can prevent encrypted keys from being restored.
 
-Built on [MSC3089](https://github.com/matrix-org/matrix-spec-proposals/pull/3089), which models
-a file tree using Matrix primitives:
+Deletion has strict ordering. Delete files before their folders or vaults because folders and
+vaults must be empty. File deletion removes the encrypted media object before redacting its Matrix
+event and requires TeleCrypt's Synapse storage extension; stock Synapse cannot provide that
+deletion contract.
 
-| Storage concept | Matrix concept |
-|---|---|
-| Vault | A Space (room marked as a file tree) |
-| Folder | A child Space |
-| File | An event pointing at encrypted uploaded content |
-| Sharing | Room invitation |
-| Permissions | Power levels |
+## Source repositories
 
-### Deletion
+- Web application: [`TeleCrypt-io/storage`](https://github.com/TeleCrypt-io/storage)
+- Command-line client: [`cli/`](https://github.com/TeleCrypt-io/storage/tree/main/cli)
 
-Vaults and folders are deleted only when they are empty. Delete each file first; deleting a file
-also removes its encrypted media object before redacting its Matrix event. Delete empty child
-folders before deleting their parent. A nonempty delete
-fails with `NonEmptyTreeError`, so a shared or nested tree is never removed implicitly.
+## License
 
-Encryption uses the same scheme as Matrix attachments (AES-CTR with a per-file key, keys
-distributed via the room's Megolm session). File deletion uses TeleCrypt's authenticated Synapse
-storage extension to remove the local media object before Matrix redaction; stock
-Synapse without that extension cannot provide the SDK deletion contract.
-
-## Licence
-
-[Business Source License 1.1](./LICENSE). Non-commercial use is permitted; converts to
-Apache License 2.0 on 2030-07-20.
-
-For commercial licensing, contact TeleCrypt.io.
-
-## Third-party code
-
-- [`matrix-js-sdk`](https://github.com/matrix-org/matrix-js-sdk) — Apache-2.0 — dependency
-- [`matrix-encrypt-attachment`](https://github.com/matrix-org/matrix-encrypt-attachment) — Apache-2.0 — dependency
+See [`LICENSE`](./LICENSE) for the complete terms. The current license is Business Source License
+1.1 with an additional grant for non-commercial use; it is not an open-source license. The stated
+Change Date is 2030-07-20, and the Change License is Apache License 2.0. The license also changes
+on the fourth anniversary of the first public distribution of a specific version if that occurs
+before its stated Change Date. The full license controls in case of any discrepancy.
