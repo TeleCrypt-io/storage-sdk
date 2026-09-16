@@ -5,16 +5,14 @@
 End-to-end encrypted file storage and sharing, built on Matrix.
 
 The current public TeleCrypt architecture, responsibilities, and product limits are authoritative at
-[www.telecrypt.io/llms.txt](https://www.telecrypt.io/llms.txt). This README documents this SDK's package API
-and development workflow.
+[www.telecrypt.io/llms.txt](https://www.telecrypt.io/llms.txt). This README documents the package API
+and user-visible storage behavior.
 
 Files are encrypted on the client before upload. The server stores only opaque ciphertext and
 never holds the decryption keys. Shared vaults let multiple people add and read files, and a
 Recovery Key restores your files on a new device — even if you lose the original.
 
-This repository publishes the library package from annotated version tags using npm Trusted
-Publishing. GitHub Releases identify the corresponding source version. The command-line client is
-maintained in its own repository.
+The command-line client is maintained in the [`cli/` package](https://github.com/TeleCrypt-io/storage.telecrypt.io/tree/main/cli).
 
 ## Install
 
@@ -105,27 +103,6 @@ Encryption uses the same scheme as Matrix attachments (AES-CTR with a per-file k
 distributed via the room's Megolm session). File deletion uses TeleCrypt's authenticated Synapse
 storage extension to remove the local media object before Matrix redaction; stock
 Synapse without that extension cannot provide the SDK deletion contract.
-
-## Development
-
-```bash
-npm ci --ignore-scripts --no-fund --no-audit
-npm run test:unit      # unit-only checks; does not start Podman
-npm run synapse:up     # disposable local Synapse/MAS fixture
-npm test               # full SDK suite, including fixture-backed functional tests
-```
-
-The full suite uses the real local Synapse/MAS/Postgres fixture in Podman at `localhost:8008`, never
-a production server. This is the shared fixture for the SDK, CLI, and Web functional/e2e suites;
-start it from this checkout and reuse it for the sibling repositories. Unit tests may use mocks for
-isolated boundaries, but they do not replace the real-stack checks.
-
-If setup or tests fail, inspect the relevant logs, then run `npm run synapse:down` when finished.
-
-After a successful run, use `npm run synapse:down` for scoped teardown. Use
-`./throwaway_synapse/down.sh --wipe` only when a complete fixture reset is explicitly required.
-
-See [RELEASING.md](./RELEASING.md) for the npm release procedure.
 
 ## Licence
 
