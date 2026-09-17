@@ -14,7 +14,7 @@
 #   ./down.sh --wipe # stop and remove all throwaway state
 #
 # Verify it is up:  curl http://localhost:8008/_matrix/client/versions
-#                   curl http://localhost:8008/auth/.well-known/openid-configuration
+#                   curl http://localhost:8008/.well-known/openid-configuration
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -143,7 +143,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. MAS config (generated once, then patched: db uri, matrix.* secret/
-#    endpoint, same-origin public_base/issuer, permissive dev DCR policy).
+#    endpoint, same-origin public_base, permissive dev DCR policy).
 # ---------------------------------------------------------------------------
 if [[ ! -f "$DATA/mas/config.yaml" ]]; then
   echo "==> generating MAS config"
@@ -225,7 +225,7 @@ echo -n "==> waiting for MAS"
 for i in $(seq 1 60); do
   printf 'MAS readiness probe %s\n' "$i" >> "$probe_diagnostics"
   if curl --silent --show-error --fail-with-body --max-time 2 \
-    "http://localhost:8008/auth/.well-known/openid-configuration" >> "$probe_diagnostics" 2>&1; then
+    "http://localhost:8008/.well-known/openid-configuration" >> "$probe_diagnostics" 2>&1; then
     printf 'MAS readiness probe %s succeeded\n' "$i" >> "$probe_diagnostics"
     echo " — ready"
     break
@@ -249,7 +249,7 @@ for i in $(seq 1 60); do
   fi
 done
 
-echo -n "==> waiting for the front door (Synapse + MAS auth proxy)"
+echo -n "==> waiting for the front door (Synapse + MAS)"
 for i in $(seq 1 60); do
   printf 'Front-door readiness probe %s\n' "$i" >> "$probe_diagnostics"
   if curl --silent --show-error --fail-with-body --max-time 2 \

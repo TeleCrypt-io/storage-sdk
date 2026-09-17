@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patches a `mas-cli config generate` output in place for the throwaway
 dev/test stack: points it at the throwaway Postgres + Synapse containers,
-sets its same-origin public_base/issuer, and relaxes the dynamic client
+sets its same-origin public_base, and relaxes the dynamic client
 registration policy to allow http/localhost redirect URIs (this is a
 disposable dev instance we own, never production).
 
@@ -33,10 +33,10 @@ content = re.sub(
     flags=re.M,
 )
 
-# http: public_base/issuer match the single homeserver origin. Caddy exposes
-# this MAS root under /auth and strips that prefix before forwarding.
-content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8008/auth/", content, flags=re.M)
-content = re.sub(r"^  issuer: .*$", "  issuer: http://localhost:8008/auth/", content, flags=re.M)
+# http: public_base matches the single homeserver origin. MAS derives issuer
+# from public_base when no separate issuer is configured.
+content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8008/", content, flags=re.M)
+content = re.sub(r"^  issuer: .*\n", "", content, flags=re.M)
 
 # database: the default max_connections: 10 was observed to be too tight
 # under the full functional suite's concurrency (8 vitest files in parallel,

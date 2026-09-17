@@ -1,31 +1,25 @@
 # Front door for the throwaway MAS-delegated Synapse stack. The homeserver
-# origin serves Matrix and MAS endpoints from one origin; Synapse delegates
-# authentication to MAS.
+# origin serves Matrix and MAS native endpoints from one origin.
 # See https://element-hq.github.io/matrix-authentication-service/setup/homeserver.html
 {
 	servers :8008 {
-		# This fixture is intentionally HTTP-only; do not advertise TLS-only
-		# HTTP/2 and HTTP/3 protocols that Caddy must then skip.
 		protocols h1
 	}
 }
 
 :8008 {
-	# MAS advertises http://localhost:8008/auth/ as its public origin. Strip
-	# that public prefix before forwarding to MAS's root-mounted listener.
-	redir /auth /auth/ 308
-	handle_path /auth/* {
+	@mas_compat path /_matrix/client/*/logout /_matrix/client/*/refresh
+	handle @mas_compat {
 		reverse_proxy throwaway-mas:8080
 	}
 
-	@mas_auth path /_matrix/client/*/logout /_matrix/client/*/refresh
-	handle @mas_auth {
-		reverse_proxy throwaway-mas:8080
-	}
-	handle {
-		# Synapse generates its internal listener on 7608 when the logical
-		# server name includes the public :8008 port.  Keep that internal
-		# detail behind the single :8008 front door.
+	@matrix path /_matrix/*
+	handle @matrix {
 		reverse_proxy throwaway-synapse:7608
+	}
+
+	# MAS owns its native root, OAuth and account routes.
+	handle {
+		reverse_proxy throwaway-mas:8080
 	}
 }
