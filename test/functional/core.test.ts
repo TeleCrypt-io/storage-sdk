@@ -93,7 +93,7 @@ describe("core operations", () => {
     }
   });
 
-  it("C.2 multi-participant share: B uploads, A downloads B's bytes byte-identical", async () => {
+  it("C.2 multi-participant share: B downloads A's bytes byte-identical", async () => {
     const userA = await registerTestUser("core_share_a");
     const userB = await registerTestUser("core_share_b");
     const storageA = await createStorage(userA);
@@ -101,39 +101,38 @@ describe("core operations", () => {
     try {
       const vault = await core.createVault(storageA, "CoreShared");
 
-      const share = await core.shareVault(storageA, vault.id, userB.userId, "editor");
-      expect(share).toEqual({ vaultId: vault.id, userId: userB.userId, role: "editor" });
+      const share = await core.shareVault(storageA, vault.id, userB.userId, "viewer");
+      expect(share).toEqual({ vaultId: vault.id, userId: userB.userId, role: "viewer" });
 
       const joined = await core.joinVault(storageB, vault.id);
       expect(joined).toEqual({ vaultId: vault.id, joined: true });
 
       const originalBytes = new TextEncoder().encode(`core round-trip ${Math.random()}`);
       const uploaded = await core.uploadFile(
-        storageB,
+        storageA,
         vault.id,
-        "from-b.txt",
+        "from-a.txt",
         originalBytes,
         "text/plain",
       );
-      expect(uploaded.name).toBe("from-b.txt");
+      expect(uploaded.name).toBe("from-a.txt");
       expect(uploaded.mimetype).toBe("text/plain");
 
-      // Device A downloads B's upload — proves the megolm key A received as
-      // room creator (from B's upload) actually decrypts, byte-identical.
+      // Device B downloads A's upload — proves the shared-room key is usable by readers.
       const downloaded = await waitFor(
         async () => {
           try {
-            return await core.downloadFile(storageA, vault.id, uploaded.id);
+            return await core.downloadFile(storageB, vault.id, uploaded.id);
           } catch {
             return null;
           }
         },
-        { label: "A decrypts B's upload", timeoutMs: 15000 },
+        { label: "B decrypts A's upload", timeoutMs: 15000 },
       );
 
       expect(downloaded.bytes).toEqual(originalBytes);
       expect(downloaded.mimetype).toBe("text/plain");
-      expect(downloaded.name).toBe("from-b.txt");
+      expect(downloaded.name).toBe("from-a.txt");
     } finally {
       stopTestClient(storageA.getClient());
       stopTestClient(storageB.getClient());

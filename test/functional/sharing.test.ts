@@ -106,7 +106,7 @@ describe("sharing", () => {
     }
   });
 
-  it("3.3 Bob as Editor can upload; Alice can decrypt", async () => {
+  it("3.3 Bob as Reader cannot upload", async () => {
     const aliceUser = await registerTestUser("share_a");
     const bobUser = await registerTestUser("share_b");
     const alice = await createTestClient(aliceUser);
@@ -122,63 +122,16 @@ describe("sharing", () => {
       await bob.joinRoom(tree.id);
       const bobTree = await waitForTree(bobStore, tree.id);
 
-      // Alice sets Bob as Editor
-      await tree.setPermissions(bobUser.userId, TreePermissions.Editor);
-
-      // Bob uploads a file
+      // Storage sharing is owner/readers only. A reader cannot create a file.
       const bobData = new TextEncoder().encode("Bob's file").buffer as ArrayBuffer;
-      await bobStore.uploadFile(bobTree, "bob.txt", bobData, "text/plain");
-      await waitForFiles(bobTree, "bob uploaded");
-
-      // Alice can see and decrypt Bob's file
-      const aliceFiles = await waitFor(
-        async () => {
-          const files = tree.listFiles() as {
-            id: string;
-            getName: () => string;
-          }[];
-          return files.some((f) => f.getName() === "bob.txt") ? files : null;
-        },
-        { label: "alice sees bob's file", timeoutMs: 15000 },
-      );
-
-      const bobFile = aliceFiles.find((f: any) => f.getName() === "bob.txt")!;
-      const downloaded = await aliceStore.downloadFile(bobFile as any);
-      const decoded = new TextDecoder().decode(downloaded.data);
-      expect(decoded).toBe("Bob's file");
+      await expect(bobStore.uploadFile(bobTree, "bob.txt", bobData, "text/plain")).rejects.toThrow();
     } finally {
       stopTestClient(alice);
       stopTestClient(bob);
     }
   });
 
-  it("3.4 Bob as Viewer cannot upload", async () => {
-    const aliceUser = await registerTestUser("share_a");
-    const bobUser = await registerTestUser("share_b");
-    const alice = await createTestClient(aliceUser);
-    const bob = await createTestClient(bobUser);
-    try {
-      const aliceStore = new TeleCryptIOStorage(alice);
-      const bobStore = new TeleCryptIOStorage(bob);
-
-      const tree = await aliceStore.createTree("NoUpload");
-      await waitFor(() => tree.room.name === "NoUpload");
-
-      await tree.invite(bobUser.userId);
-      await bob.joinRoom(tree.id);
-      const bobTree = await waitForTree(bobStore, tree.id);
-
-      const data = new TextEncoder().encode("unauthorized").buffer as ArrayBuffer;
-      await expect(
-        bobStore.uploadFile(bobTree, "hack.txt", data, "text/plain"),
-      ).rejects.toThrow();
-    } finally {
-      stopTestClient(alice);
-      stopTestClient(bob);
-    }
-  });
-
-  it("3.5 uninvited user cannot see the vault", async () => {
+  it("3.4 uninvited user cannot see the vault", async () => {
     const aliceUser = await registerTestUser("share_a");
     const charlieUser = await registerTestUser("share_c");
     const alice = await createTestClient(aliceUser);
@@ -198,7 +151,7 @@ describe("sharing", () => {
     }
   });
 
-  it("3.6 getPermissions reports the role that was set", async () => {
+  it("3.5 storage readers cannot change their role", async () => {
     const aliceUser = await registerTestUser("share_a");
     const bobUser = await registerTestUser("share_b");
     const alice = await createTestClient(aliceUser);
@@ -215,22 +168,15 @@ describe("sharing", () => {
       const viewerPerms = tree.getPermissions(bobUser.userId);
       expect(viewerPerms).toBe(TreePermissions.Viewer);
 
-      await tree.setPermissions(bobUser.userId, TreePermissions.Editor);
-      const editorPerms = await waitFor(
-        () => {
-          const perms = tree.getPermissions(bobUser.userId);
-          return perms === TreePermissions.Editor ? perms : null;
-        },
-        { label: "permissions updated to Editor", timeoutMs: 10000 },
-      );
-      expect(editorPerms).toBe(TreePermissions.Editor);
+      await expect(tree.setPermissions(bobUser.userId, TreePermissions.Editor)).rejects.toThrow();
+      expect(tree.getPermissions(bobUser.userId)).toBe(TreePermissions.Viewer);
     } finally {
       stopTestClient(alice);
       stopTestClient(bob);
     }
   });
 
-  it("3.7 sharing parent with andSubspaces grants access to subfolders", async () => {
+  it("3.6 sharing parent with andSubspaces grants access to subfolders", async () => {
     const aliceUser = await registerTestUser("share_a");
     const bobUser = await registerTestUser("share_b");
     const alice = await createTestClient(aliceUser);
@@ -405,7 +351,7 @@ describe("sharing", () => {
     }
   });
 
-  it("3.9 listMembers reports participants and their roles from membership + power levels", async () => {
+  it("3.8 listMembers reports participants and their roles from membership + power levels", async () => {
     const aliceUser = await registerTestUser("share_a");
     const bobUser = await registerTestUser("share_b");
     const charlieUser = await registerTestUser("share_c");
@@ -438,19 +384,18 @@ describe("sharing", () => {
       expect(bobInvited.role).toBe(TreePermissions.Viewer);
       expect(bobInvited.membership).toBe("invite");
 
-      // Bob joins, and Alice promotes him to editor.
+      // Bob joins and remains a reader.
       await bob.joinRoom(tree.id);
-      await tree.setPermissions(bobUser.userId, TreePermissions.Editor);
       const joinedMembers = await waitFor(
         async () => {
           const members = await aliceStore.listMembers(tree);
           const b = members.find((m) => m.userId === bobUser.userId);
-          return b?.membership === "join" && b.role === TreePermissions.Editor ? members : null;
+          return b?.membership === "join" && b.role === TreePermissions.Viewer ? members : null;
         },
-        { label: "bob joined as editor", timeoutMs: 10000 },
+        { label: "bob joined as reader", timeoutMs: 10000 },
       );
       const bobJoined = joinedMembers.find((m) => m.userId === bobUser.userId)!;
-      expect(bobJoined.role).toBe(TreePermissions.Editor);
+      expect(bobJoined.role).toBe(TreePermissions.Viewer);
       expect(bobJoined.membership).toBe("join");
 
       // Charlie, who was never invited, must not appear at all.

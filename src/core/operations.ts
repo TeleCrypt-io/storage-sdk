@@ -908,7 +908,7 @@ export async function declineInvite(
   }, "mutation");
 }
 
-/** Invites `userId` to the vault and applies the requested role. */
+/** Invites `userId` to the vault as a reader. */
 export async function shareVault(
   storage: TeleCryptIOStorage,
   vaultId: string,
@@ -916,8 +916,8 @@ export async function shareVault(
   role: string,
   options?: OperationOptions,
 ): Promise<ShareResult> {
-  if (role !== "viewer" && role !== "editor") {
-    throw new StorageError("invalid --role (must be viewer or editor)");
+  if (role !== "viewer") {
+    throw new StorageError("storage sharing supports viewers only");
   }
   const operation = createOperationDeadline(options);
   const completedRoomIds = new Set<string>();
@@ -943,6 +943,16 @@ export async function shareVault(
         }
         for (const [index, space] of spaces.entries()) {
           ensureOperationActive(operation.signal);
+          const members =
+            index === 0
+              ? currentMembers
+              : await withRateLimitRetry(
+                  () => storage.listMembers(space, { signal: operation.signal }),
+                  operation.signal,
+                );
+          if (members.some((member) => member.userId === userId && member.role === "owner")) {
+            throw new StorageError("share will not demote an existing owner");
+          }
           const currentMembership =
             index === 0
               ? currentMembers.find((member) => member.userId === userId)?.membership
@@ -968,24 +978,10 @@ export async function shareVault(
             if (!isActiveMembership(membership ?? "")) throw new StorageError("share failed");
           }
         }
-        for (const space of spaces) {
-          ensureOperationActive(operation.signal);
-          const members =
-            space.id === tree.id
-              ? currentMembers
-              : await withRateLimitRetry(
-                  () => storage.listMembers(space, { signal: operation.signal }),
-                  operation.signal,
-                );
-          if (members.some((member) => member.userId === userId && member.role === "owner")) {
-            throw new StorageError("share will not demote an existing owner");
-          }
-          await withRateLimitRetry(
-            () => withMatrixMutationAbort(() => space.setPermissions(userId, role), operation.signal),
-            operation.signal,
-          );
-          completedRoomIds.add(space.id);
-        }
+        // Storage rooms have one immutable owner power level and readers use
+        // the room's default user level. Inviting is the complete sharing
+        // operation; changing per-user power levels would create editors and
+        // let metadata authorship drift away from the owner.
       } catch (error) {
         if (error instanceof MutationOutcomeUnknownError) throw error;
         if (completedRoomIds.size > 0) {
@@ -1007,7 +1003,7 @@ export async function shareVault(
         }
         throw new StorageError("share failed", { cause: error });
       }
-      return { vaultId, userId, role };
+      return { vaultId, userId, role: "viewer" };
     }, operation.signal);
     return await raceOperationDeadline(operation, pending, "mutation");
   } finally {
@@ -1416,6 +1412,14 @@ export async function deleteFile(
     const completedIds: string[] = [];
     try {
       const client = storage.getClient();
+      // MSC3089 uses the file event ID as the branch state key, but the current
+      // listing is a separate state event. Redact that current listing after
+      // clearing the branch state; redacting only the file event leaves the
+      // listing visible and is especially harmful when a user is suspended.
+      const listingEventId = branch.indexEvent?.getId?.() ?? branch.id;
+      if (typeof listingEventId !== "string" || listingEventId.length === 0) {
+        throw new StorageError("encrypted file has no listing event identifier");
+      }
       await withRateLimitRetry(
         () =>
           withMatrixMutationAbort(
@@ -1428,13 +1432,13 @@ export async function deleteFile(
       await withRateLimitRetry(
         () =>
           withMatrixMutationAbort(
-            () => client.redactEvent(tree.id, branch.id),
+            () => client.redactEvent(tree.id, listingEventId),
             signal,
             "delete file event",
           ),
         signal,
       );
-      completedIds.push(branch.id);
+      completedIds.push(listingEventId);
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) {

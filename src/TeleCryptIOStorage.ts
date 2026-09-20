@@ -11,6 +11,7 @@ import {
   SyncState,
   UNSTABLE_MSC3088_ENABLED,
   UNSTABLE_MSC3088_PURPOSE,
+  UNSTABLE_MSC3089_BRANCH,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
 } from "matrix-js-sdk";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
@@ -78,6 +79,8 @@ export interface TreeSpace {
 
 export interface FileBranch {
   readonly id: string;
+  /** Current MSC3089 branch/listing event. Its event ID is distinct from `id` (the state key). */
+  readonly indexEvent?: Pick<MatrixEvent, "getId">;
   /** Matrix SDK keeps a redacted branch in state as an inactive object. */
   readonly isActive?: boolean;
   getName(): string;
@@ -1423,19 +1426,22 @@ export class TeleCryptIOStorage {
         invite: 100,
         kick: 100,
         ban: 100,
-        redact: 50,
-        state_default: 50,
-        events_default: 50,
+        redact: 100,
+        state_default: 0,
+        events_default: 0,
         users_default: 0,
         events: {
           [EventType.RoomPowerLevels]: 100,
           [EventType.RoomHistoryVisibility]: 100,
           [EventType.RoomTombstone]: 100,
           [EventType.RoomEncryption]: 100,
-          [EventType.RoomName]: 50,
-          [EventType.RoomMessage]: 50,
-          [EventType.RoomMessageEncrypted]: 50,
-          [EventType.Sticker]: 50,
+          [EventType.RoomName]: 100,
+          [EventType.RoomMessage]: 0,
+          [EventType.RoomMessageEncrypted]: 0,
+          [EventType.Sticker]: 0,
+          [EventType.SpaceChild]: 100,
+          [EventType.SpaceParent]: 100,
+          [UNSTABLE_MSC3089_BRANCH.name]: 100,
         },
         users: { [userId]: 100 },
       },

@@ -1418,7 +1418,6 @@ describe("operation safety", () => {
   it("suppresses only typed M_FORBIDDEN after authoritative membership confirms the target", async () => {
     const tree = makeTree("!vault:example.test", "Vault", true);
     tree.invite = vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
-    tree.setPermissions = vi.fn().mockResolvedValue(undefined);
     const storage = {
       getTree: () => tree,
       getClient: () => ({ getUserId: () => "@owner:example.test" }),
@@ -1431,19 +1430,17 @@ describe("operation safety", () => {
         ]),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, tree.id, "@target:example.test", "editor")).resolves.toEqual({
+    await expect(shareVault(storage, tree.id, "@target:example.test", "viewer")).resolves.toEqual({
       vaultId: tree.id,
       userId: "@target:example.test",
-      role: "editor",
+      role: "viewer",
     });
-    expect(tree.setPermissions).toHaveBeenCalledWith("@target:example.test", "editor");
   });
 
   it("does not infer an existing member from arbitrary error text", async () => {
     const tree = makeTree("!vault:example.test", "Vault", true);
     const failure = new Error("already in the room, secret=do-not-ignore");
     tree.invite = vi.fn().mockRejectedValue(failure);
-    tree.setPermissions = vi.fn();
     const storage = {
       getTree: () => tree,
       getClient: () => ({ getUserId: () => "@owner:example.test" }),
@@ -1454,7 +1451,6 @@ describe("operation safety", () => {
     await expect(shareVault(storage, tree.id, "@target:example.test", "viewer")).rejects.toThrow(
       "share failed",
     );
-    expect(tree.setPermissions).not.toHaveBeenCalled();
   });
 
   it("applies share and unshare across every known nested room", async () => {
@@ -1462,8 +1458,6 @@ describe("operation safety", () => {
     const root = makeTree("!root-share:example.test", "Root", true);
     root.getDirectories = () => [child];
     root.invite = vi.fn().mockResolvedValue(undefined);
-    root.setPermissions = vi.fn().mockResolvedValue(undefined);
-    child.setPermissions = vi.fn().mockResolvedValue(undefined);
     const client = {
       getUserId: () => "@owner:example.test",
       kick: vi.fn().mockResolvedValue(undefined),
@@ -1476,14 +1470,12 @@ describe("operation safety", () => {
       getRoomMembership: vi.fn().mockResolvedValue("join"),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "editor")).resolves.toEqual({
+    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).resolves.toEqual({
       vaultId: root.id,
       userId: "@target:example.test",
-      role: "editor",
+      role: "viewer",
     });
     expect(root.invite).toHaveBeenCalledWith("@target:example.test");
-    expect(root.setPermissions).toHaveBeenCalledWith("@target:example.test", "editor");
-    expect(child.setPermissions).toHaveBeenCalledWith("@target:example.test", "editor");
 
     await expect(unshareVault(storage, root.id, "@target:example.test")).resolves.toEqual({
       vaultId: root.id,
@@ -1499,8 +1491,6 @@ describe("operation safety", () => {
     root.getDirectories = () => [child];
     root.invite = vi.fn().mockResolvedValue(undefined);
     child.invite = vi.fn().mockResolvedValue(undefined);
-    root.setPermissions = vi.fn().mockResolvedValue(undefined);
-    child.setPermissions = vi.fn().mockResolvedValue(undefined);
     const storage = {
       getTree: () => root,
       getClient: () => ({ getUserId: () => "@owner:example.test" }),
@@ -1563,8 +1553,6 @@ describe("operation safety", () => {
     const root = makeTree("!root-owner:example.test", "Root", true);
     root.getDirectories = () => [child];
     root.invite = vi.fn().mockResolvedValue(undefined);
-    root.setPermissions = vi.fn().mockResolvedValue(undefined);
-    child.setPermissions = vi.fn().mockResolvedValue(undefined);
     const storage = {
       getTree: () => root,
       getClient: () => ({ getUserId: () => "@admin:example.test" }),
@@ -1578,25 +1566,23 @@ describe("operation safety", () => {
     await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).rejects.toThrow(
       "existing owner",
     );
-    expect(child.setPermissions).not.toHaveBeenCalled();
   });
 
-  it("reports share as partial after an earlier room permission commit", async () => {
+  it("reports share as partial after an earlier room invite commit", async () => {
     const child = makeTree("!child-share-partial:example.test", "Child", false);
     const root = makeTree("!root-share-partial:example.test", "Root", true);
     root.getDirectories = () => [child];
     root.invite = vi.fn().mockResolvedValue(undefined);
-    root.setPermissions = vi.fn().mockResolvedValue(undefined);
-    child.setPermissions = vi.fn().mockRejectedValue(new Error("child permission failed"));
+    child.invite = vi.fn().mockRejectedValue(new Error("child invite failed"));
     const storage = {
       getTree: () => root,
       getClient: () => ({ getUserId: () => "@owner:example.test" }),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      getRoomMembership: vi.fn().mockResolvedValue(null),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "editor")).rejects.toMatchObject({
+    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).rejects.toMatchObject({
       code: "MUTATION_PARTIAL",
       operation: "share",
       completedIds: [root.id],
