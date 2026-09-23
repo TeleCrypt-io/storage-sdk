@@ -173,6 +173,7 @@ describe("sharing", () => {
     const bob = await createTestClient(bobUser);
     try {
       const aliceStore = new TeleCryptIOStorage(alice);
+      const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("PermTest");
       await waitForTreeName(aliceStore, tree.id, "PermTest");
@@ -180,11 +181,17 @@ describe("sharing", () => {
       await tree.invite(bobUser.userId);
       await bob.joinRoom(tree.id);
 
-      const viewerPerms = tree.getPermissions(bobUser.userId);
+      const bobTree = await waitForTree(bobStore, tree.id, "Bob sees joined vault");
+      const viewerPerms = bobTree.getPermissions(bobUser.userId);
       expect(viewerPerms).toBe(TreePermissions.Viewer);
 
-      await expect(tree.setPermissions(bobUser.userId, TreePermissions.Editor)).rejects.toThrow();
-      expect(tree.getPermissions(bobUser.userId)).toBe(TreePermissions.Viewer);
+      await expect(bobTree.setPermissions(bobUser.userId, TreePermissions.Editor)).rejects.toThrow();
+      const authoritativeMembers = await aliceStore.listMembers(tree);
+      expect(authoritativeMembers.find((member) => member.userId === bobUser.userId)?.role).toBe(
+        TreePermissions.Viewer,
+      );
+      await bobStore.refreshRoomState(tree.id);
+      expect(bobTree.getPermissions(bobUser.userId)).toBe(TreePermissions.Viewer);
     } finally {
       stopTestClient(alice);
       stopTestClient(bob);

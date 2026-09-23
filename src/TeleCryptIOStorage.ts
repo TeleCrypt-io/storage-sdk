@@ -2260,7 +2260,9 @@ export class TeleCryptIOStorage {
     const pls = parseMatrixPowerLevels(plsRaw);
 
     const viewLevel = pls.users_default ?? 0;
-    const editLevel = pls.events_default ?? 50;
+    // Match matrix-js-sdk's MSC3089TreeSpace.getPermissions() default. An
+    // explicit zero still means regular users lack the editor threshold.
+    const editLevel = pls.events_default || 50;
     const adminLevel = pls.events?.["m.room.power_levels"] ?? 100;
     const roleFor = (userId: string): string => {
       const userLevel = pls.users?.[userId] ?? viewLevel;
