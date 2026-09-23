@@ -5,6 +5,7 @@ import {
   MatrixClient,
   MatrixEvent,
   MatrixError,
+  MsgType,
   Preset,
   RoomCreateTypeField,
   RoomType,
@@ -12,6 +13,7 @@ import {
   UNSTABLE_MSC3088_ENABLED,
   UNSTABLE_MSC3088_PURPOSE,
   UNSTABLE_MSC3089_BRANCH,
+  UNSTABLE_MSC3089_LEAF,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
 } from "matrix-js-sdk";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
@@ -79,8 +81,9 @@ export interface TreeSpace {
 
 export interface FileBranch {
   readonly id: string;
+  readonly roomId: string;
   /** Current MSC3089 branch/listing event. Its event ID is distinct from `id` (the state key). */
-  readonly indexEvent?: Pick<MatrixEvent, "getId">;
+  readonly indexEvent?: Pick<MatrixEvent, "getId" | "getContent" | "getSender" | "isRedacted">;
   /** Matrix SDK keeps a redacted branch in state as an inactive object. */
   readonly isActive?: boolean;
   getName(): string;
@@ -92,6 +95,16 @@ export interface FileBranch {
   }>;
   getFileEvent(): Promise<Pick<MatrixEvent, "getContent" | "getTs" | "isDecryptionFailure">>;
 }
+
+const STORAGE_METADATA_EVENT_TYPE = "io.telecrypt.storage.metadata";
+const STORAGE_METADATA_MSGTYPE = "io.telecrypt.storage.metadata";
+const GENERIC_TREE_NAME = "Encrypted storage";
+const GENERIC_FILE_NAME = "Encrypted file";
+
+type MetadataEventContent = Record<string, unknown> & {
+  msgtype: string;
+  body: string;
+};
 
 export interface CreateTeleCryptIOStorageOptions {
   /** Matrix homeserver base URL, e.g. "https://matrix.example.com". */
@@ -482,13 +495,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function isUndecryptableFilePlaceholder(branch: FileBranch): Promise<boolean> {
-  // matrix-js-sdk replaces failed encrypted event content with m.bad.encrypted;
-  // its public failure flag is the authoritative state and avoids guessing
-  // from that display content (or misclassifying malformed plaintext events).
-  return (await branch.getFileEvent()).isDecryptionFailure();
-}
-
 function validateSecretStorageStatus(value: unknown): SecretStorageStatusShape {
   if (!isRecord(value)) throw new RecoverySetupAmbiguousError();
   const defaultKeyId = value.defaultKeyId;
@@ -685,6 +691,9 @@ export async function withTreeMutation<T>(
 
 export class TeleCryptIOStorage {
   private readonly decoratedTreeSpaces = new WeakSet<object>();
+  private readonly decoratedFileBranches = new WeakMap<object, FileBranch>();
+  private readonly treeNames = new Map<string, string>();
+  private readonly fileNames = new Map<string, string>();
 
   constructor(private client: MatrixClient) {
     // Advanced callers may construct a MatrixClient themselves. The SDK does
@@ -696,6 +705,299 @@ export class TeleCryptIOStorage {
   /** The underlying matrix-js-sdk client (e.g. to stop it, or for advanced/interop use). */
   getClient(): MatrixClient {
     return this.client;
+  }
+
+  private fileNameKey(treeId: string, fileId: string): string {
+    return `${treeId}\u0000${fileId}`;
+  }
+
+  private getStateEvent(roomId: string, eventType: string, stateKey: string): MatrixEvent | null {
+    const state = this.client.getRoom(roomId)?.currentState as unknown as {
+      getStateEvents: (type: string, key: string) => MatrixEvent | MatrixEvent[] | null | undefined;
+    } | undefined;
+    const raw = state?.getStateEvents(eventType, stateKey);
+    if (Array.isArray(raw)) return raw[0] ?? null;
+    return raw ?? null;
+  }
+
+  private getTreeOwnerId(roomId: string): string {
+    const create = this.getStateEvent(roomId, EventType.RoomCreate, "");
+    const ownerId = create?.getSender();
+    if (!ownerId) throw new StorageError("storage owner is unavailable");
+    return ownerId;
+  }
+
+  private async sendEncryptedMetadataMessage(
+    roomId: string,
+    content: MetadataEventContent,
+  ): Promise<string> {
+    const response = await this.client.sendMessage(roomId, content as never);
+    return validateMatrixEventId(
+      (response as unknown as { event_id?: unknown } | undefined)?.event_id,
+      "storage metadata response event ID",
+    );
+  }
+
+  private async readEncryptedMetadataMessage(
+    roomId: string,
+    eventId: string,
+    allowRedacted = false,
+  ): Promise<MatrixEvent> {
+    const rawEvent = await this.client.fetchRoomEvent(roomId, eventId);
+    const event = this.client.getEventMapper()(rawEvent);
+    await this.client.decryptEventIfNeeded(event);
+
+    if (event.isDecryptionFailure()) throw new UndecryptableFileError();
+    if (
+      allowRedacted &&
+      event.getId() === eventId &&
+      event.getRoomId() === roomId &&
+      event.getSender() === this.getTreeOwnerId(roomId) &&
+      event.isRedacted()
+    ) {
+      return event;
+    }
+    if (
+      event.getId() !== eventId ||
+      event.getRoomId() !== roomId ||
+      event.getSender() !== this.getTreeOwnerId(roomId) ||
+      event.getWireType() !== EventType.RoomMessageEncrypted ||
+      event.getType() !== EventType.RoomMessage
+    ) {
+      throw new StorageError("encrypted storage metadata is invalid or unavailable");
+    }
+    return event;
+  }
+
+  private async writeTreeName(roomId: string, name: string): Promise<void> {
+    validateName(name, "name");
+    const metadataEventId = await this.sendEncryptedMetadataMessage(roomId, {
+      msgtype: STORAGE_METADATA_MSGTYPE,
+      body: name,
+    });
+    await this.client.sendStateEvent(
+      roomId,
+      STORAGE_METADATA_EVENT_TYPE as never,
+      { event_id: metadataEventId } as never,
+      "",
+    );
+    this.treeNames.set(roomId, name);
+  }
+
+  /** Resolves an encrypted vault/folder name through its pointer state event. */
+  async getTreeName(roomId: string, options?: MatrixRequestOptions): Promise<string> {
+    if (options?.signal?.aborted) throw new StorageError("operation cancelled");
+    await this.refreshRoomState(roomId, options);
+    const pointer = this.getStateEvent(roomId, STORAGE_METADATA_EVENT_TYPE, "");
+    const pointerContent = pointer?.getContent();
+    if (
+      !pointer ||
+      pointer.getSender() !== this.getTreeOwnerId(roomId) ||
+      !isRecord(pointerContent) ||
+      typeof pointerContent.event_id !== "string"
+    ) {
+      throw new StorageError("encrypted storage name is unavailable");
+    }
+    const metadataEventId = validateMatrixEventId(pointerContent.event_id, "storage metadata event ID");
+    let event: MatrixEvent;
+    try {
+      event = await this.readEncryptedMetadataMessage(roomId, metadataEventId);
+    } catch (error) {
+      // A new device can list storage before restoring room keys. Keep the
+      // room visible with a generic label; a later call retries decryption.
+      if (error instanceof UndecryptableFileError) return GENERIC_TREE_NAME;
+      throw error;
+    }
+    const content = event.getContent();
+    if (
+      !isRecord(content) ||
+      content.msgtype !== STORAGE_METADATA_MSGTYPE ||
+      typeof content.body !== "string" ||
+      Object.hasOwn(content, "file_event_id")
+    ) {
+      throw new StorageError("encrypted storage name is invalid or unavailable");
+    }
+    validateName(content.body, "name");
+    this.treeNames.set(roomId, content.body);
+    return content.body;
+  }
+
+  private async writeFileName(treeId: string, fileId: string, name: string): Promise<void> {
+    validateName(name, "file name");
+    validateMatrixEventId(fileId, "file event ID");
+    const metadataEventId = await this.sendEncryptedMetadataMessage(treeId, {
+      msgtype: STORAGE_METADATA_MSGTYPE,
+      body: name,
+      file_event_id: fileId,
+    });
+    await this.client.sendStateEvent(
+      treeId,
+      UNSTABLE_MSC3089_BRANCH.name,
+      { active: true, metadata_event_id: metadataEventId } as never,
+      fileId,
+    );
+    this.fileNames.set(this.fileNameKey(treeId, fileId), name);
+  }
+
+  /** Resolves an encrypted file name from the MSC3089 index pointer. */
+  async getFileName(
+    treeId: string,
+    fileId: string,
+    options?: MatrixRequestOptions & { refreshState?: boolean },
+  ): Promise<string> {
+    if (options?.signal?.aborted) throw new StorageError("operation cancelled");
+    if (options?.refreshState !== false) await this.refreshRoomState(treeId, options);
+    const tree = this.getTree(treeId);
+    const branch = tree?.getFile(fileId);
+    if (!branch || branch.isActive === false) throw new StorageError("file not found");
+    const indexEvent = branch.indexEvent;
+    const indexContent = indexEvent?.getContent();
+    if (
+      !indexEvent ||
+      indexEvent.getSender() !== this.getTreeOwnerId(treeId) ||
+      !isRecord(indexContent) ||
+      indexContent.active !== true ||
+      typeof indexContent.metadata_event_id !== "string"
+    ) {
+      throw new StorageError("encrypted file name is unavailable");
+    }
+    const metadataEventId = validateMatrixEventId(
+      indexContent.metadata_event_id,
+      "file metadata event ID",
+    );
+    let event: MatrixEvent;
+    try {
+      event = await this.readEncryptedMetadataMessage(treeId, metadataEventId);
+    } catch (error) {
+      // File IDs remain listable on a fresh device while its room keys are
+      // being restored. The caller can resolve the private name on retry.
+      if (error instanceof UndecryptableFileError) return GENERIC_FILE_NAME;
+      throw error;
+    }
+    const content = event.getContent();
+    if (!isRecord(content) || typeof content.body !== "string") {
+      throw new StorageError("encrypted file name is invalid or unavailable");
+    }
+    if (content.msgtype === MsgType.File) {
+      if (metadataEventId !== fileId || !isRecord(content.file)) {
+        throw new StorageError("encrypted file metadata does not match its listing");
+      }
+    } else if (
+      content.msgtype !== STORAGE_METADATA_MSGTYPE ||
+      content.file_event_id !== fileId
+    ) {
+      throw new StorageError("encrypted file metadata does not match its listing");
+    }
+    validateName(content.body, "file name");
+    this.fileNames.set(this.fileNameKey(treeId, fileId), content.body);
+    return content.body;
+  }
+
+  /** Returns the current file metadata pointer, including on inactive branches. */
+  async getFileMetadataEventId(
+    treeId: string,
+    fileId: string,
+    options?: MatrixRequestOptions,
+  ): Promise<string | null> {
+    if (options?.signal?.aborted) throw new StorageError("operation cancelled");
+    await this.refreshRoomState(treeId, options);
+    const branch = this.getTree(treeId)?.getFile(fileId);
+    if (!branch) throw new StorageError("file not found");
+    const indexEvent = branch.indexEvent;
+    const content = indexEvent?.getContent();
+    if (!indexEvent || indexEvent.getSender() !== this.getTreeOwnerId(treeId)) {
+      throw new StorageError("encrypted file listing is unavailable");
+    }
+    if (
+      !isRecord(content) ||
+      typeof content.metadata_event_id !== "string"
+    ) {
+      if (branch.isActive === false || indexEvent.isRedacted()) return null;
+      throw new StorageError("encrypted file name is unavailable");
+    }
+    return validateMatrixEventId(content.metadata_event_id, "file metadata event ID");
+  }
+
+  /** Fetches and validates a current encrypted rename event, allowing retries after redaction. */
+  async getFileRenameMetadataEvent(
+    treeId: string,
+    fileId: string,
+    metadataEventId: string,
+  ): Promise<MatrixEvent> {
+    const event = await this.readEncryptedMetadataMessage(treeId, metadataEventId, true);
+    if (event.isRedacted()) return event;
+    const content = event.getContent();
+    if (
+      !isRecord(content) ||
+      content.msgtype !== STORAGE_METADATA_MSGTYPE ||
+      content.file_event_id !== fileId ||
+      typeof content.body !== "string"
+    ) {
+      throw new StorageError("encrypted file metadata does not match its listing");
+    }
+    validateName(content.body, "file name");
+    return event;
+  }
+
+  /** Fetches the original encrypted file message directly by event ID. */
+  async getOriginalFileEvent(
+    treeId: string,
+    fileId: string,
+    allowRedacted = false,
+  ): Promise<MatrixEvent> {
+    const event = await this.readEncryptedMetadataMessage(treeId, fileId, allowRedacted);
+    if (event.isRedacted() && allowRedacted) return event;
+    const content = event.getContent();
+    if (
+      !isRecord(content) ||
+      content.msgtype !== MsgType.File ||
+      typeof content.body !== "string" ||
+      !isRecord(content.file) ||
+      typeof content.file.url !== "string"
+    ) {
+      throw new StorageError("encrypted file message is invalid or unavailable");
+    }
+    return event;
+  }
+
+  private async createEncryptedFile(
+    treeId: string,
+    name: string,
+    encryptedContents: ArrayBuffer | Uint8Array,
+    info: Record<string, unknown>,
+    additionalContent?: Record<string, unknown>,
+  ): Promise<{ event_id: string }> {
+    validateFileName(name);
+    const bytes = encryptedContents instanceof Uint8Array
+      ? encryptedContents
+      : new Uint8Array(encryptedContents);
+    const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const uploaded = await this.client.uploadContent(body, { includeFilename: false });
+    if (typeof uploaded.content_uri !== "string" || uploaded.content_uri.length === 0) {
+      throw new StorageError("encrypted media upload returned no content URI");
+    }
+    const fileInfo = { ...info, url: uploaded.content_uri };
+    const fileContent: Record<string, unknown> = {
+      ...additionalContent,
+      msgtype: MsgType.File,
+      body: name,
+      url: uploaded.content_uri,
+      file: fileInfo,
+      [UNSTABLE_MSC3089_LEAF.name]: {},
+    };
+    const sent = await this.client.sendMessage(treeId, fileContent as never);
+    const fileEventId = validateMatrixEventId(
+      (sent as unknown as { event_id?: unknown } | undefined)?.event_id,
+      "file upload response event ID",
+    );
+    await this.client.sendStateEvent(
+      treeId,
+      UNSTABLE_MSC3089_BRANCH.name,
+      { active: true, metadata_event_id: fileEventId } as never,
+      fileEventId,
+    );
+    this.fileNames.set(this.fileNameKey(treeId, fileEventId), name);
+    return { event_id: fileEventId };
   }
 
   /**
@@ -1420,7 +1722,7 @@ export class TeleCryptIOStorage {
     if (!userId) throw new Error("createTree: Matrix client has no user ID");
 
     return {
-      name,
+      name: GENERIC_TREE_NAME,
       preset: Preset.PrivateChat,
       power_level_content_override: {
         invite: 100,
@@ -1442,6 +1744,7 @@ export class TeleCryptIOStorage {
           [EventType.SpaceChild]: 100,
           [EventType.SpaceParent]: 100,
           [UNSTABLE_MSC3089_BRANCH.name]: 100,
+          [STORAGE_METADATA_EVENT_TYPE]: 100,
         },
         users: { [userId]: 100 },
       },
@@ -1511,10 +1814,47 @@ export class TeleCryptIOStorage {
     this.decoratedTreeSpaces.add(tree as object);
 
     const originalGetDirectories = tree.getDirectories.bind(tree);
+    const originalListFiles = typeof tree.listFiles === "function"
+      ? tree.listFiles.bind(tree)
+      : () => [];
+    const originalGetFile = typeof tree.getFile === "function"
+      ? tree.getFile.bind(tree)
+      : () => null;
     tree.getDirectories = () =>
       originalGetDirectories().map((child) => this.decorateTreeSpace(child));
     tree.createDirectory = (name: string) => this.createSubtree(tree, name);
+    tree.setName = (name: string) => this.writeTreeName(tree.id, name);
+    tree.listFiles = () => originalListFiles().map((branch) => this.decorateFileBranch(tree.id, branch));
+    tree.getFile = (fileId: string) => {
+      const branch = originalGetFile(fileId);
+      return branch ? this.decorateFileBranch(tree.id, branch) : null;
+    };
+    tree.createFile = (name, encryptedContents, info, additionalContent) =>
+      this.createEncryptedFile(tree.id, name, encryptedContents, info, additionalContent);
     return tree;
+  }
+
+  private decorateFileBranch(treeId: string, branch: FileBranch): FileBranch {
+    const existing = this.decoratedFileBranches.get(branch as object);
+    if (existing) return existing;
+    const decorated = Object.create(branch) as FileBranch;
+    const nameKey = this.fileNameKey(treeId, branch.id);
+    Object.defineProperties(decorated, {
+      getName: {
+        value: () => this.fileNames.get(nameKey) ?? GENERIC_FILE_NAME,
+      },
+      setName: {
+        value: (name: string) => this.writeFileName(treeId, branch.id, name),
+      },
+      delete: {
+        value: async () => {
+          const { deleteFile } = await import("./core/operations.js");
+          await deleteFile(this, treeId, branch.id);
+        },
+      },
+    });
+    this.decoratedFileBranches.set(branch as object, decorated);
+    return decorated;
   }
 
   /** Cleans up only a room created by this operation and reports incomplete cleanup. */
@@ -1624,8 +1964,25 @@ export class TeleCryptIOStorage {
       throw new RoomCreationAmbiguousError(operation, error);
     }
     try {
-      return await this.waitForTreeSpace(roomId, operation, signal);
+      const tree = await this.waitForTreeSpace(roomId, operation, signal);
+      try {
+        await this.writeTreeName(roomId, name);
+      } catch (error) {
+        try {
+          await this.cleanupCreatedRoom(roomId);
+        } catch (cleanupError) {
+          throwWithCleanupDetail(error, roomId, cleanupError);
+        }
+        throw new StorageError(`${operation}: encrypted name initialization failed`, { cause: error });
+      }
+      return tree;
     } catch (error) {
+      if (
+        error instanceof StorageError &&
+        error.message === `${operation}: encrypted name initialization failed`
+      ) {
+        throw error;
+      }
       try {
         await this.cleanupCreatedRoom(roomId);
       } catch (cleanupError) {
@@ -1998,27 +2355,14 @@ export class TeleCryptIOStorage {
   ): Promise<{ data: ArrayBuffer; mimetype: string }> {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     let info: Record<string, unknown> | undefined;
+    let fileEvent: MatrixEvent | undefined;
     try {
-      ({ info } = await branch.getFileInfo());
+      fileEvent = await this.getOriginalFileEvent(branch.roomId, branch.id);
+      const content = fileEvent.getContent();
+      info = isRecord(content) && isRecord(content.file) ? content.file : undefined;
     } catch (error) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       if (error instanceof StorageError || error instanceof MatrixError) throw error;
-      // matrix-js-sdk's file-info accessor reads an attachment absent from
-      // failed-decryption events. Use its explicit decryption status, not a
-      // guessed content shape; preserve other SDK/transport failures.
-      let isPlaceholder = false;
-      try {
-        isPlaceholder = await isUndecryptableFilePlaceholder(branch);
-      } catch (placeholderError) {
-        throw new AggregateError(
-          [error, placeholderError],
-          "file metadata lookup and placeholder inspection both failed",
-          { cause: error },
-        );
-      }
-      if (isPlaceholder) {
-        throw new UndecryptableFileError();
-      }
       throw error;
     }
     // Missing metadata alone does not establish a decryption failure.
@@ -2028,7 +2372,7 @@ export class TeleCryptIOStorage {
     // `info` is the encrypted attachment descriptor. Its shape is owned by
     // matrix-encrypt-attachment and does not carry the plaintext size. The
     // event's `info` block is the sole source of user-facing file metadata.
-    const eventMetadata = readFileEventMetadata((await branch.getFileEvent()).getContent());
+    const eventMetadata = readFileEventMetadata(fileEvent!.getContent());
     if (signal?.aborted) throw new StorageError("operation cancelled");
     const declaredSize = eventMetadata.size;
     const mimetype = eventMetadata.mimetype ?? "application/octet-stream";

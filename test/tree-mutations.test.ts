@@ -16,6 +16,27 @@ function tree(id: string, name: string, isTopLevel: boolean): TreeSpace {
   } as unknown as TreeSpace;
 }
 
+function storageForTest(rawClient: unknown): TeleCryptIOStorage {
+  const client = rawClient as Record<string, unknown>;
+  let messageId = 0;
+  if (typeof client.sendMessage !== "function") {
+    client.sendMessage = vi.fn(async () => ({ event_id: `$encrypted-name-${++messageId}` }));
+  }
+  const sendStateEvent = client.sendStateEvent as
+    | ((roomId: string, type: string, content: unknown, stateKey: string) => Promise<unknown>)
+    | undefined;
+  client.sendStateEvent = vi.fn((roomId: string, type: string, content: unknown, stateKey: string) => {
+    // Tree creation now writes the encrypted name pointer before linking the
+    // room. Keep each test's existing link behavior and failure injection
+    // focused on its m.space.child/m.space.parent operation.
+    if (type === "io.telecrypt.storage.metadata") return Promise.resolve({});
+    return sendStateEvent
+      ? sendStateEvent(roomId, type, content, stateKey)
+      : Promise.resolve({});
+  });
+  return new TeleCryptIOStorage(client as never);
+}
+
 describe("tree mutations", () => {
   it("routes createDirectory through the linked-subtree path and refreshes both rooms", async () => {
     const parentRoom = {
@@ -44,7 +65,7 @@ describe("tree mutations", () => {
       sendStateEvent: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
     const decoratedParent = storage.getTree(parent.id)!;
 
     await expect(decoratedParent.createDirectory("Child")).resolves.toBe(child);
@@ -151,7 +172,7 @@ describe("tree mutations", () => {
       unstableCreateFileTree,
       unstableGetFileTreeSpace: vi.fn((roomId: string) => trees.get(roomId) ?? null),
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     await expect(storage.createTree("Created")).resolves.toBe(created);
     expect(client.createRoom).toHaveBeenCalledTimes(1);
@@ -164,7 +185,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       createRoom: vi.fn(),
     };
-    await expect(new TeleCryptIOStorage(client as never).createTree("bad\nname")).rejects.toThrow(
+    await expect(storageForTest(client).createTree("bad\nname")).rejects.toThrow(
       "invalid name",
     );
     expect(client.createRoom).not.toHaveBeenCalled();
@@ -177,7 +198,7 @@ describe("tree mutations", () => {
       createRoom: vi.fn(async () => ({ room_id: "$not-a-room-id" })),
       unstableGetFileTreeSpace: vi.fn(),
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     await expect(storage.createTree("Invalid response")).rejects.toMatchObject({
       code: "ROOM_CREATION_AMBIGUOUS",
@@ -206,7 +227,7 @@ describe("tree mutations", () => {
       }),
       unstableGetFileTreeSpace: vi.fn((roomId: string) => trees.get(roomId) ?? null),
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     const [first, second] = await Promise.all([
       storage.createTree("Same"),
@@ -254,7 +275,7 @@ describe("tree mutations", () => {
       }),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     const [first, second] = await Promise.all([
       storage.createSubtree(parent, "Child"),
@@ -305,7 +326,7 @@ describe("tree mutations", () => {
       forget: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     let caught: unknown;
     try {
@@ -355,7 +376,7 @@ describe("tree mutations", () => {
       forget: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     await expect(storage.createSubtree(parent, "Child")).rejects.toThrow(
       "ambiguous parent link failure",
@@ -401,7 +422,7 @@ describe("tree mutations", () => {
       forget: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     let caught: unknown;
     try {
@@ -460,7 +481,7 @@ describe("tree mutations", () => {
       forget: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     await expect(storage.createSubtree(parent, "Child")).rejects.toThrow(
       "ambiguous child link failure",
@@ -519,7 +540,7 @@ describe("tree mutations", () => {
         }),
       },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     let caught: unknown;
     try {
@@ -569,7 +590,7 @@ describe("tree mutations", () => {
       forget: vi.fn().mockResolvedValue(undefined),
       http: { authedRequest: vi.fn(async () => []) },
     };
-    const storage = new TeleCryptIOStorage(client as never);
+    const storage = storageForTest(client);
 
     let caught: unknown;
     try {
@@ -595,7 +616,7 @@ describe("tree mutations", () => {
         if (failedStep === "forget") throw new Error("forget failed");
       }),
     };
-    const storage = new TeleCryptIOStorage(client as never) as unknown as {
+    const storage = storageForTest(client) as unknown as {
       cleanupCreatedRoom: (roomId: string) => Promise<void>;
     };
 

@@ -62,6 +62,15 @@ The SDK maps the file tree to Matrix primitives defined by MSC3089:
 Vault, folder, and file IDs are opaque Matrix room and event IDs. Names are display labels: two
 objects with the same name are still distinct, and a name is not an idempotency key.
 
+Vault and folder names, and file names, are stored in encrypted room messages. Matrix room names
+remain the generic `Encrypted storage`; file-listing state stores only an event pointer, and media
+uploads omit the original filename. Use the asynchronous operations in `@telecrypt-io/storage/core`
+to read names. The synchronous Matrix SDK tree helper cannot decrypt on demand and exposes a generic
+file label until an async operation resolves the name. This is a TeleCrypt metadata format: standard
+MSC3089 clients will not display the private names or understand these file indexes. SDK 0.8 starts
+this format without a reader or migration for trees written by older SDK versions; those old trees
+may be ignored or removed.
+
 File bytes are encrypted in the client before upload with Matrix attachment encryption (AES-CTR
 and a per-file key distributed through the room's Megolm session). The server stores encrypted
 media and Matrix events, but encryption does not hide all room, event, or other metadata from the

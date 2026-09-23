@@ -23,7 +23,6 @@ import {
   MatrixError,
   RoomCreateTypeField,
   RoomType,
-  UNSTABLE_MSC3089_BRANCH,
   UNSTABLE_MSC3088_ENABLED,
   UNSTABLE_MSC3088_PURPOSE,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
@@ -31,6 +30,7 @@ import {
 } from "matrix-js-sdk";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
+import { validateMatrixEventId } from "./constants.js";
 import {
   FileTooLargeError,
   MutationPartialError,
@@ -326,7 +326,6 @@ async function refreshDeletionRooms(
   if (parentEvents === null) throw new StorageError("could not enumerate storage parent safely");
   const parentIds = new Set<string>();
   for (const event of parentEvents) {
-    if (!isActiveRelationEvent(event)) continue;
     const parentId = relationStateKey(event);
     if (!parentId) throw new StorageError("could not enumerate storage parent safely");
     if (parentId !== rootId) parentIds.add(parentId);
@@ -335,15 +334,6 @@ async function refreshDeletionRooms(
   const parents = [...parentIds];
   if (parents[0]) {
     await storage.refreshRoomState(parents[0], { signal });
-    const childEvents = readRelationEvents(client, parents[0], EventType.SpaceChild, rootId);
-    if (
-      childEvents === null ||
-      !childEvents.some(
-        (event) => isActiveRelationEvent(event) && relationStateKey(event, rootId) === rootId,
-      )
-    ) {
-      throw new StorageError("storage parent relation is inconsistent");
-    }
   }
   if (signal?.aborted) throw new StorageError("operation cancelled");
   return parents;
@@ -384,6 +374,7 @@ async function refreshTreeSpaces(
 type RelationEvent = {
   getStateKey?: () => string | undefined;
   getId?: () => string | undefined;
+  getSender?: () => string | undefined;
   getContent?: () => unknown;
 };
 
@@ -447,30 +438,50 @@ async function unlinkExternalParents(
   signal?: AbortSignal,
 ): Promise<void> {
   const client = storage.getClient();
-  let mutationAttempted = false;
+  const completedRelationEventIds: string[] = [];
+  const redactRelation = async (
+    roomId: string,
+    eventType: string,
+    stateKey: string,
+  ): Promise<void> => {
+    await storage.refreshRoomState(roomId, { signal });
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    const events = readRelationEvents(client, roomId, eventType, stateKey);
+    if (events === null) throw new StorageError("storage folder state is unavailable");
+    const event = events[0];
+    if (!event || !isActiveRelationEvent(event)) return;
+    const currentUserId = client.getUserId();
+    if (!currentUserId || event.getSender?.() !== currentUserId) {
+      throw new StorageError("storage folder relation was not authored by the owner");
+    }
+    const eventId = validateMatrixEventId(event.getId?.(), "storage folder relation event ID");
+    await withRateLimitRetry(
+      () => withMatrixMutationAbort(() => client.redactEvent(roomId, eventId), signal),
+      signal,
+    );
+    if (!completedRelationEventIds.includes(eventId)) completedRelationEventIds.push(eventId);
+    await storage.refreshRoomState(roomId, { signal });
+    const remaining = readRelationEvents(client, roomId, eventType, stateKey);
+    if (remaining === null || remaining.some((candidate) => isActiveRelationEvent(candidate))) {
+      throw new StorageError("delete graph unlink could not be verified");
+    }
+  };
+
   try {
     for (const parentId of externalParents) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
-      // Empty state-event content is the MSC3089-supported unlink form. Redaction
-      // is not used here because it can be delayed or rejected independently of
-      // the relation update.
-      mutationAttempted = true;
-      await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => client.sendStateEvent(parentId, EventType.SpaceChild, {}, rootId), signal),
-        signal,
-      );
-      if (signal?.aborted) throw new StorageError("operation cancelled");
-      await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => client.sendStateEvent(rootId, EventType.SpaceParent, {}, parentId), signal),
-        signal,
-      );
+      // Redact owner-authored relations one room at a time. If the process stops
+      // after the parent-side redaction, the redacted state key remains visible
+      // and the next call continues with the child-side relation.
+      await redactRelation(parentId, EventType.SpaceChild, rootId);
+      await redactRelation(rootId, EventType.SpaceParent, parentId);
       await storage.refreshRoomState(parentId, { signal });
       await storage.refreshRoomState(rootId, { signal });
       const childLink = readRelationEvents(client, parentId, EventType.SpaceChild, rootId);
       const parentLink = readRelationEvents(client, rootId, EventType.SpaceParent, parentId);
       if (
-        !childLink ||
-        !parentLink ||
+        childLink === null ||
+        parentLink === null ||
         childLink.some((event) => isActiveRelationEvent(event)) ||
         parentLink.some((event) => isActiveRelationEvent(event))
       ) {
@@ -478,58 +489,16 @@ async function unlinkExternalParents(
       }
     }
   } catch (error) {
-    if (!mutationAttempted && error instanceof StorageError && error.message === "operation cancelled") {
-      throw error;
-    }
-    // Unlinking is a two-room transaction. A failed second state update must
-    // not leave a still-live vault detached from its external parent. Best
-    // effort is insufficient here: surface a distinct failure if the repair
-    // itself cannot be completed so callers never mistake a partial mutation
-    // for a successful delete.
-    try {
-      await relinkExternalParents(storage, rootId, externalParents, new AbortController().signal);
-    } catch (cleanupError) {
-      throw new StorageError("delete graph unlink cleanup is incomplete", {
-        cause: new AggregateError(
-          [error, cleanupError],
-          "delete graph unlink and relink both failed",
-          { cause: error },
-        ),
-      });
+    if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
+    if (completedRelationEventIds.length > 0) {
+      throw new MutationPartialError(
+        "delete folder links",
+        completedRelationEventIds,
+        "some parent links were removed; retry deleting the same folder to finish unlinking",
+        { cause: error },
+      );
     }
     throw error;
-  }
-}
-
-async function relinkExternalParents(
-  storage: TeleCryptIOStorage,
-  rootId: string,
-  externalParents: string[],
-  signal?: AbortSignal,
-): Promise<void> {
-  const client = storage.getClient();
-  const via = client.getDomain();
-  if (!via) throw new StorageError("delete graph relink is unavailable");
-  for (const parentId of externalParents) {
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    await withRateLimitRetry(
-      () => withMatrixMutationAbort(() => client.sendStateEvent(parentId, EventType.SpaceChild, { via: [via] }, rootId), signal),
-      signal,
-    );
-    await withRateLimitRetry(
-      () => withMatrixMutationAbort(() => client.sendStateEvent(rootId, EventType.SpaceParent, { via: [via] }, parentId), signal),
-      signal,
-    );
-    await storage.refreshRoomState(parentId, { signal });
-    await storage.refreshRoomState(rootId, { signal });
-    const childLink = readRelationEvents(client, parentId, EventType.SpaceChild, rootId);
-    const parentLink = readRelationEvents(client, rootId, EventType.SpaceParent, parentId);
-    if (
-      !childLink?.some((event) => isActiveRelationEvent(event)) ||
-      !parentLink?.some((event) => isActiveRelationEvent(event))
-    ) {
-      throw new StorageError("delete graph relink could not be verified");
-    }
   }
 }
 
@@ -551,10 +520,21 @@ async function deleteRoomDeterministically(
   };
   try {
     const client = storage.getClient();
-    const tree = storage.getTree(roomId);
-    if (!tree) throw new StorageError("storage room is unavailable for deletion");
     const self = client.getUserId();
     if (!self) throw new StorageError("Matrix user identity is unavailable");
+    const ownMembership = await storage.getRoomMembership(roomId, undefined, { signal });
+    if (ownMembership === "leave" || ownMembership === "ban") {
+      try {
+        await withRateLimitRetry(() => withMatrixMutationAbort(() => client.forget(roomId), signal), signal);
+      } catch (error) {
+        if (!isGoneError(error)) throw error;
+      }
+      removeRoomFromLocalStore(client, roomId);
+      markTreeDeleted(client, roomId);
+      return;
+    }
+    const tree = storage.getTree(roomId);
+    if (!tree) throw new StorageError("storage room is unavailable for deletion");
     const members = await storage.listMembers(tree, { signal });
     if (members.some((member) => member.userId !== self && member.role === "owner" &&
         (member.membership === "join" || member.membership === "invite" || member.membership === "knock"))) {
@@ -590,7 +570,6 @@ async function deleteRoomDeterministically(
       }
     }
 
-    const ownMembership = await storage.getRoomMembership(roomId, undefined, { signal });
     if (ownMembership === "join" || ownMembership === "invite" || ownMembership === "knock") {
       try {
         await withRateLimitRetry(() => withMatrixMutationAbort(() => client.leave(roomId), signal), signal);
@@ -674,7 +653,13 @@ export async function listVaults(
 ): Promise<VaultInfo[]> {
   return withOperationDeadline(options, async (signal) => {
     const trees = await storage.listTrees(signal);
-    return trees.filter((t) => t.isTopLevel).map((t) => ({ id: t.id, name: t.room.name }));
+    const topLevel = trees.filter((tree) => tree.isTopLevel);
+    return Promise.all(
+      topLevel.map(async (tree) => ({
+        id: tree.id,
+        name: await storage.getTreeName(tree.id, { signal }),
+      })),
+    );
   });
 }
 
@@ -728,17 +713,11 @@ export async function joinVault(
 }
 
 function roomDisplayName(
-  storage: TeleCryptIOStorage,
-  roomId: string,
-  fallbackName?: string,
+  _storage: TeleCryptIOStorage,
+  _roomId: string,
+  _fallbackName?: string,
 ): string {
-  const client = storage.getClient();
-  const room = client.getRoom(roomId);
-  if (fallbackName?.trim()) return fallbackName.trim();
-  if (room?.name) return room.name;
-  const userId = client.getUserId();
-  if (room && userId) return room.getDefaultRoomName(userId);
-  return roomId;
+  return "Encrypted storage";
 }
 
 function hasActiveSpaceParent(room: {
@@ -1128,7 +1107,12 @@ export async function listFiles(
       const files = tree
         .listFiles()
         .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
-      return files.map((f) => ({ id: f.id, name: f.getName() }));
+      return await Promise.all(
+        files.map(async (file) => ({
+          id: file.id,
+          name: await storage.getFileName(tree.id, file.id, { signal, refreshState: false }),
+        })),
+      );
     } catch (error) {
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("list files failed", { cause: error });
@@ -1148,7 +1132,12 @@ export async function listSubfolders(
     ensureOperationActive(signal);
     const directories = activeTreeDirectories(storage.getClient(), tree)
       .filter((directory) => !isMarkedTreeDeleted(storage, directory.id));
-    return directories.map((d) => ({ id: d.id, name: d.room.name }));
+    return Promise.all(
+      directories.map(async (directory) => ({
+        id: directory.id,
+        name: await storage.getTreeName(directory.id, { signal }),
+      })),
+    );
   });
 }
 
@@ -1194,10 +1183,8 @@ async function renameTree(
         async () => {
           ensureOperationActive(signal);
           const current = storage.getTree(treeId);
-          if (current?.room.name === name) return current;
-          await storage.refreshRoomState(treeId, { signal });
-          const refreshed = storage.getTree(treeId);
-          return refreshed?.room.name === name ? refreshed : null;
+          if (!current) return null;
+          return (await storage.getTreeName(treeId, { signal })) === name ? current : null;
         },
         { timeoutMs: 15000, signal },
       );
@@ -1242,6 +1229,19 @@ async function deleteTree(
     const pending = withTreeMutation(client, async () => {
       if (isTreeDeleted(client, treeId)) return { id: treeId, deleted: true };
 
+      const ownMembership = await storage.getRoomMembership(treeId, undefined, {
+        signal: operation.signal,
+      });
+      if (ownMembership === "leave" || ownMembership === "ban") {
+        try {
+          await deleteRoomDeterministically(storage, treeId, operation.signal);
+        } catch (error) {
+          if (error instanceof StorageError) throw error;
+          throw new StorageError("delete cleanup failed", { cause: error });
+        }
+        return { id: treeId, deleted: true };
+      }
+
       const tree = await resolveTree(storage, treeId, operation.signal);
       let externalParents: string[];
       try {
@@ -1263,17 +1263,6 @@ async function deleteTree(
       try {
         await deleteRoomDeterministically(storage, tree.id, operation.signal);
       } catch (error) {
-        try {
-          await relinkExternalParents(storage, tree.id, externalParents, new AbortController().signal);
-        } catch (cleanupError) {
-          throw new StorageError("delete cleanup is incomplete", {
-            cause: new AggregateError(
-              [error, cleanupError],
-              "delete and external-parent relink both failed",
-              { cause: error },
-            ),
-          });
-        }
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
       }
@@ -1324,9 +1313,10 @@ export async function renameFile(
       // short time. Do not report success until this client has observed the new
       // name through its normal sync loop.
       await waitForCondition(
-        () => {
+        async () => {
           const current = tree.getFile(fileId);
-          return current?.getName() === name ? current : null;
+          if (!current) return null;
+          return (await storage.getFileName(treeId, fileId, { signal })) === name ? current : null;
         },
         { timeoutMs: 15000, signal },
       );
@@ -1396,63 +1386,99 @@ export async function deleteFile(
 ): Promise<DeleteResult> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(storage, tree, fileId, signal);
-    let fileInfo: Awaited<ReturnType<FileBranch["getFileInfo"]>>;
+    if (isMarkedFileDeleted(storage, tree.id, fileId)) return { id: fileId, deleted: true };
+    await storage.refreshRoomState(treeId, { signal });
+    const branch = tree.getFile(fileId);
+    if (!branch) throw new StorageError("file not found");
+
+    let originalEvent;
     try {
-      fileInfo = await branch.getFileInfo();
+      originalEvent = await storage.getOriginalFileEvent(tree.id, fileId, true);
     } catch (error) {
       throw new StorageError("could not resolve encrypted file safely", { cause: error });
     }
-    const mediaId = fileInfo?.info?.url;
+    if (originalEvent.isRedacted()) {
+      if (branch.isActive === false) {
+        markFileDeleted(storage.getClient(), tree.id, fileId);
+        return { id: fileId, deleted: true };
+      }
+      throw new StorageError("file listing is active but its attachment event is redacted");
+    }
+    const originalContent = originalEvent.getContent();
+    const fileDescriptor =
+      typeof originalContent === "object" &&
+      originalContent !== null &&
+      !Array.isArray(originalContent) &&
+      "file" in originalContent &&
+      typeof originalContent.file === "object" &&
+      originalContent.file !== null &&
+      !Array.isArray(originalContent.file)
+        ? originalContent.file as Record<string, unknown>
+        : undefined;
+    const mediaId = fileDescriptor?.url;
     if (typeof mediaId !== "string" || mediaId.length === 0) {
       throw new StorageError("encrypted file has no media identifier");
     }
     await deleteFileMedia(storage, [mediaId], signal);
 
-    const completedIds: string[] = [];
+    const completedIds: string[] = [mediaId];
     try {
       const client = storage.getClient();
-      // MSC3089 uses the file event ID as the branch state key, but the current
-      // listing is a separate state event. Redact that current listing after
-      // clearing the branch state; redacting only the file event leaves the
-      // listing visible and is especially harmful when a user is suspended.
-      const listingEventId = branch.indexEvent?.getId?.() ?? branch.id;
-      if (typeof listingEventId !== "string" || listingEventId.length === 0) {
+      const metadataEventId = await storage.getFileMetadataEventId(tree.id, fileId, { signal });
+      if (metadataEventId && metadataEventId !== fileId) {
+        const metadataEvent = await storage.getFileRenameMetadataEvent(
+          tree.id,
+          fileId,
+          metadataEventId,
+        );
+        if (!metadataEvent.isRedacted()) {
+          await withRateLimitRetry(
+            () => withMatrixMutationAbort(
+              () => client.redactEvent(tree.id, metadataEventId),
+              signal,
+              "delete file rename metadata",
+            ),
+            signal,
+          );
+        }
+        completedIds.push(metadataEventId);
+      }
+
+      const currentBranch = tree.getFile(fileId);
+      const indexEvent = currentBranch?.indexEvent;
+      const listingEventId = indexEvent?.getId();
+      if (!indexEvent || typeof listingEventId !== "string" || listingEventId.length === 0) {
         throw new StorageError("encrypted file has no listing event identifier");
       }
-      await withRateLimitRetry(
-        () =>
-          withMatrixMutationAbort(
-            () => client.sendStateEvent(tree.id, UNSTABLE_MSC3089_BRANCH.name, {}, branch.id),
-            signal,
-            "delete file state",
-          ),
-        signal,
-      );
-      await withRateLimitRetry(
-        () =>
-          withMatrixMutationAbort(
+      if (!indexEvent.isRedacted()) {
+        if (indexEvent.getSender() !== client.getUserId()) {
+          throw new StorageError("file listing was not authored by the owner");
+        }
+        await withRateLimitRetry(
+          () => withMatrixMutationAbort(
             () => client.redactEvent(tree.id, listingEventId),
             signal,
-            "delete file event",
+            "delete file listing",
           ),
-        signal,
-      );
-      completedIds.push(listingEventId);
-    } catch (error) {
-      if (error instanceof MutationOutcomeUnknownError) throw error;
-      if (signal.aborted) {
-        throw new MutationPartialError(
-          "delete file",
-          completedIds,
-          "media was deleted but Matrix event cleanup was cancelled",
-          { cause: error },
+          signal,
         );
       }
+      completedIds.push(listingEventId);
+
+      await withRateLimitRetry(
+        () => withMatrixMutationAbort(
+          () => client.redactEvent(tree.id, fileId),
+          signal,
+          "delete file attachment event",
+        ),
+        signal,
+      );
+      completedIds.push(fileId);
+    } catch (error) {
       throw new MutationPartialError(
         "delete file",
         completedIds,
-        "media was deleted but Matrix event cleanup stopped",
+        "file media and the listed completed steps were deleted; retry with the original file ID to finish Matrix cleanup",
         { cause: error },
       );
     }
@@ -1462,10 +1488,9 @@ export async function deleteFile(
           await storage.refreshRoomState(tree.id, { signal });
           ensureOperationActive(signal);
           const current = tree.getFile(fileId);
-          // Matrix SDK keeps a redacted branch event in room state as an
-          // inactive branch. Treat both an absent branch and that redacted
-          // inactive branch as confirmed deletion.
-          return !current || current.isActive === false ? true : null;
+          if (current && current.isActive !== false) return null;
+          const attachment = await storage.getOriginalFileEvent(tree.id, fileId, true);
+          return attachment.isRedacted() ? true : null;
         },
         { timeoutMs: 15000, signal },
       );
@@ -1474,7 +1499,7 @@ export async function deleteFile(
       const detail = "Matrix deletion completed but the file state could not be verified";
       throw new MutationPartialError("delete file", completedIds, detail, { cause: error });
     }
-    markFileDeleted(storage.getClient(), tree.id, branch.id);
+    markFileDeleted(storage.getClient(), tree.id, fileId);
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
   }, "mutation");
@@ -1550,7 +1575,7 @@ export async function downloadFile(
     return {
       bytes: new Uint8Array(result.data),
       mimetype: result.mimetype,
-      name: branch.getName(),
+      name: await storage.getFileName(tree.id, fileId, { signal }),
     };
   });
 }
@@ -1586,8 +1611,8 @@ export async function getFileDetails(
 ): Promise<FileDetails> {
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    const branch = await resolveFile(storage, tree, fileId, signal);
-    const name = branch.getName();
+    await resolveFile(storage, tree, fileId, signal);
+    const name = await storage.getFileName(tree.id, fileId, { signal });
     let mimetype: string | null = null;
     let size: number | null = null;
     let createdAt: string | null = null;
@@ -1595,7 +1620,7 @@ export async function getFileDetails(
 
     try {
       ensureOperationActive(signal);
-      const event = await branch.getFileEvent();
+      const event = await storage.getOriginalFileEvent(tree.id, fileId);
       const metadata = readFileEventMetadata(event.getContent());
       mimetype = metadata.mimetype;
       size = metadata.size;
@@ -1617,7 +1642,7 @@ async function getTreeDetails(
   treeId: string,
   signal?: AbortSignal,
 ): Promise<VaultDetails> {
-  const tree = await resolveTree(storage, treeId, signal);
+  await resolveTree(storage, treeId, signal);
   if (signal?.aborted) throw new StorageError("operation cancelled");
   const client = storage.getClient();
   const room = client.getRoom(treeId);
@@ -1635,7 +1660,7 @@ async function getTreeDetails(
   }
 
   return {
-    name: tree.room.name || roomDisplayName(storage, treeId),
+    name: await storage.getTreeName(treeId, { signal }),
     id: treeId,
     createdAt,
     memberCount,

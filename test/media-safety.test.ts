@@ -13,12 +13,55 @@ import { MAX_MEDIA_FILE_BYTES, validateCanonicalMatrixUserId } from "../src/core
 
 function branch() {
   return {
-    getFileInfo: vi.fn().mockResolvedValue({ info: { url: "mxc://example.test/media" } }),
-    getFileEvent: vi.fn().mockResolvedValue({
-      getContent: () => ({ info: {} }),
-      isDecryptionFailure: () => false,
-    }),
+    id: "$media-file",
+    roomId: "!media-room:example.test",
+    getName: () => "Encrypted file",
   } as never;
+}
+
+function encryptedFileEvent(
+  content: Record<string, unknown> = {
+    msgtype: "m.file",
+    body: "secret.txt",
+    file: { url: "mxc://example.test/media" },
+    info: { mimetype: "text/plain", size: 1 },
+  },
+  decryptionFailure = false,
+) {
+  return {
+    getId: () => "$media-file",
+    getRoomId: () => "!media-room:example.test",
+    getSender: () => "@owner:example.test",
+    getType: () => "m.room.message",
+    getWireType: () => "m.room.encrypted",
+    getContent: () => content,
+    getTs: () => 0,
+    isRedacted: () => false,
+    isDecryptionFailure: () => decryptionFailure,
+  };
+}
+
+function mediaClient(
+  event = encryptedFileEvent(),
+  extra: Record<string, unknown> = {},
+) {
+  const ownerEvent = { getSender: () => "@owner:example.test" };
+  return {
+    getUserId: () => "@owner:example.test",
+    getRoom: () => ({
+      currentState: {
+        getStateEvents: (type: string, stateKey: string) =>
+          type === "m.room.create" && stateKey === "" ? ownerEvent : null,
+      },
+    }),
+    fetchRoomEvent: vi.fn().mockResolvedValue({}),
+    getEventMapper: () => () => event,
+    decryptEventIfNeeded: vi.fn().mockResolvedValue(undefined),
+    getAccessToken: () => "access-token",
+    getHomeserverUrl: () => "https://matrix.example.test",
+    mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
+    ...extra,
+  };
 }
 
 afterEach(() => {
@@ -111,11 +154,7 @@ describe("media safety bounds", () => {
   });
 
   it("rejects a successful media response above the product size limit", async () => {
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
+    const client = mediaClient();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -131,89 +170,57 @@ describe("media safety bounds", () => {
     );
   });
 
-  it("preserves a non-placeholder file-info failure", async () => {
+  it("preserves a non-placeholder file-event fetch failure", async () => {
     const failure = new Error("media metadata transport unavailable");
-    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
-    file.getFileInfo = vi.fn().mockRejectedValue(failure);
+    const client = mediaClient(encryptedFileEvent(), {
+      fetchRoomEvent: vi.fn().mockRejectedValue(failure),
+    });
 
-    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBe(failure);
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toBe(failure);
   });
 
   it("translates the matrix-js-sdk decryption failure state", async () => {
-    const file = branch() as {
-      getFileInfo: ReturnType<typeof vi.fn>;
-      getFileEvent: ReturnType<typeof vi.fn>;
-    };
-    file.getFileInfo = vi.fn().mockRejectedValue(new TypeError("matrix file info failed"));
-    file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ msgtype: "m.bad.encrypted", body: "unable to decrypt" }),
-      isDecryptionFailure: () => true,
-    });
+    const client = mediaClient(encryptedFileEvent({}, true));
 
-    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBeInstanceOf(
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toBeInstanceOf(
       UndecryptableFileError,
     );
   });
 
-  it("preserves a malformed plaintext file event when decryption did not fail", async () => {
-    const failure = new TypeError("matrix file info failed");
-    const file = branch() as {
-      getFileInfo: ReturnType<typeof vi.fn>;
-      getFileEvent: ReturnType<typeof vi.fn>;
-    };
-    file.getFileInfo = vi.fn().mockRejectedValue(failure);
-    file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ msgtype: "m.file", body: "secret.txt" }),
-      isDecryptionFailure: () => false,
-    });
+  it("fails closed on a malformed plaintext file event when decryption succeeded", async () => {
+    const client = mediaClient(encryptedFileEvent({ msgtype: "m.file", body: "secret.txt" }));
 
-    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toBe(failure);
-  });
-
-  it("does not claim decryption failed merely because returned metadata is incomplete", async () => {
-    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
-    file.getFileInfo.mockResolvedValue({ info: {} });
-    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toThrow(
-      "file metadata is missing a media URL",
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
+      "encrypted file message is invalid or unavailable",
     );
   });
 
-  it("preserves file-info and placeholder inspection failures", async () => {
-    const infoFailure = new Error("matrix file info failed");
-    const eventFailure = new Error("matrix file event unavailable");
-    const file = branch() as {
-      getFileInfo: ReturnType<typeof vi.fn>;
-      getFileEvent: ReturnType<typeof vi.fn>;
-    };
-    file.getFileInfo = vi.fn().mockRejectedValue(infoFailure);
-    file.getFileEvent = vi.fn().mockRejectedValue(eventFailure);
-
-    await expect(new TeleCryptIOStorage({} as never).downloadFile(file as never)).rejects.toMatchObject({
-      message: "file metadata lookup and placeholder inspection both failed",
-      cause: infoFailure,
-      errors: [infoFailure, eventFailure],
-    });
+  it("does not claim decryption failed merely because returned metadata is incomplete", async () => {
+    const client = mediaClient(encryptedFileEvent({
+      msgtype: "m.file",
+      body: "secret.txt",
+      file: {},
+    }));
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
+      "encrypted file message is invalid or unavailable",
+    );
   });
 
   it("preserves caller cancellation while file info fails", async () => {
     const controller = new AbortController();
-    const file = branch() as { getFileInfo: ReturnType<typeof vi.fn> };
-    file.getFileInfo = vi.fn().mockImplementation(async () => {
-      controller.abort();
-      throw new Error("file info request cancelled");
+    const client = mediaClient(encryptedFileEvent(), {
+      decryptEventIfNeeded: vi.fn().mockImplementation(async () => {
+        controller.abort();
+      }),
     });
 
     await expect(
-      new TeleCryptIOStorage({} as never).downloadFile(file as never, controller.signal),
+      new TeleCryptIOStorage(client as never).downloadFile(branch(), controller.signal),
     ).rejects.toThrow("operation cancelled");
   });
 
   it("rejects a media response without a body", async () => {
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
+    const client = mediaClient();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -233,11 +240,7 @@ describe("media safety bounds", () => {
     });
     const fetchMock = vi.fn().mockResolvedValueOnce(first);
     vi.stubGlobal("fetch", fetchMock);
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
+    const client = mediaClient();
 
     await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
       "media download failed",
@@ -253,11 +256,7 @@ describe("media safety bounds", () => {
     try {
       const fetchMock = vi.fn(() => new Promise<Response>(() => undefined));
       vi.stubGlobal("fetch", fetchMock);
-      const client = {
-        getAccessToken: () => "access-token",
-        getHomeserverUrl: () => "https://matrix.example.test",
-        mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-      };
+      const client = mediaClient();
       const pending = new TeleCryptIOStorage(client as never).downloadFile(branch());
       await vi.advanceTimersByTimeAsync(0);
       const assertion = expect(pending).rejects.toThrow("media download timed out");
@@ -270,15 +269,12 @@ describe("media safety bounds", () => {
   });
 
   it("rejects malformed downloaded MIME metadata", async () => {
-    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
-    file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ info: { mimetype: "text/\nplain" } }),
-    });
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
+    const client = mediaClient(encryptedFileEvent({
+      msgtype: "m.file",
+      body: "secret.txt",
+      file: { url: "mxc://example.test/media" },
+      info: { mimetype: "text/\nplain" },
+    }));
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -289,21 +285,18 @@ describe("media safety bounds", () => {
       ),
     );
 
-    await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toThrow(
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
       "media metadata is invalid",
     );
   });
 
   it("rejects decrypted bytes whose event size metadata does not match", async () => {
-    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
-    file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ info: { mimetype: "text/plain", size: 2 } }),
-    });
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
+    const client = mediaClient(encryptedFileEvent({
+      msgtype: "m.file",
+      body: "secret.txt",
+      file: { url: "mxc://example.test/media" },
+      info: { mimetype: "text/plain", size: 2 },
+    }));
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -311,23 +304,20 @@ describe("media safety bounds", () => {
       ),
     );
 
-    await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toThrow(
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toThrow(
       "media metadata size does not match decrypted file",
     );
   });
 
   it("rejects an event size declaration above the media limit", async () => {
-    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
-    file.getFileEvent = vi.fn().mockResolvedValue({
-      getContent: () => ({ info: { mimetype: "text/plain", size: MAX_MEDIA_FILE_BYTES + 1 } }),
-    });
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: vi.fn(),
-    };
+    const client = mediaClient(encryptedFileEvent({
+      msgtype: "m.file",
+      body: "secret.txt",
+      file: { url: "mxc://example.test/media" },
+      info: { mimetype: "text/plain", size: MAX_MEDIA_FILE_BYTES + 1 },
+    }), { mxcUrlToHttp: vi.fn() });
 
-    await expect(new TeleCryptIOStorage(client as never).downloadFile(file as never)).rejects.toBeInstanceOf(
+    await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toBeInstanceOf(
       FileTooLargeError,
     );
     expect(client.mxcUrlToHttp).not.toHaveBeenCalled();
@@ -335,16 +325,16 @@ describe("media safety bounds", () => {
 
   it("checks cancellation after the file event metadata read", async () => {
     const controller = new AbortController();
-    const file = branch() as { getFileEvent: ReturnType<typeof vi.fn> };
-    file.getFileEvent = vi.fn().mockImplementation(async () => {
+    const client = mediaClient(encryptedFileEvent({
+      msgtype: "m.file",
+      body: "secret.txt",
+      file: { url: "mxc://example.test/media" },
+      info: {},
+    }), {
+      decryptEventIfNeeded: vi.fn().mockImplementation(async () => {
       controller.abort();
-      return { getContent: () => ({ info: {} }) };
+      }),
     });
-    const client = {
-      getAccessToken: () => "access-token",
-      getHomeserverUrl: () => "https://matrix.example.test",
-      mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
-    };
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -353,7 +343,7 @@ describe("media safety bounds", () => {
     );
 
     await expect(
-      new TeleCryptIOStorage(client as never).downloadFile(file as never, controller.signal),
+      new TeleCryptIOStorage(client as never).downloadFile(branch(), controller.signal),
     ).rejects.toThrow("operation cancelled");
   });
 

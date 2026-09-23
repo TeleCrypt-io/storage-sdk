@@ -78,12 +78,13 @@ describe("operation safety", () => {
     const failure = new Error("file state unavailable");
     const tree = makeTree("!file-state:example.test", "Files", true);
     tree.getFile = vi.fn(() => { throw failure; });
-    const storage = { getClient: () => ({}), getTree: () => tree } as unknown as TeleCryptIOStorage;
+    const storage = {
+      getClient: () => ({}),
+      getTree: () => tree,
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TeleCryptIOStorage;
 
-    await expect(deleteFile(storage, tree.id, "$file:example.test")).rejects.toMatchObject({
-      message: "file lookup failed",
-      cause: failure,
-    });
+    await expect(deleteFile(storage, tree.id, "$file:example.test")).rejects.toBe(failure);
     expect(tree.getFile).toHaveBeenCalledTimes(1);
   });
 
@@ -97,28 +98,70 @@ describe("operation safety", () => {
     expect(createSubtree).toHaveBeenCalledTimes(1);
   });
 
-  function deletionFixture({ id = "$v1", mediaId = "mxc://example.test/v1" } = {}) {
+  function deletionFixture({
+    id = "$v1",
+    mediaId = "mxc://example.test/v1",
+    renameId,
+    owner = "@owner:example.test",
+  }: { id?: string; mediaId?: string; renameId?: string; owner?: string } = {}) {
+    let listingRedacted = false;
+    let originalRedacted = false;
+    let renameRedacted = false;
+    const metadataId = renameId ?? id;
+    const listing = {
+      getId: () => "$listing",
+      getSender: () => owner,
+      getContent: () => listingRedacted ? {} : { active: true, metadata_event_id: metadataId },
+      isRedacted: () => listingRedacted,
+    };
+    const originalEvent = {
+      getContent: () => ({ msgtype: "m.file", body: "secret.txt", file: { url: mediaId } }),
+      isRedacted: () => originalRedacted,
+    };
+    const renameEvent = {
+      getContent: () => ({ msgtype: "io.telecrypt.storage.metadata", body: "renamed.txt", file_event_id: id }),
+      isRedacted: () => renameRedacted,
+    };
     const branch = {
       id,
-      isActive: true,
-      getFileInfo: vi.fn().mockResolvedValue({ info: { url: mediaId }, httpUrl: "https://matrix.invalid" }),
+      roomId: "!delete-file:example.test",
+      indexEvent: listing,
+      get isActive() { return !listingRedacted; },
+      getFileInfo: vi.fn(),
     };
     const tree = makeTree("!delete-file:example.test", "Delete file", true);
     tree.getFile = vi.fn().mockReturnValue(branch);
     const client = {
+      getUserId: () => owner,
       http: { authedRequest: vi.fn().mockResolvedValue({}) },
       sendStateEvent: vi.fn().mockResolvedValue({}),
-      redactEvent: vi.fn().mockResolvedValue({}),
+      redactEvent: vi.fn(async (_roomId: string, eventId: string) => {
+        if (eventId === "$listing") listingRedacted = true;
+        if (eventId === id) originalRedacted = true;
+        if (eventId === renameId) renameRedacted = true;
+        return {};
+      }),
     };
-    const refreshRoomState = vi.fn().mockImplementation(async () => {
-      tree.getFile = vi.fn().mockReturnValue(null);
-    });
+    const refreshRoomState = vi.fn().mockResolvedValue(undefined);
     const storage = {
       getTree: () => tree,
       getClient: () => client,
       refreshRoomState,
+      getOriginalFileEvent: vi.fn().mockImplementation(async () => originalEvent),
+      getFileMetadataEventId: vi.fn().mockImplementation(async () => listingRedacted ? null : metadataId),
+      getFileRenameMetadataEvent: vi.fn().mockImplementation(async () => renameEvent),
     } as unknown as TeleCryptIOStorage;
-    return { client, storage, tree, branch, refreshRoomState };
+    return {
+      client,
+      storage,
+      tree,
+      branch,
+      listing,
+      originalEvent,
+      renameEvent,
+      refreshRoomState,
+      markRedacted: () => { listingRedacted = true; originalRedacted = true; },
+    };
   }
 
   function deletionRefreshFixture(
@@ -145,6 +188,7 @@ describe("operation safety", () => {
       getClient: () => client,
       getTree: () => root,
       refreshRoomState,
+      getRoomMembership: vi.fn().mockResolvedValue("join"),
     } as unknown as TeleCryptIOStorage;
     return { client, root, roomIds, storage };
   }
@@ -153,14 +197,24 @@ describe("operation safety", () => {
     const root = makeTree("!nested-empty:example.test", "Empty", false);
     const externalId = "!external-parent:example.test";
     const active = { via: ["example.test"] };
-    const links = new Map<string, object>([["child", active], ["parent", active]]);
+    const links = new Map<string, { content: object; redacted: boolean; id: string }>([
+      ["child", { content: active, redacted: false, id: "$parent-child" }],
+      ["parent", { content: active, redacted: false, id: "$child-parent" }],
+    ]);
     const events: string[] = [];
     const rootRoom = {
       roomId: root.id,
       currentState: {
         getStateEvents: (eventType: string, stateKey?: string) => {
           if (eventType !== EventType.SpaceParent || (stateKey !== undefined && stateKey !== externalId)) return [];
-          return [{ getStateKey: () => externalId, getContent: () => links.get("parent") }];
+          const link = links.get("parent")!;
+          return [{
+            getStateKey: () => externalId,
+            getId: () => link.id,
+            getSender: () => "@owner:example.test",
+            getContent: () => link.content,
+            isRedacted: () => link.redacted,
+          }];
         },
       },
     };
@@ -169,7 +223,14 @@ describe("operation safety", () => {
       currentState: {
         getStateEvents: (eventType: string, stateKey?: string) => {
           if (eventType !== EventType.SpaceChild || (stateKey !== undefined && stateKey !== root.id)) return [];
-          return [{ getStateKey: () => root.id, getContent: () => links.get("child") }];
+          const link = links.get("child")!;
+          return [{
+            getStateKey: () => root.id,
+            getId: () => link.id,
+            getSender: () => "@owner:example.test",
+            getContent: () => link.content,
+            isRedacted: () => link.redacted,
+          }];
         },
       },
     };
@@ -178,9 +239,14 @@ describe("operation safety", () => {
       getUserId: () => "@owner:example.test",
       getDomain: () => "example.test",
       getRoom: (roomId: string) => rooms.get(roomId) ?? null,
-      sendStateEvent: vi.fn(async (roomId: string, eventType: string, content: object) => {
-        events.push(`state:${roomId}:${eventType}`);
-        links.set(eventType === EventType.SpaceChild ? "child" : "parent", content);
+      redactEvent: vi.fn(async (roomId: string, eventId: string) => {
+        events.push(`redact:${roomId}:${eventId}`);
+        for (const link of links.values()) {
+          if (link.id === eventId) {
+            link.content = {};
+            link.redacted = true;
+          }
+        }
       }),
       leave: vi.fn(async () => { events.push("leave"); }),
       forget: vi.fn(async () => { events.push("forget"); }),
@@ -198,8 +264,8 @@ describe("operation safety", () => {
   it("deletes the current media before redacting its Matrix event", async () => {
     const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
 
-    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v2")).resolves.toEqual({
-      id: "$v2",
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
       deleted: true,
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledWith(
@@ -214,16 +280,12 @@ describe("operation safety", () => {
       },
     );
     expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
-      fixture.client.sendStateEvent.mock.invocationCallOrder[0],
+      fixture.client.redactEvent.mock.invocationCallOrder[0],
     );
-    expect(fixture.client.sendStateEvent).toHaveBeenNthCalledWith(
-      1,
-      fixture.tree.id,
-      "org.matrix.msc3089.branch",
-      {},
-      "$v1",
-    );
-    expect(fixture.client.redactEvent).toHaveBeenCalledWith(fixture.tree.id, "$v1");
+    expect(fixture.client.redactEvent.mock.calls).toEqual([
+      [fixture.tree.id, "$listing"],
+      [fixture.tree.id, "$v1"],
+    ]);
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(true);
   });
 
@@ -297,16 +359,14 @@ describe("operation safety", () => {
       fixture.tree.id,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(fixture.refreshRoomState.mock.invocationCallOrder[0]).toBeGreaterThan(
+    expect(fixture.refreshRoomState.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
       Math.max(...fixture.client.redactEvent.mock.invocationCallOrder),
     );
   });
 
   it("accepts a redacted inactive branch as confirmed deletion", async () => {
     const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
-    fixture.refreshRoomState.mockImplementation(async () => {
-      fixture.tree.getFile = vi.fn().mockReturnValue({ id: "$v1", isActive: false });
-    });
+    fixture.markRedacted();
 
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
       id: "$v1",
@@ -321,11 +381,38 @@ describe("operation safety", () => {
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).rejects.toMatchObject({
       code: "MUTATION_PARTIAL",
       operation: "delete file",
-      completedIds: [],
+      completedIds: ["mxc://example.test/v1"],
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
+      deleted: true,
+    });
+    expect(fixture.client.redactEvent.mock.calls).toEqual([
+      [fixture.tree.id, "$listing"],
+      [fixture.tree.id, "$listing"],
+      [fixture.tree.id, "$v1"],
+    ]);
+  });
+
+  it("redacts the current encrypted rename event before the listing and attachment", async () => {
+    const fixture = deletionFixture({
+      id: "$v1",
+      mediaId: "mxc://example.test/v1",
+      renameId: "$rename",
+    });
+
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
+      id: "$v1",
+      deleted: true,
+    });
+    expect(fixture.client.redactEvent.mock.calls).toEqual([
+      [fixture.tree.id, "$rename"],
+      [fixture.tree.id, "$listing"],
+      [fixture.tree.id, "$v1"],
+    ]);
   });
 
   it("refreshes the parent room before listing subfolders", async () => {
@@ -351,6 +438,7 @@ describe("operation safety", () => {
       }),
       getTree: () => tree,
       refreshRoomState,
+      getTreeName: vi.fn().mockResolvedValue("Child"),
     } as unknown as TeleCryptIOStorage;
 
     await expect(listSubfolders(storage, tree.id)).resolves.toEqual([
@@ -515,7 +603,12 @@ describe("operation safety", () => {
     };
     const tree = makeTree("!details-failure:example.test", "Vault", true);
     tree.getFile = vi.fn().mockReturnValue(branch);
-    const storage = { getClient: () => ({}), getTree: () => tree } as unknown as TeleCryptIOStorage;
+    const storage = {
+      getClient: () => ({}),
+      getTree: () => tree,
+      getFileName: vi.fn().mockResolvedValue("details.txt"),
+      getOriginalFileEvent: vi.fn().mockRejectedValue(failure),
+    } as unknown as TeleCryptIOStorage;
 
     await expect(getFileDetails(storage, tree.id, branch.id)).rejects.toMatchObject({
       message: "get file details failed",
@@ -644,13 +737,18 @@ describe("operation safety", () => {
 
   it("refreshes the exact room before reporting a renamed folder", async () => {
     const tree = makeTree("!rename:example.test", "Child", false);
-    tree.setName = vi.fn().mockResolvedValue(undefined);
+    let name = "Child";
+    tree.setName = vi.fn(async (updated: string) => { name = updated; });
     const refreshRoomState = vi.fn(async () => {
-      (tree.room as { name: string }).name = "Renamed";
+      return;
     });
     const storage = {
       getTree: () => tree,
       refreshRoomState,
+      getTreeName: vi.fn(async (roomId: string, options: { signal?: AbortSignal }) => {
+        await refreshRoomState(roomId, options);
+        return name;
+      }),
     } as unknown as TeleCryptIOStorage;
 
     await expect(renameFolder(storage, tree.id, "Renamed")).resolves.toEqual({
@@ -671,6 +769,10 @@ describe("operation safety", () => {
     const storage = {
       getTree: () => tree,
       refreshRoomState,
+      getTreeName: vi.fn(async (roomId: string, options: { signal?: AbortSignal }) => {
+        await refreshRoomState(roomId, options);
+        return "Renamed";
+      }),
     } as unknown as TeleCryptIOStorage;
 
     await expect(renameFolder(storage, tree.id, "Renamed")).rejects.toMatchObject({
@@ -1189,136 +1291,94 @@ describe("operation safety", () => {
     expect(forget).not.toHaveBeenCalled();
   });
 
-  it("unlinks one parent before deleting an empty room", async () => {
+  it("redacts owner-authored parent links before deleting an empty room", async () => {
     const fixture = linkedEmptyFolderFixture();
 
     await expect(deleteFolder(fixture.storage, fixture.root.id)).resolves.toEqual({
       id: fixture.root.id,
       deleted: true,
     });
-    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(2);
     expect(fixture.events).toEqual([
-      `state:${fixture.externalId}:${EventType.SpaceChild}`,
-      `state:${fixture.root.id}:${EventType.SpaceParent}`,
+      `redact:${fixture.externalId}:$parent-child`,
+      `redact:${fixture.root.id}:$child-parent`,
       "leave",
       "forget",
     ]);
-    expect(fixture.links.get("child")).toEqual({});
-    expect(fixture.links.get("parent")).toEqual({});
+    expect(fixture.links.get("child")?.content).toEqual({});
+    expect(fixture.links.get("parent")?.content).toEqual({});
   });
 
-  it("relinks its parent if deleting the unlinked room fails", async () => {
+  it("keeps completed relation redactions and resumes room deletion on retry", async () => {
     const fixture = linkedEmptyFolderFixture();
-    fixture.client.forget.mockRejectedValue(new Error("forget failed"));
+    fixture.client.forget.mockRejectedValueOnce(new Error("forget failed"));
 
     await expect(deleteFolder(fixture.storage, fixture.root.id)).rejects.toMatchObject({
       code: "MUTATION_PARTIAL",
       operation: "delete",
       completedIds: [fixture.root.id],
     });
-    expect(fixture.links.get("child")).toEqual({ via: ["example.test"] });
-    expect(fixture.links.get("parent")).toEqual({ via: ["example.test"] });
-    expect(fixture.client.sendStateEvent).toHaveBeenCalledTimes(4);
+    expect(fixture.links.get("child")?.content).toEqual({});
+    expect(fixture.links.get("parent")?.content).toEqual({});
+    expect(fixture.events.slice(0, 2)).toEqual([
+      `redact:${fixture.externalId}:$parent-child`,
+      `redact:${fixture.root.id}:$child-parent`,
+    ]);
+
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).resolves.toEqual({
+      id: fixture.root.id,
+      deleted: true,
+    });
+    expect(fixture.events.filter((event) => event.startsWith("redact:"))).toHaveLength(2);
   });
 
-  it("rejects a mismatched parent relation before changing either side", async () => {
+  it("continues a folder unlink when one relation was already redacted", async () => {
     const fixture = linkedEmptyFolderFixture();
-    fixture.links.set("child", {});
+    const childRelation = fixture.links.get("child")!;
+    childRelation.content = {};
+    childRelation.redacted = true;
 
-    await expect(deleteFolder(fixture.storage, fixture.root.id)).rejects.toThrow(
-      "storage parent relation is inconsistent",
-    );
-    expect(fixture.links.get("child")).toEqual({});
-    expect(fixture.links.get("parent")).toEqual({ via: ["example.test"] });
-    expect(fixture.client.sendStateEvent).not.toHaveBeenCalled();
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).resolves.toEqual({
+      id: fixture.root.id,
+      deleted: true,
+    });
+    expect(fixture.events).toEqual([
+      `redact:${fixture.root.id}:$child-parent`,
+      "leave",
+      "forget",
+    ]);
+  });
+
+  it("reports a partial unlink and retries the remaining owner-authored relation", async () => {
+    const fixture = linkedEmptyFolderFixture();
+    let failChildRelation = true;
+    const redactEvent = fixture.client.redactEvent.getMockImplementation()!;
+    fixture.client.redactEvent.mockImplementation(async (roomId: string, eventId: string) => {
+      if (eventId === "$child-parent" && failChildRelation) {
+        failChildRelation = false;
+        throw new Error("child link redaction failed");
+      }
+      return redactEvent(roomId, eventId);
+    });
+
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "delete folder links",
+      completedIds: ["$parent-child"],
+      message: expect.stringContaining("retry deleting the same folder"),
+    });
+    expect(fixture.links.get("child")?.content).toEqual({});
+    expect(fixture.links.get("parent")?.content).toEqual({ via: ["example.test"] });
     expect(fixture.client.leave).not.toHaveBeenCalled();
     expect(fixture.client.forget).not.toHaveBeenCalled();
-  });
 
-  it("rolls back a partial external unlink before reporting failure", async () => {
-    const root = makeTree("!partial-root:example.test", "Root", false);
-    const externalId = "!partial-parent:example.test";
-    const active = { via: ["example.test"] };
-    const links = new Map([
-      ["child", active],
-      ["parent", active],
+    await expect(deleteFolder(fixture.storage, fixture.root.id)).resolves.toEqual({
+      id: fixture.root.id,
+      deleted: true,
+    });
+    expect(fixture.events.filter((event) => event.startsWith("redact:"))).toEqual([
+      `redact:${fixture.externalId}:$parent-child`,
+      `redact:${fixture.root.id}:$child-parent`,
     ]);
-    const rootRoom = {
-      roomId: root.id,
-      getMembers: () => [],
-      getMyMembership: () => "join",
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: (eventType: string, stateKey?: string) => {
-          if (eventType === EventType.SpaceParent && (stateKey === externalId || stateKey === undefined)) {
-            return { getStateKey: () => externalId, getContent: () => links.get("parent") };
-          }
-          return [];
-        },
-      },
-    };
-    const externalRoom = {
-      roomId: externalId,
-      getMembers: () => [],
-      getMyMembership: () => "join",
-      currentState: {
-        getStateEvents: (eventType: string, stateKey?: string) => {
-          if (eventType === EventType.SpaceChild && (stateKey === root.id || stateKey === undefined)) {
-            return { getStateKey: () => root.id, getContent: () => links.get("child") };
-          }
-          return [];
-        },
-      },
-    };
-    const rooms = new Map([[root.id, rootRoom], [externalId, externalRoom]]);
-    const client = {
-      getUserId: () => "@owner:example.test",
-      getDomain: () => "example.test",
-      getRoom: (roomId: string) => rooms.get(roomId) ?? null,
-      getRooms: () => [...rooms.values()],
-      unstableGetFileTreeSpace: (roomId: string) => (roomId === root.id ? root : null),
-      sendStateEvent: vi.fn().mockImplementation(async (_roomId: string, eventType: string, content: object) => {
-        if (eventType === EventType.SpaceChild && Object.keys(content).length === 0) {
-          links.set("child", {});
-          return;
-        }
-        if (eventType === EventType.SpaceParent && Object.keys(content).length === 0) {
-          throw new Error("parent unlink failed");
-        }
-        if (eventType === EventType.SpaceChild) {
-          links.set("child", active);
-          return;
-        }
-        links.set("parent", active);
-      }),
-      leave: vi.fn(),
-      forget: vi.fn(),
-      http: {
-        authedRequest: vi.fn(async (_method: string, path: string) =>
-          path.endsWith("/joined_rooms")
-            ? { joined_rooms: [root.id] }
-            : path.endsWith("/members")
-            ? { chunk: [] }
-            : path.includes("m.room.power_levels")
-              ? {}
-              : [],
-        ),
-      },
-    };
-
-    let caught: unknown;
-    try {
-      await deleteVault(new TeleCryptIOStorage(client as never), root.id);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toMatchObject({ message: "delete failed", cause: expect.any(Error) });
-    expect((caught as Error).cause).toBeInstanceOf(Error);
-    expect(client.leave).not.toHaveBeenCalled();
-    expect(client.forget).not.toHaveBeenCalled();
-    expect(links.get("child")).toEqual(active);
-    expect(links.get("parent")).toEqual(active);
-    expect(client.sendStateEvent).toHaveBeenCalledTimes(4);
   });
 
   it("handles a typed kick race only when the member is no longer active", async () => {

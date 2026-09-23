@@ -296,6 +296,12 @@ describe("core operations", () => {
         );
         expect(downloaded.bytes).toEqual(bytes);
         expect(downloaded.mimetype).toBe("text/plain");
+        expect((await core.listVaults(storageB)).find((item) => item.id === vault.id)?.name).toBe(
+          "CoreRecoveryTest",
+        );
+        expect((await core.listFiles(storageB, vault.id)).find((item) => item.id === uploaded.id)?.name).toBe(
+          "secret.txt",
+        );
       } finally {
         stopTestClient(storageB.getClient());
       }

@@ -34,7 +34,7 @@ describe("pending invites", () => {
     } as unknown as TeleCryptIOStorage;
 
     await expect(listPendingInvites(storage)).resolves.toEqual([
-      { id: "!top:example.test", name: "Top-level vault" },
+      { id: "!top:example.test", name: "Encrypted storage" },
     ]);
   });
 
@@ -101,7 +101,7 @@ describe("pending invites", () => {
     } as unknown as TeleCryptIOStorage;
 
     await expect(listPendingInvites(storage)).resolves.toEqual([
-      { id: reviewed.roomId, name: reviewed.roomId },
+      { id: reviewed.roomId, name: "Encrypted storage" },
     ]);
   });
 

@@ -19,6 +19,21 @@ async function waitForTree(
   );
 }
 
+async function waitForTreeName(
+  storage: TeleCryptIOStorage,
+  treeId: string,
+  expected: string,
+  label = "encrypted tree name visible",
+): Promise<void> {
+  await waitFor(async () => {
+    try {
+      return (await storage.getTreeName(treeId)) === expected;
+    } catch {
+      return false;
+    }
+  }, { label, timeoutMs: 15000 });
+}
+
 async function waitForFiles(
   tree: { listFiles: () => { length: number } },
   label = "files appear",
@@ -43,7 +58,7 @@ describe("sharing", () => {
       const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("Shared");
-      await waitFor(() => tree.room.name === "Shared");
+      await waitForTreeName(aliceStore, tree.id, "Shared");
 
       const data = new TextEncoder().encode("shared content").buffer as ArrayBuffer;
       const eventId = await aliceStore.uploadFile(tree, "shared.txt", data, "text/plain");
@@ -71,7 +86,7 @@ describe("sharing", () => {
       const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("DecryptTest");
-      await waitFor(() => tree.room.name === "DecryptTest");
+      await waitForTreeName(aliceStore, tree.id, "DecryptTest");
 
       // Alice invites Bob FIRST, then uploads so Bob gets the megolm key
       await tree.invite(bobUser.userId);
@@ -116,7 +131,7 @@ describe("sharing", () => {
       const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("EditTest");
-      await waitFor(() => tree.room.name === "EditTest");
+      await waitForTreeName(aliceStore, tree.id, "EditTest");
 
       await tree.invite(bobUser.userId);
       await bob.joinRoom(tree.id);
@@ -141,7 +156,7 @@ describe("sharing", () => {
       const charlieStore = new TeleCryptIOStorage(charlie);
 
       const tree = await aliceStore.createTree("Private");
-      await waitFor(() => tree.room.name === "Private");
+      await waitForTreeName(aliceStore, tree.id, "Private");
 
       const charlieTrees = await charlieStore.listTrees();
       expect(charlieTrees.some((t) => t.id === tree.id)).toBe(false);
@@ -160,7 +175,7 @@ describe("sharing", () => {
       const aliceStore = new TeleCryptIOStorage(alice);
 
       const tree = await aliceStore.createTree("PermTest");
-      await waitFor(() => tree.room.name === "PermTest");
+      await waitForTreeName(aliceStore, tree.id, "PermTest");
 
       await tree.invite(bobUser.userId);
       await bob.joinRoom(tree.id);
@@ -186,7 +201,7 @@ describe("sharing", () => {
       const bobStore = new TeleCryptIOStorage(bob);
 
       const parent = await aliceStore.createTree("Parent");
-      await waitFor(() => parent.room.name === "Parent");
+      await waitForTreeName(aliceStore, parent.id, "Parent");
 
       const child = await parent.createDirectory("Child");
       await waitFor(
@@ -224,7 +239,7 @@ describe("sharing", () => {
       const bobStore = new TeleCryptIOStorage(bob);
 
       const tree = await aliceStore.createTree("Revocation");
-      await waitFor(() => tree.room.name === "Revocation");
+      await waitForTreeName(aliceStore, tree.id, "Revocation");
 
       // Alice invites Bob first, then uploads a file Bob can read
       await tree.invite(bobUser.userId);
@@ -361,7 +376,7 @@ describe("sharing", () => {
       const aliceStore = new TeleCryptIOStorage(alice);
 
       const tree = await aliceStore.createTree("Members");
-      await waitFor(() => tree.room.name === "Members");
+      await waitForTreeName(aliceStore, tree.id, "Members");
 
       // Alice (the creator/owner) should already be reported even before
       // anyone else is invited.

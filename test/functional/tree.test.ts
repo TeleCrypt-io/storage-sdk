@@ -8,11 +8,18 @@ import { waitFor } from "../harness/waitFor";
 import { TeleCryptIOStorage, MSC3089TreeSpace } from "../../src/TeleCryptIOStorage";
 
 async function waitForName(
+  storage: TeleCryptIOStorage,
   tree: MSC3089TreeSpace,
   expected: string,
   label = "name propagates",
 ): Promise<void> {
-  await waitFor(() => tree.room.name === expected, { label, timeoutMs: 10000 });
+  await waitFor(async () => {
+    try {
+      return (await storage.getTreeName(tree.id)) === expected;
+    } catch {
+      return false;
+    }
+  }, { label, timeoutMs: 10000 });
 }
 
 describe("tree operations", () => {
@@ -24,7 +31,7 @@ describe("tree operations", () => {
       const tree = await storage.createTree("My Vault");
       expect(tree.id).toBeTruthy();
       expect(typeof tree.id).toBe("string");
-      await waitForName(tree, "My Vault", "initial name");
+      await waitForName(storage, tree, "My Vault", "initial name");
       expect(tree.isTopLevel).toBe(true);
     } finally {
       stopTestClient(client);
@@ -37,7 +44,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       const sub = await root.createDirectory("Sub");
 
@@ -60,7 +67,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       // createSubtree must return a usable tree and leave the exact
       // space.child link visible after its authoritative state refresh.
@@ -90,7 +97,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const l1 = await storage.createTree("L1");
-      await waitForName(l1, "L1");
+      await waitForName(storage, l1, "L1");
 
       const l2 = await l1.createDirectory("L2");
       await waitFor(() => l2.isTopLevel === false, {
@@ -122,11 +129,11 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const tree = await storage.createTree("Original");
-      await waitForName(tree, "Original");
+      await waitForName(storage, tree, "Original");
 
       await tree.setName("Renamed");
-      await waitForName(tree, "Renamed", "rename propagates");
-      expect(tree.room.name).toBe("Renamed");
+      await waitForName(storage, tree, "Renamed", "rename propagates");
+      expect(await storage.getTreeName(tree.id)).toBe("Renamed");
     } finally {
       stopTestClient(client);
     }
@@ -138,7 +145,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       const sub = await root.createDirectory("Sub");
       await waitFor(() => sub.isTopLevel === false, {
@@ -169,7 +176,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       const sub = await root.createDirectory("Sub");
       await waitFor(() => sub.isTopLevel === false, {
@@ -193,7 +200,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       const a = await root.createDirectory("A");
       const b = await root.createDirectory("B");
@@ -226,7 +233,7 @@ describe("tree operations", () => {
     try {
       const storage = new TeleCryptIOStorage(client);
       const root = await storage.createTree("Root");
-      await waitForName(root, "Root");
+      await waitForName(storage, root, "Root");
 
       await expect(root.createDirectory("")).rejects.toThrow("invalid name");
     } finally {

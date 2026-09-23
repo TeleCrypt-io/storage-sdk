@@ -41,6 +41,14 @@ function makeFixture(
 
   const branch = {
     id: FILE_ID,
+    roomId: ROOM_ID,
+    indexEvent: {
+      getId: () => "$listing",
+      getSender: () => "@cross-client:example.test",
+      getContent: () => localBranchContent,
+      isRedacted: () => Object.keys(localBranchContent).length === 0,
+    },
+    get isActive() { return Object.keys(localBranchContent).length > 0; },
     getName: () => "cross-client.txt",
     setName: vi.fn(),
     delete: vi.fn(),
@@ -96,8 +104,9 @@ function makeFixture(
         shared.branchContent = { ...content };
       }
     }),
-    redactEvent: vi.fn(async () => {
-      shared.redacted = true;
+    redactEvent: vi.fn(async (_roomId: string, eventId: string) => {
+      if (eventId === "$listing") shared.branchContent = {};
+      if (eventId === FILE_ID) shared.redacted = true;
     }),
     leave: vi.fn().mockResolvedValue(undefined),
     forget: vi.fn().mockResolvedValue(undefined),
@@ -107,6 +116,12 @@ function makeFixture(
   const storage = {
     getClient: () => client,
     getTree: () => tree,
+    getOriginalFileEvent: vi.fn(async () => ({
+      getContent: () => ({ msgtype: "m.file", body: "cross-client.txt", file: { url: "mxc://example.test/cross-client-media" } }),
+      isRedacted: () => shared.redacted,
+    })),
+    getFileMetadataEventId: vi.fn(async () => shared.branchContent.metadata_event_id ?? null),
+    getFileRenameMetadataEvent: vi.fn(),
     listJoinedRoomIds: vi.fn().mockResolvedValue([ROOM_ID]),
     refreshRoomState: vi.fn(async () => {
       localBranchContent = { ...shared.branchContent };
@@ -124,7 +139,7 @@ describe("cross-client deletion reconciliation", () => {
   it("allows client A to delete a vault after client B leaves an authoritative tombstone", async () => {
     const shared: SharedState = {
       branchPresent: true,
-      branchContent: { active: true, name: "cross-client.txt" },
+      branchContent: { active: true, metadata_event_id: FILE_ID },
       redacted: false,
     };
     const fixtureB = makeFixture(shared.branchContent, {}, shared);
@@ -148,8 +163,8 @@ describe("cross-client deletion reconciliation", () => {
   });
 
   it.each([
-    ["active", { active: true, name: "cross-client.txt" }, {}],
-    ["malformed inactive", { active: false, name: "cross-client.txt" }, {}],
+    ["active", { active: true, metadata_event_id: FILE_ID }, {}],
+    ["malformed inactive", { active: false, metadata_event_id: FILE_ID }, {}],
     ["unverified", {}, { branchPresent: false }],
   ])("fails closed for a %s branch", async (_label, content, options) => {
     const fixture = makeFixture(content, options);

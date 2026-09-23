@@ -28,6 +28,16 @@ async function createStorage(user: {
   });
 }
 
+async function waitForTreeName(storage: TeleCryptIOStorage, treeId: string, expected: string): Promise<void> {
+  await waitFor(async () => {
+    try {
+      return (await storage.getTreeName(treeId)) === expected;
+    } catch {
+      return false;
+    }
+  }, { label: "encrypted tree name visible", timeoutMs: 15000 });
+}
+
 /** Polls the raw server-side key backup endpoint until it reports at least
  * one stored key. This is the authoritative proof that the background backup
  * engine has actually finished uploading — `getActiveSessionBackupVersion()`
@@ -95,9 +105,7 @@ describe("key management", () => {
     const storageA = await createStorage(userA);
     try {
       const tree = await storageA.createTree("RecoveryTest");
-      await waitFor(() => tree.room.name === "RecoveryTest", {
-        label: "tree name visible",
-      });
+      await waitForTreeName(storageA, tree.id, "RecoveryTest");
 
       const plaintext = new TextEncoder().encode(
         "lost laptop recovery test content",
@@ -190,9 +198,7 @@ describe("key management", () => {
     const storageA = await createStorage(userA);
     try {
       const tree = await storageA.createTree("BadRecoveryTest");
-      await waitFor(() => tree.room.name === "BadRecoveryTest", {
-        label: "tree name visible",
-      });
+      await waitForTreeName(storageA, tree.id, "BadRecoveryTest");
 
       const plaintext = new TextEncoder().encode("must stay unrecoverable")
         .buffer as ArrayBuffer;
