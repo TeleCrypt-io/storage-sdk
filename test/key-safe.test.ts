@@ -92,11 +92,13 @@ function fixture() {
     }) },
   };
   const checkpoint = vi.fn(async () => undefined);
+  const startSync = vi.fn(async () => undefined);
   const prefix = `telecrypt-io-storage::key-safe-test::${cryptoRandomId()}`;
   const make = () => new DecryptionKeySafe(client as never, async (_key, fn) => fn(), {
     cryptoDatabasePrefix: prefix, onKeySafeStateChanged: checkpoint,
-  });
+  }, startSync);
   return { safe: make(), make, crypto, client, checkpoint, encoded, serverAccountData, cachedAccountData,
+    startSync,
     newLogin: () => { signingCached = false; locallySigned = false; active = null; cachedAccountData.clear(); },
     removeBackup: () => { backup = null; active = null; },
   };
@@ -159,7 +161,15 @@ describe("mandatory Decryption Key Safe", () => {
     f.newLogin();
     const fresh = f.make();
     expect(await fresh.getStatus()).toEqual({ state: "restore-required" });
+    f.crypto.userHasCrossSigningKeys.mockClear();
+    f.crypto.bootstrapCrossSigning.mockClear();
+    f.crypto.restoreKeyBackup.mockClear();
+    f.startSync.mockClear();
     expect(await fresh.restore(f.encoded)).toEqual({ imported: 0, total: 0, state: "ready" });
+    expect(f.crypto.userHasCrossSigningKeys).toHaveBeenCalledWith("@owner:test", true);
+    expect(f.crypto.userHasCrossSigningKeys.mock.invocationCallOrder[0]).toBeLessThan(f.crypto.bootstrapCrossSigning.mock.invocationCallOrder[0]);
+    expect(f.startSync).toHaveBeenCalledOnce();
+    expect(f.crypto.restoreKeyBackup.mock.invocationCallOrder[0]).toBeLessThan(f.startSync.mock.invocationCallOrder[0]);
     expect(await fresh.getStatus()).toEqual({ state: "ready" });
     expect(f.crypto.bootstrapSecretStorage.mock.calls.filter(([opts]) => opts.setupNewKeyBackup)).toHaveLength(1);
   });

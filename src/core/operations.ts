@@ -692,9 +692,29 @@ export async function joinVault(
       }
     }
     if (membership === "join") return { vaultId, joined: true };
+    const client = storage.getClient();
+    const userId = client.getUserId();
+    if (userId && client.getRoom(vaultId)?.getMember(userId)?.membership !== "invite") {
+      // MatrixClient.joinRoom reads the inviter from its local invite-room
+      // state. A to-device history bundle can arrive first in the initial
+      // sync, before that stripped invite state has reached the room store;
+      // joining without it skips Matrix JS SDK's pending-bundle acceptance.
+      try {
+        await waitForCondition(
+          () => client.getRoom(vaultId)?.getMember(userId)?.membership === "invite" ? true : null,
+          { timeoutMs: 15000, signal },
+        );
+      } catch (err) {
+        if (signal.aborted) throw new StorageError("operation cancelled");
+        if (err instanceof ConditionTimeoutError) {
+          throw new StorageError("the room invitation has not reached this login yet; retry joining", { cause: err });
+        }
+        throw err;
+      }
+    }
     try {
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => storage.getClient().joinRoom(vaultId), signal),
+        () => withMatrixMutationAbort(() => client.joinRoom(vaultId), signal),
         signal,
       );
     } catch (err) {

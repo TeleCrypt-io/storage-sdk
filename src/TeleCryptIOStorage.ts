@@ -135,6 +135,8 @@ export interface CreateTeleCryptIOStorageOptions {
   onKeySafeStateChanged?: () => Promise<void>;
   /** initialSyncLimit passed to startClient(); default 10. */
   initialSyncLimit?: number;
+  /** Start Matrix sync after crypto initializes; default true. */
+  startClient?: boolean;
   /** How long to wait for the first sync before giving up; default 15000ms. */
   syncTimeoutMs?: number;
   /** How long to wait for rust-crypto WASM + IndexedDB init; default 60000ms. */
@@ -180,6 +182,7 @@ export interface CreateFromOidcOptions {
   /** Persist local Key Safe state before server-side setup continues (CLI snapshots). */
   onKeySafeStateChanged?: () => Promise<void>;
   initialSyncLimit?: number;
+  startClient?: boolean;
   syncTimeoutMs?: number;
   initTimeoutMs?: number;
   onProgress?: (message: string) => void;
@@ -701,9 +704,20 @@ export class TeleCryptIOStorage {
   private readonly fileNames = new Map<string, string>();
 
   readonly keySafe: DecryptionKeySafe;
+  private syncStarted = false;
+  private syncInFlight: Promise<void> | undefined;
 
-  constructor(private client: MatrixClient, options: KeySafePersistenceOptions = {}) {
-    this.keySafe = new DecryptionKeySafe(client, (key, operation, signal) => this.withSecretStorageKey(key, operation, signal), options);
+  constructor(
+    private client: MatrixClient,
+    options: KeySafePersistenceOptions = {},
+    private readonly syncOptions: Pick<CreateTeleCryptIOStorageOptions, "initialSyncLimit" | "syncTimeoutMs" | "onProgress"> = {},
+  ) {
+    this.keySafe = new DecryptionKeySafe(
+      client,
+      (key, operation, signal) => this.withSecretStorageKey(key, operation, signal),
+      options,
+      (signal) => this.startSync(signal),
+    );
     // Advanced callers may construct a MatrixClient themselves. The SDK does
     // not mutate matrix-js-sdk internals: configure that client with the
     // supported createClient({ fetchFn, localTimeoutMs }) options, or use
@@ -713,6 +727,42 @@ export class TeleCryptIOStorage {
   /** The underlying matrix-js-sdk client (e.g. to stop it, or for advanced/interop use). */
   getClient(): MatrixClient {
     return this.client;
+  }
+
+  /** Start Matrix room sync after crypto setup, for example after the current
+   * login has checked or restored its Decryption Key Safe. */
+  async startSync(signal?: AbortSignal): Promise<void> {
+    if (this.syncStarted) return;
+    if (this.syncInFlight) return this.syncInFlight;
+    const start = (async () => {
+      try {
+        TeleCryptIOStorage.throwIfAborted(signal);
+        const timeoutMs = this.syncOptions.syncTimeoutMs ?? 15000;
+        this.syncOptions.onProgress?.("Starting Matrix client…");
+        await TeleCryptIOStorage.withTimeout(
+          this.client.startClient({ initialSyncLimit: this.syncOptions.initialSyncLimit ?? 10 }),
+          timeoutMs,
+          "client start",
+          signal,
+        );
+        this.syncOptions.onProgress?.("Waiting for first sync with homeserver…");
+        await TeleCryptIOStorage.waitForFirstSync(this.client, timeoutMs, signal);
+        TeleCryptIOStorage.throwIfAborted(signal);
+        this.syncStarted = true;
+        this.syncOptions.onProgress?.("Sync complete.");
+      } catch (error) {
+        try {
+          this.client.stopClient();
+        } catch (stopError) {
+          throw new AggregateError([error, stopError], "Matrix sync startup and cleanup failed");
+        }
+        throw error;
+      } finally {
+        this.syncInFlight = undefined;
+      }
+    })();
+    this.syncInFlight = start;
+    return start;
   }
 
   private fileNameKey(treeId: string, fileId: string): string {
@@ -1126,7 +1176,7 @@ export class TeleCryptIOStorage {
   }
 
   /** Shared post-construction bootstrap for `create()`/`createFromOidc()`:
-   * persistent crypto store, first sync, wrap in a `TeleCryptIOStorage`. */
+   * persistent crypto store, optional first sync, wrap in a `TeleCryptIOStorage`. */
   private static async bootstrap(
     client: MatrixClient,
     opts: Pick<
@@ -1137,6 +1187,7 @@ export class TeleCryptIOStorage {
       | "cryptoDatabasePrefix"
       | "onKeySafeStateChanged"
       | "initialSyncLimit"
+      | "startClient"
       | "syncTimeoutMs"
       | "initTimeoutMs"
       | "onProgress"
@@ -1145,6 +1196,7 @@ export class TeleCryptIOStorage {
   ): Promise<TeleCryptIOStorage> {
     const progress = opts.onProgress ?? (() => {});
     const persistent = opts.persistentCryptoStore ?? true;
+    let storage: TeleCryptIOStorage | undefined;
     try {
       progress("Loading encryption engine (WASM)…");
       await TeleCryptIOStorage.withTimeout(
@@ -1159,32 +1211,37 @@ export class TeleCryptIOStorage {
       );
       progress("Encryption ready — opening secure store…");
 
-      progress("Starting Matrix client…");
-      // Mark this before awaiting: startClient can start its sync loop and then
-      // reject while reporting an error from the initial request.
-      await TeleCryptIOStorage.withTimeout(
-        client.startClient({ initialSyncLimit: opts.initialSyncLimit ?? 10 }),
-        opts.syncTimeoutMs ?? 15000,
-        "client start",
-        opts.signal,
-      );
-
-      progress("Waiting for first sync with homeserver…");
-      await TeleCryptIOStorage.waitForFirstSync(client, opts.syncTimeoutMs ?? 15000, opts.signal);
-      TeleCryptIOStorage.throwIfAborted(opts.signal);
-      progress("Sync complete.");
-
-      return new TeleCryptIOStorage(client, opts);
+      storage = new TeleCryptIOStorage(client, opts, opts);
+      if (opts.startClient === false) {
+        // Rust Crypto starts checking server-side backup state during init. A
+        // short-lived caller (the CLI login transaction) may close this
+        // client before that background check finishes, so drain it before
+        // returning the sync-deferred client.
+        const crypto = client.getCrypto();
+        if (crypto) {
+          await TeleCryptIOStorage.withTimeout(
+            crypto.checkKeyBackupAndEnable(),
+            opts.syncTimeoutMs ?? 15000,
+            "crypto backup check",
+            opts.signal,
+          );
+        }
+      } else {
+        await storage.startSync(opts.signal);
+      }
+      return storage;
     } catch (error) {
       // stopClient is idempotent in matrix-js-sdk and is also required after
       // init/timeout failures: crypto startup can have installed listeners or
       // a sync task before the awaited operation rejects.
-      try {
-        client.stopClient();
-      } catch (cleanupError) {
-        throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
-          cause: error,
-        });
+      if (!storage) {
+        try {
+          client.stopClient();
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
+            cause: error,
+          });
+        }
       }
       throw error;
     }

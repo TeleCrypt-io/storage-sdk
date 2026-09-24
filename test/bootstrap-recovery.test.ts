@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { SyncState } from "matrix-js-sdk";
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import {
@@ -44,6 +45,26 @@ describe("bootstrap and recovery safety", () => {
 
     await expect(bootstrap(client, bootstrapOptions())).rejects.toThrow("crypto init failed");
     expect(client.stopClient).toHaveBeenCalledTimes(1);
+  });
+
+  it("can initialize crypto before starting room sync", async () => {
+    const checkKeyBackupAndEnable = vi.fn().mockResolvedValue(null);
+    const client = {
+      initRustCrypto: vi.fn().mockResolvedValue(undefined),
+      startClient: vi.fn().mockResolvedValue(undefined),
+      getSyncState: vi.fn().mockReturnValue(SyncState.Prepared),
+      getCrypto: () => ({ checkKeyBackupAndEnable }),
+      stopClient: vi.fn(),
+    };
+
+    const storage = await bootstrap(client, { ...bootstrapOptions(), startClient: false });
+    expect(client.startClient).not.toHaveBeenCalled();
+    expect(checkKeyBackupAndEnable).toHaveBeenCalledTimes(1);
+
+    await storage.startSync();
+    await storage.startSync();
+    expect(client.startClient).toHaveBeenCalledTimes(1);
+    expect(client.startClient).toHaveBeenCalledWith({ initialSyncLimit: 10 });
   });
 
   it("stops a client when startClient rejects after startup begins", async () => {

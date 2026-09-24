@@ -1075,9 +1075,14 @@ describe("operation safety", () => {
 
   it("attempts a join when Synapse hides invite membership behind M_FORBIDDEN", async () => {
     const joinRoom = vi.fn().mockResolvedValue(undefined);
+    const client = {
+      getUserId: () => "@reader:example.test",
+      getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+      joinRoom,
+    };
     const storage = { keySafe: { requireReady: async () => undefined },
       getRoomMembership: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
-      getClient: () => ({ joinRoom }),
+      getClient: () => client,
     } as unknown as TeleCryptIOStorage;
 
     await expect(joinVault(storage, "!invited:example.test")).resolves.toEqual({
@@ -1088,12 +1093,15 @@ describe("operation safety", () => {
   });
 
   it("suppresses join M_FORBIDDEN only after authoritative recheck confirms join", async () => {
+    const joinRoom = vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
     const storage = { keySafe: { requireReady: async () => undefined },
       getRoomMembership: vi.fn()
         .mockResolvedValueOnce("invite")
         .mockResolvedValueOnce("join"),
       getClient: () => ({
-        joinRoom: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
+        getUserId: () => "@reader:example.test",
+        getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+        joinRoom,
       }),
     } as unknown as TeleCryptIOStorage;
 
@@ -1101,6 +1109,34 @@ describe("operation safety", () => {
       vaultId: "!race:example.test",
       joined: true,
     });
+    expect(joinRoom).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits until the local room store has the invite before joining", async () => {
+    vi.useFakeTimers();
+    try {
+      let roomLookups = 0;
+      const inviteRoom = { getMember: () => ({ membership: "invite" }) };
+      const joinRoom = vi.fn().mockResolvedValue(undefined);
+      const storage = { keySafe: { requireReady: async () => undefined },
+        getRoomMembership: vi.fn().mockResolvedValue("invite"),
+        getClient: () => ({
+          getUserId: () => "@reader:example.test",
+          getRoom: () => ++roomLookups >= 3 ? inviteRoom : undefined,
+          joinRoom,
+        }),
+      } as unknown as TeleCryptIOStorage;
+
+      const pending = joinVault(storage, "!syncing:example.test");
+      await vi.advanceTimersByTimeAsync(300);
+      await expect(pending).resolves.toEqual({
+        vaultId: "!syncing:example.test",
+        joined: true,
+      });
+      expect(joinRoom).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for the server-advised delay before retrying a rate-limited join", async () => {
@@ -1113,7 +1149,11 @@ describe("operation safety", () => {
       const joinRoom = vi.fn().mockRejectedValueOnce(rateLimited).mockResolvedValueOnce(undefined);
       const storage = { keySafe: { requireReady: async () => undefined },
         getRoomMembership: vi.fn().mockResolvedValue("invite"),
-        getClient: () => ({ joinRoom }),
+        getClient: () => ({
+          getUserId: () => "@reader:example.test",
+          getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+          joinRoom,
+        }),
       } as unknown as TeleCryptIOStorage;
       const pending = joinVault(storage, "!limited:example.test");
       const assertion = expect(pending).resolves.toEqual({

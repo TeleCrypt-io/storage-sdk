@@ -46,6 +46,13 @@ by default. Browser persistence uses IndexedDB and the Matrix Rust crypto WASM r
 example assumes a browser environment. OIDC discovery, login, refresh, and the corresponding
 `createFromOidc` inputs are exported from `@telecrypt-io/storage/core`.
 
+Applications that require the Decryption Key Safe before downloading room history can create the
+client with `startClient: false`. Check its status and restore room keys first; `restore()` starts
+sync after importing them so Matrix can publish this login's device keys and complete account
+signing. For an already-ready safe, call `await storage.startSync()` after the status check. Keep
+Storage operations locked until the Safe reports ready. The default is to start sync during
+creation.
+
 The example creates retained Matrix rooms and encrypted media. Delete its file and then its empty
 vault when finished; cleanup is part of the operation, not an automatic consequence of stopping
 the client.

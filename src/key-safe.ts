@@ -32,7 +32,12 @@ export class DecryptionKeySafe {
   private tail: Promise<unknown> = Promise.resolve();
   private secretRecordsRefreshed = false;
   private refreshedKeyDescriptorId: string | null = null;
-  constructor(private client: MatrixClient, private withKey: WithKey, private options: KeySafePersistenceOptions = {}) {}
+  constructor(
+    private client: MatrixClient,
+    private withKey: WithKey,
+    private options: KeySafePersistenceOptions = {},
+    private startSync?: (signal?: AbortSignal) => Promise<void>,
+  ) {}
 
   private active(signal?: AbortSignal): void {
     if (signal?.aborted) throw new StorageError("operation cancelled");
@@ -209,6 +214,11 @@ export class DecryptionKeySafe {
       this.client.downloadKeysForUsers([user]),
       this.crypto().getCrossSigningStatus(),
     ]);
+    // A new login may defer room sync until the Safe is restored. Ensure the
+    // Rust crypto store has the account's public signing keys before importing
+    // their private copies from secret storage; the HTTP download above alone
+    // does not populate that native identity cache.
+    await this.crypto().userHasCrossSigningKeys(user, true);
     const remote = server.master_keys?.[user];
     const hasPrivateKeys = Object.values(status.privateKeysCachedLocally).every(Boolean);
     if (remote && !status.privateKeysInSecretStorage && !hasPrivateKeys) {
@@ -318,6 +328,10 @@ export class DecryptionKeySafe {
         await this.crypto().loadSessionBackupPrivateKeyFromSecretStorage();
         await this.crypto().checkKeyBackupAndEnable();
         const result = await this.crypto().restoreKeyBackup();
+        // Restore room keys before starting history sync. That first sync also
+        // publishes this login's device keys so Matrix can complete its
+        // account-signing check.
+        await this.startSync?.(options.signal);
         if (!(await this.signingReady())) throw new StorageError("This login's account signing setup is incomplete");
         this.active(options.signal);
         const currentBackup = await this.serverBackup();
