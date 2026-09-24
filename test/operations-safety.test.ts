@@ -466,11 +466,12 @@ describe("operation safety", () => {
 
   it("refreshes the parent room before listing subfolders", async () => {
     const tree = makeTree("!folders:example.test", "Folders", true);
-    const getDirectories = vi.fn().mockReturnValue([
-      { id: "!child:example.test", room: { name: "Child" } },
-    ]);
-    tree.getDirectories = getDirectories;
     const refreshRoomState = vi.fn().mockResolvedValue(undefined);
+    const getTree = vi.fn((roomId: string) =>
+      roomId === tree.id
+        ? tree
+        : { id: roomId, room: { name: "Child" } },
+    );
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({
         getRoom: () => ({
@@ -485,7 +486,7 @@ describe("operation safety", () => {
           },
         }),
       }),
-      getTree: () => tree,
+      getTree,
       refreshRoomState,
       getTreeName: vi.fn().mockResolvedValue("Child"),
     } as unknown as TeleCryptIOStorage;
@@ -497,9 +498,42 @@ describe("operation safety", () => {
       tree.id,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(
-      getDirectories.mock.invocationCallOrder[0]!,
-    );
+    expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(getTree.mock.invocationCallOrder[1]!);
+  });
+
+  it("waits for an active child relation to appear in Matrix's TreeSpace projection", async () => {
+    const parent = makeTree("!parent:example.test", "Parent", true);
+    parent.getDirectories = () => [];
+    const child = makeTree("!child:example.test", "Child", false);
+    let childLookups = 0;
+    const storage = {
+      keySafe: { requireReady: async () => undefined },
+      getClient: () => ({
+        getRoom: () => ({
+          currentState: {
+            getStateEvents: (eventType: string) =>
+              eventType === EventType.SpaceChild
+                ? [{
+                    getStateKey: () => child.id,
+                    getContent: () => ({ via: ["example.test"] }),
+                  }]
+                : [],
+          },
+        }),
+      }),
+      getTree: (roomId: string) => {
+        if (roomId === parent.id) return parent;
+        childLookups += 1;
+        return childLookups === 1 ? null : child;
+      },
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+      getTreeName: vi.fn().mockResolvedValue("Child"),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(listSubfolders(storage, parent.id)).resolves.toEqual([
+      { id: child.id, name: "Child" },
+    ]);
+    expect(childLookups).toBeGreaterThan(1);
   });
 
   it("does not list a child whose space relation is inactive", async () => {

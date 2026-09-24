@@ -413,7 +413,12 @@ function isActiveRelationEvent(event: RelationEvent): boolean {
   );
 }
 
-function activeTreeDirectories(client: MatrixClient, tree: TreeSpace): TreeSpace[] {
+async function activeTreeDirectories(
+  storage: TeleCryptIOStorage,
+  tree: TreeSpace,
+  signal?: AbortSignal,
+): Promise<TreeSpace[]> {
+  const client = storage.getClient();
   const childEvents = readRelationEvents(client, tree.id, EventType.SpaceChild);
   if (childEvents === null) throw new StorageError("storage folder state is unavailable");
   const activeChildIds = new Set<string>();
@@ -423,12 +428,26 @@ function activeTreeDirectories(client: MatrixClient, tree: TreeSpace): TreeSpace
     if (!childId) throw new StorageError("storage folder state is inconsistent");
     activeChildIds.add(childId);
   }
-  const knownChildren = new Map(tree.getDirectories().map((child) => [child.id, child]));
-  return [...activeChildIds].map((childId) => {
-    const child = knownChildren.get(childId);
-    if (!child) throw new StorageError("storage folder state is inconsistent");
-    return child;
-  });
+  const directories = await Promise.all([...activeChildIds].map(async (childId) => {
+    if (isMarkedTreeDeleted(storage, childId)) return null;
+    try {
+      // The parent room's relationship state can arrive before Matrix SDK's
+      // MSC3089 TreeSpace projection includes that child. Resolve the exact
+      // room named by the active relation instead of treating that brief
+      // projection lag as corrupt folder state.
+      return await waitForCondition(
+        () => storage.getTree(childId),
+        { timeoutMs: 15000, signal },
+      );
+    } catch (error) {
+      if (signal?.aborted) throw new StorageError("operation cancelled");
+      if (error instanceof ConditionTimeoutError) {
+        throw new StorageError("storage folder state is inconsistent");
+      }
+      throw new StorageError("storage folder state lookup failed", { cause: error });
+    }
+  }));
+  return directories.filter((directory): directory is TreeSpace => directory !== null);
 }
 
 async function unlinkExternalParents(
@@ -1160,7 +1179,7 @@ export async function listSubfolders(
     const tree = await resolveTree(storage, parentId, signal);
     await storage.refreshRoomState(parentId, { signal });
     ensureOperationActive(signal);
-    const directories = activeTreeDirectories(storage.getClient(), tree)
+    const directories = (await activeTreeDirectories(storage, tree, signal))
       .filter((directory) => !isMarkedTreeDeleted(storage, directory.id));
     return Promise.all(
       directories.map(async (directory) => ({
