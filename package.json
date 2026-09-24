@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "matrix-encrypt-attachment": "1.0.3",
-    "matrix-js-sdk": "42.2.0"
+    "matrix-js-sdk": "42.4.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
