@@ -76,9 +76,27 @@ and a per-file key distributed through the room's Megolm session). The server st
 media and Matrix events, but encryption does not hide all room, event, or other metadata from the
 server or users who can read the room.
 
-Recovery is explicit. Use `core.setupRecovery(storage)` to create a recovery key and keep that key
-securely; use `core.restoreRecovery(storage, recoveryKey)` on a new device. Losing the recovery key
-can prevent encrypted keys from being restored.
+The Decryption Key Safe is mandatory before the public core storage operations. Inspect
+`storage.keySafe.getStatus(signal?)`. For `setup-required`, call `setup(signal?)`, offer the returned
+`recoveryKey` for copying/saving, explain that losing both this key and local decryption keys can
+make files permanently unreadable, and require an explicit saved-key acknowledgement before
+`confirmSaved(signal?)`. `confirmation-required` returns the same pending key after interruption.
+For `restore-required`, call `restore(recoveryKey, signal?)` with the existing key; this restores
+room keys and signs the current login using the existing account keys. Normal use requires `ready`.
+Setup and restore never replace an existing safe or account signing identity. Resetting the account
+password cannot recover encrypted files.
+
+Pending setup state is kept beside the login's IndexedDB crypto data. A platform that snapshots
+IndexedDB to disk, such as the CLI, must supply `onKeySafeStateChanged` at creation and durably flush
+its snapshot before resolving that callback. Key Safe methods accept an optional `AbortSignal`.
+The safe, signing keys, and saved-key acknowledgement are shared SDK behavior rather than separate
+Web/CLI implementations.
+
+Sharing uses Matrix's native encrypted-history bundle exchange. Both users must have completed
+their account signing setup. An invitation alone does not establish successful history sharing:
+the SDK checks native recipient-device eligibility afterward and reports partial completion if
+keys could not be shared. An upload restriction can reject the encrypted history bundle upload;
+the error is preserved, including when retrying an existing invitation.
 
 Deletion has strict ordering. Delete files before their folders or vaults because folders and
 vaults must be empty. File deletion removes the encrypted media object before redacting its Matrix

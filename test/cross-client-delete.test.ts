@@ -113,7 +113,7 @@ function makeFixture(
     kick: vi.fn().mockResolvedValue(undefined),
   };
 
-  const storage = {
+  const storage = { keySafe: { requireReady: async () => undefined },
     getClient: () => client,
     getTree: () => tree,
     getOriginalFileEvent: vi.fn(async () => ({

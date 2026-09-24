@@ -1,3 +1,4 @@
+import "fake-indexeddb/auto";
 import { describe, it, expect } from "vitest";
 import { registerTestUser } from "../harness/users";
 import { createTestClient, stopTestClient } from "../harness/clients";
@@ -238,9 +239,16 @@ describe("encrypted files", () => {
 
   it("2.8 delete a file removes it from listFiles", async () => {
     const user = await registerTestUser("file");
-    const client = await createTestClient(user);
+    const storage = await TeleCryptIOStorage.create({
+      baseUrl: "http://localhost:8008",
+      serverName: "localhost:8008",
+      userId: user.userId,
+      accessToken: user.accessToken,
+      deviceId: user.deviceId,
+    });
     try {
-      const storage = new TeleCryptIOStorage(client);
+      await storage.keySafe.setup();
+      await storage.keySafe.confirmSaved();
       const tree = await storage.createTree("DelTest");
       await waitForTreeName(storage, tree.id, "DelTest");
 
@@ -275,12 +283,12 @@ describe("encrypted files", () => {
       expect(tree.room.currentState
         .getStateEvents(UNSTABLE_MSC3089_BRANCH.name, eventId)
         ?.getContent()).toEqual({});
-      const redactedRename = await client.fetchRoomEvent(tree.id, renameId);
-      const redactedAttachment = await client.fetchRoomEvent(tree.id, eventId);
+      const redactedRename = await storage.getClient().fetchRoomEvent(tree.id, renameId);
+      const redactedAttachment = await storage.getClient().fetchRoomEvent(tree.id, eventId);
       expect(JSON.stringify(redactedRename)).not.toContain("renamed-gone.txt");
       expect(JSON.stringify(redactedAttachment)).not.toContain("gone.txt");
     } finally {
-      stopTestClient(client);
+      stopTestClient(storage.getClient());
     }
   });
 });

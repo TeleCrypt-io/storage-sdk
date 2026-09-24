@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { DecryptionKeySafe } from "../src/key-safe.js";
+beforeEach(() => { vi.spyOn(DecryptionKeySafe.prototype, "requireReady").mockResolvedValue(undefined); });
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TeleCryptIOStorage, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 import {
   downloadFile as downloadCoreFile,

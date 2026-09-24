@@ -103,3 +103,5 @@ export interface FolderDetails {
   createdAt: string | null;
   memberCount: number | null;
 }
+
+export type { KeySafeStatus, KeySafeOptions } from "../key-safe.js";

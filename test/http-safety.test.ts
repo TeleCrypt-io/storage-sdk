@@ -135,7 +135,7 @@ describe("HTTP cancellation", () => {
   });
 
   it("bounds an operation whose promise ignores its deadline signal", async () => {
-    const storage = {
+    const storage = { keySafe: { requireReady: async () => undefined },
       listTrees: () => new Promise<never>(() => undefined),
     } as never;
     const started = Date.now();

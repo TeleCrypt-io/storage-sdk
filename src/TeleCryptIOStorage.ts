@@ -54,6 +54,7 @@ import { sanitizeDiagnosticText } from "./core/oidc.js";
 import { validateName } from "./core/validation.js";
 import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
+import { DecryptionKeySafe, type KeySafePersistenceOptions } from "./key-safe.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -130,6 +131,8 @@ export interface CreateTeleCryptIOStorageOptions {
    * Node/tests, where `fake-indexeddb` is process-global).
    */
   cryptoDatabasePrefix?: string;
+  /** Persist local Key Safe state before server-side setup continues (CLI snapshots). */
+  onKeySafeStateChanged?: () => Promise<void>;
   /** initialSyncLimit passed to startClient(); default 10. */
   initialSyncLimit?: number;
   /** How long to wait for the first sync before giving up; default 15000ms. */
@@ -174,6 +177,8 @@ export interface CreateFromOidcOptions {
   tokenRefreshFunction?: TokenRefreshFunction;
   persistentCryptoStore?: boolean;
   cryptoDatabasePrefix?: string;
+  /** Persist local Key Safe state before server-side setup continues (CLI snapshots). */
+  onKeySafeStateChanged?: () => Promise<void>;
   initialSyncLimit?: number;
   syncTimeoutMs?: number;
   initTimeoutMs?: number;
@@ -695,7 +700,10 @@ export class TeleCryptIOStorage {
   private readonly treeNames = new Map<string, string>();
   private readonly fileNames = new Map<string, string>();
 
-  constructor(private client: MatrixClient) {
+  readonly keySafe: DecryptionKeySafe;
+
+  constructor(private client: MatrixClient, options: KeySafePersistenceOptions = {}) {
+    this.keySafe = new DecryptionKeySafe(client, (key, operation, signal) => this.withSecretStorageKey(key, operation, signal), options);
     // Advanced callers may construct a MatrixClient themselves. The SDK does
     // not mutate matrix-js-sdk internals: configure that client with the
     // supported createClient({ fetchFn, localTimeoutMs }) options, or use
@@ -1127,6 +1135,7 @@ export class TeleCryptIOStorage {
       | "deviceId"
       | "persistentCryptoStore"
       | "cryptoDatabasePrefix"
+      | "onKeySafeStateChanged"
       | "initialSyncLimit"
       | "syncTimeoutMs"
       | "initTimeoutMs"
@@ -1165,7 +1174,7 @@ export class TeleCryptIOStorage {
       TeleCryptIOStorage.throwIfAborted(opts.signal);
       progress("Sync complete.");
 
-      return new TeleCryptIOStorage(client);
+      return new TeleCryptIOStorage(client, opts);
     } catch (error) {
       // stopClient is idempotent in matrix-js-sdk and is also required after
       // init/timeout failures: crypto startup can have installed listeners or
@@ -1429,12 +1438,7 @@ export class TeleCryptIOStorage {
     if (signal?.aborted) throw new StorageError("operation cancelled");
 
     try {
-      await withRecoveryCryptoDeadline(() => crypto.bootstrapCrossSigning({
-        // No existing verified device to interactively re-authenticate against
-        // for this account, so there is nothing to feed into `makeRequest`;
-        // matches the working pattern already proven in keys.test.ts.
-        authUploadDeviceSigningKeys: async () => undefined,
-      }), signal, "cross-signing bootstrap");
+      await withRecoveryCryptoDeadline(() => crypto.bootstrapCrossSigning({}), signal, "cross-signing bootstrap");
     } catch (error) {
       // Cross-signing setup can commit server-side state before a transport
       // failure is observed. Do not turn that uncertainty into a retry that
