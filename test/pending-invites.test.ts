@@ -28,7 +28,7 @@ describe("pending invites", () => {
       getRoom: () => undefined,
       getUserId: () => null,
     };
-    const storage = {
+    const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => client,
       getTree: (roomId: string) => trees.get(roomId),
     } as unknown as TeleCryptIOStorage;
@@ -95,7 +95,7 @@ describe("pending invites", () => {
       getRoom: () => undefined,
       getUserId: () => null,
     };
-    const storage = {
+    const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => client,
       getTree: () => undefined,
     } as unknown as TeleCryptIOStorage;
@@ -120,7 +120,7 @@ describe("pending invites", () => {
       getRoom: () => undefined,
       getUserId: () => null,
     };
-    const storage = {
+    const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => client,
       getTree: () => ({ id: nestedInvite.roomId, isTopLevel: true, room: { name: "Nested" } }),
     } as unknown as TeleCryptIOStorage;

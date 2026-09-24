@@ -93,6 +93,8 @@ describe("OIDC/MAS login", () => {
         deviceId,
       });
       try {
+        await storage.keySafe.setup();
+        await storage.keySafe.confirmSaved();
         // The mandatory proof this is a genuinely usable storage instance,
         // not just "a token that whoami accepts". A newly created room can
         // take a beat to settle as "top-level" in this same client's own
@@ -168,6 +170,8 @@ describe("OIDC/MAS login", () => {
         deviceId,
       });
       try {
+        await storage.keySafe.setup();
+        await storage.keySafe.confirmSaved();
         const vault = await core.createVault(storage, "OidcRefreshedTokenVault");
         expect(vault.id).toBeTruthy();
       } finally {

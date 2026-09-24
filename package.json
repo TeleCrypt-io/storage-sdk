@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "license": "BUSL-1.1",
   "type": "module",
   "packageManager": "npm@11.19.0",
@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "matrix-encrypt-attachment": "1.0.3",
-    "matrix-js-sdk": "42.2.0"
+    "matrix-js-sdk": "42.4.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

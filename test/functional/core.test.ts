@@ -18,19 +18,25 @@ import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
 import * as core from "../../src/core/operations";
 
 const BASE_URL = "http://localhost:8008";
+const savedKeys = new WeakMap<TeleCryptIOStorage, { recoveryKey: string }>();
 
 async function createStorage(user: {
   userId: string;
   accessToken: string;
   deviceId: string;
-}): Promise<TeleCryptIOStorage> {
-  return TeleCryptIOStorage.create({
+}, initialize = true): Promise<TeleCryptIOStorage> {
+  const storage = await TeleCryptIOStorage.create({
     baseUrl: BASE_URL,
     serverName: "localhost:8008",
     userId: user.userId,
     accessToken: user.accessToken,
     deviceId: user.deviceId,
   });
+  if (initialize) {
+    savedKeys.set(storage, await storage.keySafe.setup());
+    await storage.keySafe.confirmSaved();
+  }
+  return storage;
 }
 
 describe("core operations", () => {
@@ -210,7 +216,7 @@ describe("core operations", () => {
     }
   });
 
-  it("C.5 setupRecovery + restoreRecovery on a fresh device", async () => {
+  it("C.5 Decryption Key Safe restores and signs a fresh login", async () => {
     const userA = await registerTestUser("core_recover");
     const storageA = await createStorage(userA);
     try {
@@ -225,17 +231,11 @@ describe("core operations", () => {
         { label: "file visible on device A" },
       );
 
-      const setup = await core.setupRecovery(storageA);
+      const setup = savedKeys.get(storageA)!;
       expect(typeof setup.recoveryKey).toBe("string");
       expect(setup.recoveryKey).toBeTruthy();
 
-      // Backup engine believes it is active...
-      await waitFor(() => storageA.keys.isRecoverySetup(), {
-        label: "backup active on device A",
-        timeoutMs: 15000,
-      });
-      // ...AND the file's room key has actually reached the server (the
-      // upload is asynchronous background work, separate from "active").
+      // Wait for the actual room key upload, not just backup enablement.
       await waitFor(
         async () => {
           const res = await fetch(`${BASE_URL}/_matrix/client/v3/room_keys/version`, {
@@ -251,8 +251,13 @@ describe("core operations", () => {
       // Device B: a genuine second device for the same user — new device_id,
       // new access_token, empty crypto store of its own.
       const userB = await loginNewDevice(userA);
-      const storageB = await createStorage(userB);
+      const storageB = await createStorage(userB, false);
       try {
+        expect((await storageB.keySafe.getStatus()).state).toBe("restore-required");
+        await expect(core.downloadFile(storageB, vault.id, uploaded.id)).rejects.toThrow("Decryption Key Safe");
+        const restore = await storageB.keySafe.restore(setup.recoveryKey);
+        expect(restore.imported).toBeGreaterThan(0);
+        expect(restore.imported).toBeLessThanOrEqual(restore.total);
         await waitFor(
           async () => {
             const vaults = await core.listVaults(storageB);
@@ -265,22 +270,8 @@ describe("core operations", () => {
             const listed = await core.listFiles(storageB, vault.id);
             return listed.length > 0 ? true : null;
           },
-          { label: "device B sees the (still undecryptable) file", timeoutMs: 15000 },
+          { label: "device B sees the restored file", timeoutMs: 15000 },
         );
-
-        // NEGATIVE CONTROL: device B has no keys yet, so it must NOT be able
-        // to decrypt. Proves the empty start — if this assertion fails,
-        // device B's crypto store is leaking from device A's, and the later
-        // "success" would be meaningless. Also asserts the CLEAR error
-        // message (regression: this used to surface as an opaque
-        // "Cannot read properties of undefined (reading 'url')").
-        await expect(core.downloadFile(storageB, vault.id, uploaded.id)).rejects.toThrow(
-          /undecryptable on this device/,
-        );
-
-        const restore = await core.restoreRecovery(storageB, setup.recoveryKey);
-        expect(restore.imported).toBeGreaterThan(0);
-        expect(restore.imported).toBeLessThanOrEqual(restore.total);
 
         // Decryption settling can take a moment after the keys land locally
         // — poll real decrypt success, not the clock.
