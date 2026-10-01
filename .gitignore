@@ -7,3 +7,6 @@ test-results/
 
 # Disposable test Synapse state — never commit (contains generated signing keys)
 throwaway_synapse/data/
+
+# Locally prepared release archives and checksums
+/release/
