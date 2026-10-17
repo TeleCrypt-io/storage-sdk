@@ -167,6 +167,7 @@ podman_remove_container_if_present "$MAS"
 echo "==> starting MAS ($MAS)"
 podman run -d --name "$MAS" --network "$NET" \
   --add-host "$DB:$DB_IP" \
+  --user 0:0 \
   -v "$DATA/mas:/data:Z" \
   "$MAS_IMG" server -c /data/config.yaml
 
