@@ -1,0 +1,66 @@
+name: Publish Storage SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Pin npm to the selected source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_version="$(node -p 'require("./package.json").packageManager.replace(/^npm@/u, "")')"
+          npm install --global "npm@$npm_version"
+          test "$(npm --version)" = "$npm_version"
+
+      - name: Prepare and validate the selected release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          bash scripts/release.sh prepare "$RELEASE_TAG"
+
+      - name: Publish the verified package and GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$sha"
+          directory="release/$RELEASE_TAG"
+          asset="telecrypt-io-storage-${RELEASE_TAG#v}.tgz"
+          test "$(jq -r .sha "$directory/manifest.json")" = "$sha"
+          test "$(jq -r .asset "$directory/manifest.json")" = "$asset"
+          digest="$(jq -r .digest "$directory/manifest.json")"
+          size="$(jq -r .size "$directory/manifest.json")"
+          test "sha256:$(sha256sum "$directory/$asset" | cut -d' ' -f1)" = "$digest"
+          test "$(wc -c <"$directory/$asset")" = "$size"
+          test "$(gh api "repos/TeleCrypt-io/storage-sdk/git/ref/tags/$RELEASE_TAG" --jq .object.sha)" = "$(git rev-parse "refs/tags/$RELEASE_TAG")"
+          npm publish "$directory/$asset" --ignore-scripts --access public
+          gh release create "$RELEASE_TAG" "$directory/$asset" --repo TeleCrypt-io/storage-sdk --verify-tag --target "$sha" --generate-notes
