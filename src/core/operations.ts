@@ -1581,7 +1581,13 @@ export async function uploadFile(
   options?: OperationOptions,
 ): Promise<FileInfo> {
   await storage.keySafe.requireReady({ signal: options?.signal });
-  return withOperationDeadline(options, async (signal) => {
+  const deadline = createOperationDeadline(options);
+  try {
+    const signal = deadline.signal;
+    ensureOperationActive(signal);
+    // Unlike a read, an upload must retain a receipt returned by an in-flight
+    // mutation after cancellation. Native HTTP requests remain time-bounded;
+    // the uploader stops before starting another write when this signal aborts.
     const tree = await resolveTree(storage, treeId, signal);
     const fileId = await withRateLimitRetry(
       () => storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype, signal),
@@ -1614,12 +1620,14 @@ export async function uploadFile(
         "upload file",
         [fileId],
         "upload completed but the file could not be observed locally",
-        { cause: error },
+        { cause: error, treeId },
       );
     }
     ensureOperationActive(signal);
     return { id: fileId, name, mimetype };
-  }, "mutation");
+  } finally {
+    deadline.close();
+  }
 }
 
 /** Discard the acknowledged stages of a failed upload using its retained IDs. */

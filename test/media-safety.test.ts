@@ -135,6 +135,7 @@ describe("media safety bounds", () => {
       expect.anything(),
       expect.anything(),
       { info: { mimetype: "application/octet-stream", size: MAX_MEDIA_FILE_BYTES } },
+      undefined,
     );
   });
 

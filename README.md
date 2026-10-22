@@ -91,6 +91,9 @@ do not repeat the upload blindly. To discard the partial upload, call
 Retry cleanup with the same IDs if it fails. A known attachment ID can also be passed to ordinary
 `core.deleteFile` even when its listing was never committed. An initial media response lost before
 the server returns any identifier still has an unknown outcome and cannot provide cleanup IDs.
+Upload cancellation stops before the next write and waits for the current request's bounded
+settlement so returned media/event IDs are retained. Keep observing the upload promise after
+cancelling a UI wait or closing a view; persist any partial receipt for the originating account.
 
 The Decryption Key Safe is mandatory before the public core storage operations. Inspect
 `storage.keySafe.getStatus(signal?)`. For `setup-required`, call `setup(signal?)`, offer the returned

@@ -3,10 +3,50 @@ import { describe, expect, it, vi } from "vitest";
 import { MatrixError, UNSTABLE_MSC3089_BRANCH } from "matrix-js-sdk";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
 import { MutationPartialError } from "../../src/core/errors.js";
+import { uploadFile } from "../../src/core/operations.js";
 import { registerTestUser } from "../harness/users.js";
 import { createTestClient, stopTestClient } from "../harness/clients.js";
 
 describe("partial upload cleanup against Synapse", () => {
+  it("returns an accepted media receipt after cancellation and removes it on explicit cleanup", async () => {
+    const user = await registerTestUser("upload_cancel");
+    const storage = await TeleCryptIOStorage.create({
+      baseUrl: "http://localhost:8008", serverName: "localhost:8008",
+      userId: user.userId, accessToken: user.accessToken, deviceId: user.deviceId,
+    });
+    const client = storage.getClient();
+    try {
+      await storage.keySafe.setup();
+      await storage.keySafe.confirmSaved();
+      const tree = await storage.createTree("Cancelled upload");
+      const controller = new AbortController();
+      const original = client.uploadContent.bind(client);
+      vi.spyOn(client, "uploadContent").mockImplementation(async (...args) => {
+        const response = await original(...args);
+        controller.abort();
+        return response;
+      });
+      const message = vi.spyOn(client, "sendMessage");
+      const error = await uploadFile(storage, tree.id, "cancelled.txt", new TextEncoder().encode("cancelled bytes"), "text/plain", {
+        signal: controller.signal,
+      }).then(() => { throw new Error("expected partial result"); }, (failure: unknown) => failure);
+      expect(error).toBeInstanceOf(MutationPartialError);
+      const partial = error as MutationPartialError;
+      expect(partial.treeId).toBe(tree.id);
+      expect(partial.completedIds).toHaveLength(1);
+      expect(message).not.toHaveBeenCalled();
+      const mediaId = partial.completedIds[0]!;
+      await storage.cleanupFileUpload(tree.id, mediaId);
+      const url = client.mxcUrlToHttp(mediaId, undefined, undefined, undefined, false, true, true)!;
+      const response = await fetch(url, { headers: { Authorization: `Bearer ${client.getAccessToken()}` } });
+      expect(response.status).toBe(404);
+      await response.text();
+    } finally {
+      vi.restoreAllMocks();
+      stopTestClient(client);
+    }
+  }, 60_000);
+
   it("removes accepted media and the attachment after a definitive listing rejection", async () => {
     const user = await registerTestUser("upload_reject");
     const client = await createTestClient(user);

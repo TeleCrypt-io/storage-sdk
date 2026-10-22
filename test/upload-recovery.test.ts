@@ -59,6 +59,63 @@ function fixture() {
 }
 
 describe("partial upload recovery", () => {
+  it("retains the media receipt returned after public core cancellation and stops before the attachment", async () => {
+    const f = fixture();
+    const deferred = Promise.withResolvers<{ content_uri: string }>();
+    f.client.uploadContent.mockReturnValue(deferred.promise);
+    const controller = new AbortController();
+    let settled = false;
+    const pending = uploadFile(f.storage, treeId, "file.txt", new Uint8Array([1]), "text/plain", { signal: controller.signal });
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await vi.waitFor(() => expect(f.client.uploadContent).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    const assertion = expect(pending).rejects.toMatchObject({
+      name: "MutationPartialError", operation: "file upload", completedIds: [mediaId], treeId,
+    });
+    deferred.resolve({ content_uri: mediaId });
+    await assertion;
+    expect(f.client.sendMessage).not.toHaveBeenCalled();
+    expect(f.client.sendStateEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(["accepted", "response lost"])("preserves both IDs when an in-flight listing settles after cancellation: %s", async (outcome) => {
+    const f = fixture();
+    const deferred = Promise.withResolvers<{ event_id: string }>();
+    f.client.sendStateEvent.mockReturnValue(deferred.promise);
+    const controller = new AbortController();
+    let settled = false;
+    const pending = uploadFile(f.storage, treeId, "file.txt", new Uint8Array([1]), "text/plain", { signal: controller.signal });
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await vi.waitFor(() => expect(f.client.sendStateEvent).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    const assertion = expect(pending).rejects.toMatchObject({
+      name: "MutationPartialError", operation: "file upload", completedIds: [mediaId, fileId], treeId,
+    });
+    if (outcome === "accepted") deferred.resolve({ event_id: "$listing" });
+    else deferred.reject(new Error("response lost"));
+    await assertion;
+    expect(f.client.http.authedRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps the acknowledged receipt when the operation budget expires during a mutation", async () => {
+    const f = fixture();
+    const deferred = Promise.withResolvers<{ event_id: string }>();
+    f.client.sendMessage.mockReturnValue(deferred.promise);
+    const pending = uploadFile(f.storage, treeId, "file.txt", new Uint8Array([1]), "text/plain", { timeoutMs: 20 });
+    const assertion = expect(pending).rejects.toMatchObject({
+      name: "MutationPartialError", completedIds: [mediaId, fileId], treeId,
+    });
+    await vi.waitFor(() => expect(f.client.sendMessage).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    deferred.resolve({ event_id: fileId });
+    await assertion;
+    expect(f.client.sendStateEvent).not.toHaveBeenCalled();
+  });
+
   it("compensates a definitive listing rejection with owned-media deletion and attachment redaction", async () => {
     const f = fixture();
     f.client.sendStateEvent.mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));

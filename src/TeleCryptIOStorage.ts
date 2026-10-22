@@ -81,6 +81,7 @@ export interface TreeSpace {
     encryptedContents: ArrayBuffer | Uint8Array,
     info: Record<string, unknown>,
     additionalContent?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{ event_id: string }>;
 }
 
@@ -1029,11 +1030,13 @@ export class TeleCryptIOStorage {
     encryptedContents: ArrayBuffer | Uint8Array,
     info: Record<string, unknown>,
     additionalContent?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{ event_id: string }> {
     validateFileName(name);
     // Authoritative room refresh also repairs legacy owner permissions before
     // publishing new encrypted content to an existing vault.
-    await this.refreshRoomState(treeId);
+    await this.refreshRoomState(treeId, { signal });
+    if (signal?.aborted) throw new StorageError("operation cancelled");
     const bytes = encryptedContents instanceof Uint8Array
       ? encryptedContents
       : new Uint8Array(encryptedContents);
@@ -1046,6 +1049,7 @@ export class TeleCryptIOStorage {
         throw new StorageError("encrypted media upload returned no content URI");
       }
       mediaId = uploaded.content_uri;
+      if (signal?.aborted) throw new StorageError("operation cancelled");
       const fileContent: Record<string, unknown> = {
         ...additionalContent,
         msgtype: MsgType.File,
@@ -1059,12 +1063,14 @@ export class TeleCryptIOStorage {
         (sent as unknown as { event_id?: unknown } | undefined)?.event_id,
         "file upload response event ID",
       );
+      if (signal?.aborted) throw new StorageError("operation cancelled");
       await this.client.sendStateEvent(
         treeId,
         UNSTABLE_MSC3089_BRANCH.name,
         { active: true, metadata_event_id: fileId } as never,
         fileId,
       );
+      if (signal?.aborted) throw new StorageError("operation cancelled");
       this.fileNames.set(this.fileNameKey(treeId, fileId), name);
       return { event_id: fileId };
     } catch (error) {
@@ -2035,8 +2041,8 @@ export class TeleCryptIOStorage {
       const branch = originalGetFile(fileId);
       return branch ? this.decorateFileBranch(tree.id, branch) : null;
     };
-    tree.createFile = (name, encryptedContents, info, additionalContent) =>
-      this.createEncryptedFile(tree.id, name, encryptedContents, info, additionalContent);
+    tree.createFile = (name, encryptedContents, info, additionalContent, signal) =>
+      this.createEncryptedFile(tree.id, name, encryptedContents, info, additionalContent, signal);
     return tree;
   }
 
@@ -2556,29 +2562,22 @@ export class TeleCryptIOStorage {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     let response: { event_id?: unknown };
     try {
-      response = await withMatrixMutationAbort(
-        () =>
-          tree.createFile(
-            name,
-            new Uint8Array(encrypted.data),
-            encrypted.info as unknown as Record<string, unknown>,
-            { info: { mimetype, size: data.byteLength } },
-          ),
+      // Let the in-flight request settle so the uploader can retain returned
+      // media/event IDs on cancellation, then stop before the next write.
+      response = await tree.createFile(
+        name,
+        new Uint8Array(encrypted.data),
+        encrypted.info as unknown as Record<string, unknown>,
+        { info: { mimetype, size: data.byteLength } },
         signal,
-        "file upload",
       );
     } catch (error) {
-      // Preserve acknowledged upload stages, including when cancellation
-      // arrived while the individual mutation was settling.
-      if (error instanceof MutationOutcomeUnknownError && error.cause instanceof MutationPartialError) {
-        throw error.cause;
-      }
+      // Preserve acknowledged upload stages after cancellation as well.
       if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
       if (error instanceof StorageError || error instanceof MatrixError) throw error;
       // An unclassified transport failure can still follow a committed event.
       throw new MutationOutcomeUnknownError("file upload", { cause: error });
     }
-    if (signal?.aborted) throw new StorageError("operation cancelled");
     try {
       return validateMatrixEventId(response?.event_id, "file upload response event ID");
     } catch (error) {
