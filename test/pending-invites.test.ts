@@ -73,6 +73,21 @@ describe("pending invites", () => {
         },
       },
     };
+    const unencrypted = {
+      ...invite("!unencrypted-tree:example.test"),
+      currentState: {
+        getStateEvents: (type: string, stateKey: string) => {
+          if (type === EventType.RoomCreate) return { getContent: () => ({ type: "m.space" }) };
+          if (
+            type === UNSTABLE_MSC3088_PURPOSE.name &&
+            stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name
+          ) {
+            return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+          }
+          return null;
+        },
+      },
+    };
     const reviewed = {
       ...invite("!reviewed-tree:example.test"),
       currentState: {
@@ -94,7 +109,7 @@ describe("pending invites", () => {
       },
     };
     const client = {
-      getRooms: () => [generic, disabled, wrongSubtype, reviewed],
+      getRooms: () => [generic, disabled, wrongSubtype, unencrypted, reviewed],
       getRoom: () => undefined,
       getUserId: () => null,
     };

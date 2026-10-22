@@ -159,25 +159,15 @@ function sanitizeUnstructuredDiagnosticText(value: string): string {
     .trim();
 }
 
-function sanitizeDiagnosticJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((item) => sanitizeDiagnosticJson(item));
-  if (typeof value === "string") return sanitizeUnstructuredDiagnosticText(value);
-  if (typeof value !== "object" || value === null) return value;
-
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
-      DIAGNOSTIC_SECRET_FIELD.test(key) ? "<redacted>" : sanitizeDiagnosticJson(item),
-    ]),
-  );
-}
-
 /** Keep provider diagnostics useful without allowing credentials, customer
  * identifiers, or control characters from an untrusted response to cross the
  * SDK boundary. Structured JSON uses decoded property names at every depth. */
 export function sanitizeDiagnosticText(value: string): string {
   try {
-    return JSON.stringify(sanitizeDiagnosticJson(JSON.parse(value)));
+    return JSON.stringify(JSON.parse(value), (key, item: unknown) => {
+      if (DIAGNOSTIC_SECRET_FIELD.test(key)) return "<redacted>";
+      return typeof item === "string" ? sanitizeUnstructuredDiagnosticText(item) : item;
+    });
   } catch {
     return sanitizeUnstructuredDiagnosticText(value);
   }

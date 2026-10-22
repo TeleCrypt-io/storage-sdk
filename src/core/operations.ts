@@ -35,7 +35,7 @@ import {
   StorageError,
 } from "./errors.js";
 import { ConditionTimeoutError, waitForCondition } from "./poll.js";
-import { isStorageTreeRoom, validateName } from "./validation.js";
+import { hasStorageTreeMarkersRoom, isStorageTreeRoom, validateName } from "./validation.js";
 import { prepareReaderHistorySharing } from "../sharing.js";
 import {
   isFileDeleted,
@@ -882,7 +882,7 @@ export async function declineInvite(
       if (
         !currentRoom ||
         hasActiveSpaceParent(currentRoom) ||
-        !isStorageTreeRoom(currentRoom)
+        !hasStorageTreeMarkersRoom(currentRoom)
       ) {
         throw new StorageError("decline failed");
       }

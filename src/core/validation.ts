@@ -41,18 +41,26 @@ export function isStorageTreeState(
   purposeContent: unknown,
   encryptionContent: unknown,
 ): boolean {
+  return hasStorageTreeMarkers(createContent, purposeContent) &&
+    isRecord(encryptionContent) &&
+    encryptionContent.algorithm === STORAGE_ROOM_ENCRYPTION_ALGORITHM;
+}
+
+/** The room markers needed for explicit invite cleanup before encryption is available. */
+export function hasStorageTreeMarkers(createContent: unknown, purposeContent: unknown): boolean {
   return (
     isRecord(createContent) &&
     createContent[RoomCreateTypeField] === RoomType.Space &&
     isRecord(purposeContent) &&
-    purposeContent[UNSTABLE_MSC3088_ENABLED.name] === true &&
-    isRecord(encryptionContent) &&
-    encryptionContent.algorithm === STORAGE_ROOM_ENCRYPTION_ALGORITHM
+    purposeContent[UNSTABLE_MSC3088_ENABLED.name] === true
   );
 }
 
-/** Checks the existing Storage markers and Megolm room encryption together. */
-export function isStorageTreeRoom(room: StorageTreeRoomLike | null | undefined): boolean {
+function getStorageTreeState(room: StorageTreeRoomLike | null | undefined): {
+  createContent: unknown;
+  purposeContent: unknown;
+  encryptionContent: unknown;
+} {
   const getContent = (eventType: string, stateKey: string): unknown => {
     const raw = room?.currentState?.getStateEvents?.(eventType, stateKey);
     const event = Array.isArray(raw) ? raw[0] : raw;
@@ -63,9 +71,21 @@ export function isStorageTreeRoom(room: StorageTreeRoomLike | null | undefined):
       : undefined;
   };
 
-  return isStorageTreeState(
-    getContent(EventType.RoomCreate, ""),
-    getContent(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name),
-    getContent(EventType.RoomEncryption, ""),
-  );
+  return {
+    createContent: getContent(EventType.RoomCreate, ""),
+    purposeContent: getContent(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name),
+    encryptionContent: getContent(EventType.RoomEncryption, ""),
+  };
+}
+
+/** Checks the existing Storage markers and Megolm room encryption together. */
+export function isStorageTreeRoom(room: StorageTreeRoomLike | null | undefined): boolean {
+  const state = getStorageTreeState(room);
+  return isStorageTreeState(state.createContent, state.purposeContent, state.encryptionContent);
+}
+
+/** Checks only the room markers for explicit cleanup paths such as declining an invite. */
+export function hasStorageTreeMarkersRoom(room: StorageTreeRoomLike | null | undefined): boolean {
+  const state = getStorageTreeState(room);
+  return hasStorageTreeMarkers(state.createContent, state.purposeContent);
 }

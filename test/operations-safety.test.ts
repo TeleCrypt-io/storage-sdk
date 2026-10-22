@@ -61,12 +61,17 @@ function encryptedStorageStateEvent(eventType: string, stateKey = ""): unknown {
   return undefined;
 }
 
-function reviewedInviteRoom(extra: Record<string, unknown> = {}): Record<string, unknown> {
+function reviewedInviteRoom(
+  extra: Record<string, unknown> = {},
+  encrypted = true,
+): Record<string, unknown> {
   return {
     currentState: {
       getStateEvents: (type: string, stateKey: string) => {
         if (type === EventType.RoomCreate) return { getContent: () => ({ type: "m.space" }) };
-        if (type === EventType.RoomEncryption) return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+        if (encrypted && type === EventType.RoomEncryption) {
+          return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+        }
         if (type === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
           return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
         }
@@ -778,6 +783,25 @@ describe("operation safety", () => {
     expect(leave).toHaveBeenCalledWith("!invite-prejoin:example.test");
     expect(forget).toHaveBeenCalledWith("!invite-prejoin:example.test");
     expect(removeRoom).toHaveBeenCalledWith("!invite-prejoin:example.test");
+  });
+
+  it("can decline a marked invite whose room encryption is unavailable", async () => {
+    const leave = vi.fn().mockResolvedValue(undefined);
+    const forget = vi.fn().mockResolvedValue(undefined);
+    const room = reviewedInviteRoom({ getMyMembership: () => "invite" }, false);
+    const storage = { keySafe: { requireReady: async () => undefined },
+      getClient: () => ({ getRoom: () => room, leave, forget, store: { removeRoom: vi.fn() } }),
+      getTree: () => null,
+      refreshRoomState: vi.fn(),
+      getRoomMembership: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(declineInvite(storage, "!unencrypted-invite:example.test")).resolves.toEqual({
+      vaultId: "!unencrypted-invite:example.test",
+      declined: true,
+    });
+    expect(leave).toHaveBeenCalledWith("!unencrypted-invite:example.test");
+    expect(forget).toHaveBeenCalledWith("!unencrypted-invite:example.test");
   });
 
   it("fails closed when invite membership cannot be re-read", async () => {
