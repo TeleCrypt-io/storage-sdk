@@ -105,6 +105,17 @@ the SDK checks native recipient-device eligibility afterward and reports partial
 keys could not be shared. An upload restriction can reject the encrypted history bundle upload;
 the error is preserved, including when retrying an existing invitation.
 
+`joinVault` accepts the vault and its linked folder invitations, including their history keys.
+New folders inherit the parent's joined and invited readers; browsing accepts their folder
+invitations. If reader access fails after folder creation, the partial-completion error retains
+the created folder ID. Retry sharing the parent vault to complete access to that folder.
+
+Storage spaces are private and only their creator changes room state. Loading owned trees or
+refreshing their state repairs the permissive defaults emitted by older SDKs and restores
+invite-only joining. The repair preserves membership, unrelated power settings and encryption
+keys; readers do not write it. Owners must use an updated client for their existing trees to be
+repaired. Disabled Storage markers and deleted trees are not restored automatically.
+
 Deletion has strict ordering. Delete files before their folders or vaults because folders and
 vaults must be empty. File deletion removes the encrypted media object before redacting its Matrix
 event and requires TeleCrypt's Synapse storage extension; stock Synapse cannot provide that

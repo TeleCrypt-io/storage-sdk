@@ -1096,8 +1096,10 @@ describe("operation safety", () => {
   it("does not issue a join when authoritative membership is already joined", async () => {
     const joinRoom = vi.fn();
     const storage = { keySafe: { requireReady: async () => undefined },
+      getTree: (id: string) => makeTree(id, "Joined", true),
+      refreshRoomState: async () => undefined,
       getRoomMembership: vi.fn().mockResolvedValue("join"),
-      getClient: () => ({ joinRoom }),
+      getClient: () => ({ joinRoom, getRoom: () => ({ currentState: { getStateEvents: () => [] } }) }),
     } as unknown as TeleCryptIOStorage;
 
     await expect(joinVault(storage, "!joined:example.test")).resolves.toEqual({
@@ -1111,10 +1113,12 @@ describe("operation safety", () => {
     const joinRoom = vi.fn().mockResolvedValue(undefined);
     const client = {
       getUserId: () => "@reader:example.test",
-      getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+      getRoom: () => ({ getMember: () => ({ membership: "invite" }), currentState: { getStateEvents: () => [] } }),
       joinRoom,
     };
     const storage = { keySafe: { requireReady: async () => undefined },
+      getTree: (id: string) => makeTree(id, "Joined", true),
+      refreshRoomState: async () => undefined,
       getRoomMembership: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
       getClient: () => client,
     } as unknown as TeleCryptIOStorage;
@@ -1129,12 +1133,14 @@ describe("operation safety", () => {
   it("suppresses join M_FORBIDDEN only after authoritative recheck confirms join", async () => {
     const joinRoom = vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
     const storage = { keySafe: { requireReady: async () => undefined },
+      getTree: (id: string) => makeTree(id, "Joined", true),
+      refreshRoomState: async () => undefined,
       getRoomMembership: vi.fn()
         .mockResolvedValueOnce("invite")
         .mockResolvedValueOnce("join"),
       getClient: () => ({
         getUserId: () => "@reader:example.test",
-        getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+        getRoom: () => ({ getMember: () => ({ membership: "invite" }), currentState: { getStateEvents: () => [] } }),
         joinRoom,
       }),
     } as unknown as TeleCryptIOStorage;
@@ -1150,10 +1156,12 @@ describe("operation safety", () => {
     vi.useFakeTimers();
     try {
       let roomLookups = 0;
-      const inviteRoom = { getMember: () => ({ membership: "invite" }) };
+      const inviteRoom = { getMember: () => ({ membership: "invite" }), currentState: { getStateEvents: () => [] } };
       const joinRoom = vi.fn().mockResolvedValue(undefined);
       const storage = { keySafe: { requireReady: async () => undefined },
-        getRoomMembership: vi.fn().mockResolvedValue("invite"),
+        getTree: (id: string) => makeTree(id, "Joined", true),
+      refreshRoomState: async () => undefined,
+      getRoomMembership: vi.fn().mockResolvedValue("invite"),
         getClient: () => ({
           getUserId: () => "@reader:example.test",
           getRoom: () => ++roomLookups >= 3 ? inviteRoom : undefined,
@@ -1182,10 +1190,12 @@ describe("operation safety", () => {
       });
       const joinRoom = vi.fn().mockRejectedValueOnce(rateLimited).mockResolvedValueOnce(undefined);
       const storage = { keySafe: { requireReady: async () => undefined },
-        getRoomMembership: vi.fn().mockResolvedValue("invite"),
+        getTree: (id: string) => makeTree(id, "Joined", true),
+      refreshRoomState: async () => undefined,
+      getRoomMembership: vi.fn().mockResolvedValue("invite"),
         getClient: () => ({
           getUserId: () => "@reader:example.test",
-          getRoom: () => ({ getMember: () => ({ membership: "invite" }) }),
+          getRoom: () => ({ getMember: () => ({ membership: "invite" }), currentState: { getStateEvents: () => [] } }),
           joinRoom,
         }),
       } as unknown as TeleCryptIOStorage;
@@ -1656,7 +1666,7 @@ describe("operation safety", () => {
       userId: "@target:example.test",
       role: "viewer",
     });
-    expect(root.invite).toHaveBeenCalledWith("@target:example.test");
+    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
 
     await expect(unshareVault(storage, root.id, "@target:example.test")).resolves.toEqual({
       vaultId: root.id,
@@ -1686,8 +1696,8 @@ describe("operation safety", () => {
       userId: "@target:example.test",
       role: "viewer",
     });
-    expect(root.invite).toHaveBeenCalledWith("@target:example.test");
-    expect(child.invite).toHaveBeenCalledWith("@target:example.test");
+    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(child.invite).toHaveBeenCalledWith("@target:example.test", false);
   });
 
   it("rejects self-sharing and self-unsharing before a membership mutation", async () => {

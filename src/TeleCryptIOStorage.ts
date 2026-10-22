@@ -2,6 +2,7 @@ import {
   ClientEvent,
   createClient,
   EventType,
+  JoinRule,
   MatrixClient,
   MatrixEvent,
   MatrixError,
@@ -30,6 +31,7 @@ import {
   RecoverySetupError,
   RecoveryRestoreAmbiguousError,
   MutationOutcomeUnknownError,
+  MutationPartialError,
   RoomCreationAmbiguousError,
   RoomCleanupIncompleteError,
   StorageError,
@@ -55,6 +57,7 @@ import { validateName } from "./core/validation.js";
 import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
 import { DecryptionKeySafe, type KeySafePersistenceOptions } from "./key-safe.js";
+import { prepareReaderHistorySharing } from "./sharing.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -478,6 +481,7 @@ interface MatrixMemberEntry {
 }
 
 interface MatrixPowerLevels {
+  state_default?: number;
   users_default?: number;
   events_default?: number;
   events?: Record<string, number>;
@@ -636,7 +640,7 @@ function parseMatrixStateResponse(value: unknown): Record<string, unknown>[] {
 
 function parseMatrixPowerLevels(value: unknown): MatrixPowerLevels {
   if (!isRecord(value)) throw new Error("invalid Matrix power-level response");
-  for (const name of ["users_default", "events_default"]) {
+  for (const name of ["users_default", "events_default", "state_default"]) {
     const field = value[name];
     if (field !== undefined && (typeof field !== "number" || !Number.isFinite(field))) {
       throw new Error("invalid Matrix power-level response");
@@ -1080,6 +1084,11 @@ export class TeleCryptIOStorage {
       },
     );
     const parsedStateEvents = parseMatrixStateResponse(stateEvents);
+    if (await this.repairOwnedTreePermissions(roomId, parsedStateEvents, options)) {
+      // Read the accepted native state back instead of fabricating a local
+      // permission snapshot. An interrupted repair retries on the next load.
+      return this.refreshRoomState(roomId, options);
+    }
     if (typeof room.currentState.setStateEvents === "function") {
       const refreshed = parsedStateEvents.map((event) => new MatrixEvent(event as never));
       // RoomState.setStateEvents overwrites matching tuples, but deliberately
@@ -1111,6 +1120,51 @@ export class TeleCryptIOStorage {
       }
       room.currentState.setStateEvents(refreshed);
     }
+  }
+
+  private async repairOwnedTreePermissions(
+    roomId: string,
+    state: Array<Record<string, unknown>>,
+    options?: MatrixRequestOptions,
+  ): Promise<boolean> {
+    if (isTreeDeleted(this.client, roomId)) return false;
+    const event = (type: string, key = "") => state.find((item) => item.type === type && item.state_key === key);
+    const create = event(EventType.RoomCreate);
+    const purpose = event(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name);
+    if ((create?.content as Record<string, unknown>)?.[RoomCreateTypeField] !== RoomType.Space ||
+        (purpose?.content as Record<string, unknown>)?.[UNSTABLE_MSC3088_ENABLED.name] !== true) return false;
+    const userId = this.client.getUserId();
+    if (!userId || create?.sender !== userId ||
+        (event(EventType.RoomMember, userId)?.content as Record<string, unknown>)?.membership !== "join") {
+      return false;
+    }
+    const rawPower = event(EventType.RoomPowerLevels)?.content;
+    const power = parseMatrixPowerLevels(rawPower);
+    const ownerLevel = power.events?.[EventType.RoomPowerLevels] ?? 100;
+    if ((power.users?.[userId] ?? power.users_default ?? 0) < ownerLevel) return false;
+    const events = { ...power.events };
+    let changed = (power.state_default ?? 50) < 100;
+    for (const type of [EventType.RoomJoinRules, UNSTABLE_MSC3088_PURPOSE.name]) {
+      if (events[type] !== undefined && events[type] < 100) {
+        events[type] = 100;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await withMatrixMutationAbort(() => this.client.sendStateEvent(roomId, EventType.RoomPowerLevels, {
+        ...(rawPower as Record<string, unknown>),
+        state_default: Math.max(power.state_default ?? 50, 100),
+        events,
+      }, ""), matrixRequestSignal(options));
+    }
+    const joinRules = event(EventType.RoomJoinRules)?.content as Record<string, unknown> | undefined;
+    if (joinRules?.join_rule !== "invite") {
+      await withMatrixMutationAbort(() => this.client.sendStateEvent(roomId, EventType.RoomJoinRules, {
+        join_rule: JoinRule.Invite,
+      }, ""), matrixRequestSignal(options));
+      changed = true;
+    }
+    return changed;
   }
 
   /**
@@ -1790,7 +1844,7 @@ export class TeleCryptIOStorage {
         kick: 100,
         ban: 100,
         redact: 100,
-        state_default: 0,
+        state_default: 100,
         events_default: 0,
         users_default: 0,
         events: {
@@ -2078,7 +2132,14 @@ export class TeleCryptIOStorage {
       const tree = this.client.unstableGetFileTreeSpace(
         room.roomId,
       ) as unknown as TreeSpace | null;
-      if (tree) trees.push(this.decorateTreeSpace(tree));
+      if (tree) {
+        // Existing owner sessions repair the persisted permissions on load;
+        // readers never attempt this owner-only mutation.
+        if (this.getStateEvent(room.roomId, EventType.RoomCreate, "")?.getSender() === this.client.getUserId()) {
+          await this.refreshRoomState(room.roomId, { signal });
+        }
+        trees.push(this.decorateTreeSpace(tree));
+      }
     }
     return trees;
   }
@@ -2094,6 +2155,9 @@ export class TeleCryptIOStorage {
       await this.refreshRoomState(parent.id, { signal: effectiveSignal });
       const currentParent = this.getTree(parent.id);
       if (!currentParent) throw new Error("createSubtree: parent is unavailable");
+      const readers = (await this.listMembers(currentParent, { signal: effectiveSignal }))
+        .filter((member) => member.role === "viewer" &&
+          (member.membership === "join" || member.membership === "invite"));
 
       const tree = await this.createTreeSpace(name, "createSubtree", effectiveSignal);
       let parentLinkAttempted = false;
@@ -2153,7 +2217,6 @@ export class TeleCryptIOStorage {
         if (this.client.getRoom(tree.id)) {
           await this.refreshRoomState(tree.id, { signal: effectiveSignal });
         }
-        return tree;
       } catch (error) {
         // Compensation is independent of the caller's cancelled deadline.
         // Reconcile and retry these idempotent relation updates with a fresh
@@ -2263,6 +2326,25 @@ export class TeleCryptIOStorage {
         }
         throw error;
       }
+      // The folder and both links now exist. A failed invitation must leave
+      // that known folder available for reconciliation instead of deleting a
+      // room to which another reader may already have received access.
+      try {
+        for (const reader of readers) {
+          if (effectiveSignal?.aborted) throw new StorageError("operation cancelled");
+          const verifyHistorySharing = await prepareReaderHistorySharing(this.client, reader.userId);
+          await withMatrixMutationAbort(() => tree.invite(reader.userId), effectiveSignal);
+          await verifyHistorySharing();
+        }
+      } catch (error) {
+        throw new MutationPartialError(
+          "create folder",
+          [tree.id],
+          "the folder was created, but reader access is incomplete; retry sharing the parent vault with its readers",
+          { cause: error },
+        );
+      }
+      return tree;
     }, signal);
   }
 

@@ -34,10 +34,60 @@ function storageForTest(rawClient: unknown): TeleCryptIOStorage {
       ? sendStateEvent(roomId, type, content, stateKey)
       : Promise.resolve({});
   });
-  return new TeleCryptIOStorage(client as never);
+  const storage = new TeleCryptIOStorage(client as never);
+  vi.spyOn(storage, "listMembers").mockResolvedValue([]);
+  return storage;
 }
 
 describe("tree mutations", () => {
+  function sharedParent() {
+    const state = { setStateEvents: vi.fn(), getStateEvents: () => [] };
+    const parent = { ...tree("!parent:example.test", "Parent", true), room: { name: "Parent", currentState: state } } as TreeSpace;
+    const child = { ...tree("!child:example.test", "Child", false), room: { name: "Child", currentState: state }, invite: vi.fn().mockResolvedValue(undefined) } as TreeSpace;
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getDomain: () => "example.test",
+      getRoom: (id: string) => id === parent.id ? parent.room : child.room,
+      createRoom: vi.fn(async () => ({ room_id: child.id })),
+      unstableGetFileTreeSpace: (id: string) => id === parent.id ? parent : child,
+      http: { authedRequest: vi.fn(async () => []) },
+      getCrypto: () => ({ getDeviceVerificationStatus: async () => ({ signedByOwner: true }) }),
+      downloadKeysForUsers: vi.fn(async ([id]: string[]) => ({
+        master_keys: { [id]: {} }, self_signing_keys: { [id]: {} }, device_keys: { [id]: { DEVICE: {} } },
+      })),
+      leave: vi.fn(), forget: vi.fn(),
+    };
+    const storage = storageForTest(client);
+    vi.mocked(storage.listMembers).mockResolvedValue([
+      { userId: "@owner:example.test", role: "owner", membership: "join" },
+      { userId: "@reader:example.test", role: "viewer", membership: "join" },
+      { userId: "@invited:example.test", role: "viewer", membership: "invite" },
+      { userId: "@knocking:example.test", role: "viewer", membership: "knock" },
+    ]);
+    return { client, storage, parent, child };
+  }
+
+  it("shares a newly created folder with joined and invited readers using history verification", async () => {
+    const f = sharedParent();
+    await expect(f.storage.createSubtree(f.parent, "Child")).resolves.toBe(f.child);
+    expect(vi.mocked(f.child.invite).mock.calls).toEqual([
+      ["@reader:example.test"], ["@invited:example.test"],
+    ]);
+    expect(f.client.downloadKeysForUsers).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an already created folder and its ID when inherited history sharing fails", async () => {
+    const f = sharedParent();
+    f.client.getCrypto = () => ({ getDeviceVerificationStatus: async () => ({ signedByOwner: false }) });
+    await expect(f.storage.createSubtree(f.parent, "Child")).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL", operation: "create folder", completedIds: [f.child.id],
+      cause: { message: expect.stringContaining("history keys could not be shared") },
+    });
+    expect(f.child.invite).toHaveBeenCalledTimes(1);
+    expect(f.client.leave).not.toHaveBeenCalled();
+    expect(f.client.forget).not.toHaveBeenCalled();
+  });
+
   it("routes createDirectory through the linked-subtree path and refreshes both rooms", async () => {
     const parentRoom = {
       name: "Parent",

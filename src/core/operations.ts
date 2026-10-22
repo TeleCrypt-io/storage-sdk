@@ -42,6 +42,7 @@ import {
 } from "./errors.js";
 import { ConditionTimeoutError, waitForCondition } from "./poll.js";
 import { validateName } from "./validation.js";
+import { prepareReaderHistorySharing } from "../sharing.js";
 import {
   isFileDeleted,
   isTreeDeleted,
@@ -171,6 +172,7 @@ function isRateLimited(error: unknown): boolean {
 function requiresMutationReconciliation(error: unknown): boolean {
   return (
     error instanceof MutationOutcomeUnknownError ||
+    error instanceof MutationPartialError ||
     error instanceof RoomCreationAmbiguousError ||
     error instanceof RoomCleanupIncompleteError
   );
@@ -435,8 +437,17 @@ async function activeTreeDirectories(
       // MSC3089 TreeSpace projection includes that child. Resolve the exact
       // room named by the active relation instead of treating that brief
       // projection lag as corrupt folder state.
+      let joined = false;
       return await waitForCondition(
-        () => storage.getTree(childId),
+        async () => {
+          const directory = storage.getTree(childId);
+          if (directory) return directory;
+          if (!joined && client.getRoom?.(childId)?.getMyMembership?.() === "invite") {
+            await joinTreeRoom(storage, childId, signal ?? new AbortController().signal);
+            joined = true;
+          }
+          return null;
+        },
         { timeoutMs: 15000, signal },
       );
     } catch (error) {
@@ -688,6 +699,63 @@ export function getMyVaultRole(storage: TeleCryptIOStorage, vaultId: string): st
   return tree.getPermissions(userId);
 }
 
+async function joinTreeRoom(
+  storage: TeleCryptIOStorage,
+  vaultId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  let membership: string | null;
+  try {
+    membership = await storage.getRoomMembership(vaultId, undefined, { signal });
+  } catch (err) {
+    if (signal.aborted) throw new StorageError("operation cancelled");
+    // Synapse refuses GET /rooms/:room/members for an invited user with
+    // M_FORBIDDEN. That response means the membership preflight cannot
+    // inspect the room yet; it is not evidence that joining is forbidden.
+    // Attempt the idempotent join and let its own response decide access.
+    if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
+      membership = null;
+    } else {
+      throw new StorageError("join failed", { cause: err });
+    }
+  }
+  if (membership === "join") return;
+  const client = storage.getClient();
+  const userId = client.getUserId();
+  if (userId && client.getRoom(vaultId)?.getMember(userId)?.membership !== "invite") {
+    // MatrixClient.joinRoom reads the inviter from its local invite-room
+    // state. A to-device history bundle can arrive first in the initial
+    // sync, before that stripped invite state has reached the room store;
+    // joining without it skips Matrix JS SDK's pending-bundle acceptance.
+    try {
+      await waitForCondition(
+        () => client.getRoom(vaultId)?.getMember(userId)?.membership === "invite" ? true : null,
+        { timeoutMs: 15000, signal },
+      );
+    } catch (err) {
+      if (signal.aborted) throw new StorageError("operation cancelled");
+      if (err instanceof ConditionTimeoutError) {
+        throw new StorageError("the room invitation has not reached this login yet; retry joining", { cause: err });
+      }
+      throw err;
+    }
+  }
+  try {
+    await withRateLimitRetry(
+      () => withMatrixMutationAbort(() => client.joinRoom(vaultId), signal),
+      signal,
+    );
+  } catch (err) {
+    if (err instanceof MutationOutcomeUnknownError) throw err;
+    if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
+      const afterForbidden = await storage.getRoomMembership(vaultId, undefined, { signal });
+      if (afterForbidden === "join") return;
+    }
+    if (signal.aborted) throw new StorageError("operation cancelled");
+    throw new StorageError("join failed", { cause: err });
+  }
+}
+
 export async function joinVault(
   storage: TeleCryptIOStorage,
   vaultId: string,
@@ -695,57 +763,35 @@ export async function joinVault(
 ): Promise<JoinResult> {
   await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
-    let membership: string | null;
+    const joined = new Set<string>();
+    const pending = [vaultId];
     try {
-      membership = await storage.getRoomMembership(vaultId, undefined, { signal });
-    } catch (err) {
-      if (signal.aborted) throw new StorageError("operation cancelled");
-      // Synapse refuses GET /rooms/:room/members for an invited user with
-      // M_FORBIDDEN. That response means the membership preflight cannot
-      // inspect the room yet; it is not evidence that joining is forbidden.
-      // Attempt the idempotent join and let its own response decide access.
-      if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
-        membership = null;
-      } else {
-        throw new StorageError("join failed", { cause: err });
-      }
-    }
-    if (membership === "join") return { vaultId, joined: true };
-    const client = storage.getClient();
-    const userId = client.getUserId();
-    if (userId && client.getRoom(vaultId)?.getMember(userId)?.membership !== "invite") {
-      // MatrixClient.joinRoom reads the inviter from its local invite-room
-      // state. A to-device history bundle can arrive first in the initial
-      // sync, before that stripped invite state has reached the room store;
-      // joining without it skips Matrix JS SDK's pending-bundle acceptance.
-      try {
-        await waitForCondition(
-          () => client.getRoom(vaultId)?.getMember(userId)?.membership === "invite" ? true : null,
-          { timeoutMs: 15000, signal },
-        );
-      } catch (err) {
-        if (signal.aborted) throw new StorageError("operation cancelled");
-        if (err instanceof ConditionTimeoutError) {
-          throw new StorageError("the room invitation has not reached this login yet; retry joining", { cause: err });
+      while (pending.length > 0) {
+        ensureOperationActive(signal);
+        const roomId = pending.shift()!;
+        if (joined.has(roomId) || isMarkedTreeDeleted(storage, roomId)) continue;
+        // Keep native joinRoom's inviter/history-bundle handling for every
+        // child. Merely joining the root does not accept its child invites.
+        await joinTreeRoom(storage, roomId, signal);
+        joined.add(roomId);
+        await resolveTree(storage, roomId, signal);
+        await storage.refreshRoomState(roomId, { signal });
+        const children = readRelationEvents(storage.getClient(), roomId, EventType.SpaceChild);
+        if (children === null) throw new StorageError("storage folder state is unavailable");
+        for (const child of children) {
+          if (!isActiveRelationEvent(child)) continue;
+          const childId = relationStateKey(child);
+          if (!childId) throw new StorageError("storage folder state is inconsistent");
+          pending.push(childId);
         }
-        throw err;
       }
-    }
-    try {
-      await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => client.joinRoom(vaultId), signal),
-        signal,
-      );
-    } catch (err) {
-      if (err instanceof MutationOutcomeUnknownError) throw err;
-      if (err instanceof MatrixError && err.errcode === "M_FORBIDDEN") {
-        const afterForbidden = await storage.getRoomMembership(vaultId, undefined, { signal });
-        if (afterForbidden === "join") return { vaultId, joined: true };
+    } catch (error) {
+      if (joined.size > 0) {
+        throw new MutationPartialError("join", [...joined],
+          "some folders were joined; retry accepting the same vault to finish", { cause: error });
       }
-      if (signal.aborted) throw new StorageError("operation cancelled");
-      throw new StorageError("join failed", { cause: err });
+      throw error;
     }
-    ensureOperationActive(signal);
     return { vaultId, joined: true };
   }, "mutation");
 }
@@ -962,13 +1008,7 @@ export async function shareVault(
           throw new StorageError("share will not demote an existing owner");
         }
         const client = storage.getClient();
-        const crypto = client.getCrypto();
-        if (!crypto) throw new StorageError("sharing requires initialized encryption");
-        const recipient = await client.downloadKeysForUsers([userId]);
-        const devices = Object.keys(recipient.device_keys?.[userId] ?? {});
-        if (!recipient.master_keys?.[userId] || !recipient.self_signing_keys?.[userId] || devices.length === 0) {
-          throw new StorageError("The reader must set up or unlock their Decryption Key Safe before sharing");
-        }
+        const verifyHistorySharing = await prepareReaderHistorySharing(client, userId);
         for (const [index, space] of spaces.entries()) {
           ensureOperationActive(operation.signal);
           const members =
@@ -993,14 +1033,11 @@ export async function shareVault(
           // invitation. In particular, never swallow a media-upload 403 merely
           // because an invitation already exists.
           await withRateLimitRetry(
-            () => withMatrixMutationAbort(() => space.invite(userId), operation.signal),
+            () => withMatrixMutationAbort(() => space.invite(userId, false), operation.signal),
             operation.signal,
           );
           completedRoomIds.add(space.id);
-          const statuses = await Promise.all(devices.map((id) => crypto.getDeviceVerificationStatus(userId, id)));
-          if (!statuses.some((status) => status?.signedByOwner)) {
-            throw new StorageError("The invitation was sent, but history keys could not be shared; the reader must unlock their Decryption Key Safe, then retry sharing");
-          }
+          await verifyHistorySharing();
         }
         // Storage rooms have one immutable owner power level and readers use
         // the room's default user level. Changing per-user power levels would create editors and
