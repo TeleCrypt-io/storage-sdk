@@ -4,7 +4,8 @@
 // store, same as every other functional test file. See core.test.ts/
 // keys.test.ts for the same pattern.
 import "fake-indexeddb/auto";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { createClient } from "matrix-js-sdk";
 import { registerAndWaitForMasProvisioning } from "../harness/users";
 import { approveDeviceCodeViaHttp } from "../harness/oidcApproval";
 import { waitFor } from "../harness/waitFor";
@@ -71,6 +72,41 @@ async function runDeviceCodeLogin(
 }
 
 describe("OIDC/MAS login", () => {
+  it("renews a rejected media token through MAS and downloads the original encrypted bytes", async () => {
+    const user = await registerOidcTestUser("oidc_media");
+    const deviceId = "OIDCMEDIAREFRESH";
+    const { authMetadata, clientId, result } = await runDeviceCodeLogin(deviceId, user);
+    const storage = await TeleCryptIOStorage.createFromOidc({
+      baseUrl: HOMESERVER, serverName: "localhost:8008",
+      userId: `@${user.localpart}:localhost:8008`, accessToken: result.access_token, deviceId,
+    });
+    try {
+      const tree = await storage.createTree("Media refresh");
+      const bytes = new TextEncoder().encode("encrypted bytes after token renewal");
+      const fileId = await storage.uploadFile(tree, "refresh.txt", bytes.buffer, "text/plain");
+      const event = await storage.getOriginalFileEvent(tree.id, fileId);
+      const persist = vi.fn(async () => undefined);
+      const refresh = vi.fn(oidc.buildTokenRefreshFunction(authMetadata, clientId, persist, deviceId));
+      const mediaClient = createClient({
+        baseUrl: HOMESERVER, userId: `@${user.localpart}:localhost:8008`, deviceId,
+        accessToken: "rejected-media-token", refreshToken: result.refresh_token,
+        tokenRefreshFunction: refresh,
+      });
+      const downloader = new TeleCryptIOStorage(mediaClient);
+      // Metadata has already been decrypted while the session was valid. The
+      // following real media request is the first use of the rejected token.
+      vi.spyOn(downloader, "getOriginalFileEvent").mockResolvedValue(event);
+      const downloaded = await downloader.downloadFile({ id: fileId, roomId: tree.id } as never);
+      expect(new Uint8Array(downloaded.data)).toEqual(bytes);
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(persist).toHaveBeenCalledTimes(1);
+      expect(mediaClient.getAccessToken()).not.toBe("rejected-media-token");
+    } finally {
+      storage.getClient().stopClient();
+      vi.restoreAllMocks();
+    }
+  }, 45_000);
+
   it(
     "O.1 device-code grant end-to-end yields a working token and a usable TeleCryptIOStorage",
     async () => {

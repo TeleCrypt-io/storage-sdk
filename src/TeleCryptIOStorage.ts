@@ -58,6 +58,7 @@ import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
 import { DecryptionKeySafe, type KeySafePersistenceOptions } from "./key-safe.js";
 import { prepareReaderHistorySharing } from "./sharing.js";
+import { deleteOwnedMedia } from "./media.js";
 
 export interface TreeSpace {
   readonly id: string;
@@ -1030,36 +1031,126 @@ export class TeleCryptIOStorage {
     additionalContent?: Record<string, unknown>,
   ): Promise<{ event_id: string }> {
     validateFileName(name);
+    // Authoritative room refresh also repairs legacy owner permissions before
+    // publishing new encrypted content to an existing vault.
+    await this.refreshRoomState(treeId);
     const bytes = encryptedContents instanceof Uint8Array
       ? encryptedContents
       : new Uint8Array(encryptedContents);
     const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const uploaded = await this.client.uploadContent(body, { includeFilename: false });
-    if (typeof uploaded.content_uri !== "string" || uploaded.content_uri.length === 0) {
-      throw new StorageError("encrypted media upload returned no content URI");
+    let mediaId: string | undefined;
+    let fileId: string | undefined;
+    try {
+      const uploaded = await this.client.uploadContent(body, { includeFilename: false });
+      if (typeof uploaded.content_uri !== "string" || uploaded.content_uri.length === 0) {
+        throw new StorageError("encrypted media upload returned no content URI");
+      }
+      mediaId = uploaded.content_uri;
+      const fileContent: Record<string, unknown> = {
+        ...additionalContent,
+        msgtype: MsgType.File,
+        body: name,
+        url: mediaId,
+        file: { ...info, url: mediaId },
+        [UNSTABLE_MSC3089_LEAF.name]: {},
+      };
+      const sent = await this.client.sendMessage(treeId, fileContent as never);
+      fileId = validateMatrixEventId(
+        (sent as unknown as { event_id?: unknown } | undefined)?.event_id,
+        "file upload response event ID",
+      );
+      await this.client.sendStateEvent(
+        treeId,
+        UNSTABLE_MSC3089_BRANCH.name,
+        { active: true, metadata_event_id: fileId } as never,
+        fileId,
+      );
+      this.fileNames.set(this.fileNameKey(treeId, fileId), name);
+      return { event_id: fileId };
+    } catch (error) {
+      const rejected = error instanceof MatrixError &&
+        error.httpStatus !== undefined && error.httpStatus >= 400 && error.httpStatus < 500 && error.httpStatus !== 408;
+      if (!mediaId) {
+        if (rejected) throw error;
+        throw new MutationOutcomeUnknownError("file upload", { cause: error });
+      }
+      let cause = error;
+      if (rejected) {
+        try {
+          await this.cleanupFileUpload(treeId, mediaId, fileId);
+        } catch (cleanupError) {
+          cause = new AggregateError([error, cleanupError], "file upload failed and cleanup is incomplete");
+        }
+        if (cause === error) {
+          throw new StorageError("file upload was rejected; uploaded media and attachment were removed", { cause: error });
+        }
+      }
+      throw new MutationPartialError(
+        "file upload",
+        fileId ? [mediaId, fileId] : [mediaId],
+        `upload outcome needs reconciliation in ${treeId}; keep these media and attachment IDs and use cleanupFileUpload before uploading again`,
+        { cause, treeId },
+      );
     }
-    const fileInfo = { ...info, url: uploaded.content_uri };
-    const fileContent: Record<string, unknown> = {
-      ...additionalContent,
-      msgtype: MsgType.File,
-      body: name,
-      url: uploaded.content_uri,
-      file: fileInfo,
-      [UNSTABLE_MSC3089_LEAF.name]: {},
-    };
-    const sent = await this.client.sendMessage(treeId, fileContent as never);
-    const fileEventId = validateMatrixEventId(
-      (sent as unknown as { event_id?: unknown } | undefined)?.event_id,
-      "file upload response event ID",
-    );
-    await this.client.sendStateEvent(
-      treeId,
-      UNSTABLE_MSC3089_BRANCH.name,
-      { active: true, metadata_event_id: fileEventId } as never,
-      fileEventId,
-    );
-    this.fileNames.set(this.fileNameKey(treeId, fileEventId), name);
-    return { event_id: fileEventId };
+  }
+
+  /**
+   * Discards a partial upload using its MutationPartialError.completedIds:
+   * [mediaId, fileId?]. Explicit cleanup also covers an unacknowledged listing.
+   * Keep the same IDs after failure and retry this operation, not the upload.
+   */
+  async cleanupFileUpload(
+    treeId: string,
+    mediaId: string,
+    fileId?: string,
+    options?: MatrixRequestOptions,
+  ): Promise<void> {
+    validateMatrixRoomId(treeId);
+    if (!/^mxc:\/\/[^/]+\/[^/?#]+$/u.test(mediaId)) throw new StorageError("invalid media identifier");
+    if (fileId !== undefined) validateMatrixEventId(fileId, "file upload event ID");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), matrixRequestTimeout(options));
+    const abort = (): void => controller.abort(options?.signal?.reason);
+    if (options?.signal?.aborted) abort();
+    else options?.signal?.addEventListener("abort", abort, { once: true });
+    try {
+      await raceWithAbort((async () => {
+        if (controller.signal.aborted) throw new StorageError("operation cancelled");
+        let attachment: MatrixEvent | undefined;
+        let listing: MatrixEvent | null = null;
+        if (fileId) {
+          const raw = await this.client.fetchRoomEvent(treeId, fileId);
+          attachment = this.client.getEventMapper()(raw);
+          await this.client.decryptEventIfNeeded(attachment);
+          const content = attachment.getContent();
+          if (attachment.getId() !== fileId || attachment.getRoomId() !== treeId ||
+            attachment.getSender() !== this.client.getUserId() ||
+            (!attachment.isRedacted() && (attachment.getWireType() !== EventType.RoomMessageEncrypted ||
+              attachment.getType() !== EventType.RoomMessage || content.msgtype !== MsgType.File ||
+              !isRecord(content.file) || content.file.url !== mediaId))) {
+            throw new StorageError("partial upload attachment does not match the current user and media");
+          }
+          await this.refreshRoomState(treeId, { signal: controller.signal });
+          listing = this.getStateEvent(treeId, UNSTABLE_MSC3089_BRANCH.name, fileId);
+          if (listing && !listing.isRedacted() &&
+            (listing.getSender() !== this.client.getUserId() || listing.getContent().metadata_event_id !== fileId)) {
+            throw new StorageError("file changed after upload; use ordinary file deletion");
+          }
+        }
+        if (controller.signal.aborted) throw new StorageError("operation cancelled");
+        await deleteOwnedMedia(this.client, [mediaId], controller.signal);
+        if (listing && !listing.isRedacted()) {
+          await withMatrixMutationAbort(() => this.client.redactEvent(treeId, listing!.getId()!), controller.signal);
+        }
+        if (attachment && !attachment.isRedacted()) {
+          await withMatrixMutationAbort(() => this.client.redactEvent(treeId, fileId!), controller.signal);
+        }
+        if (fileId) this.fileNames.delete(this.fileNameKey(treeId, fileId));
+      })(), controller.signal, () => new MutationOutcomeUnknownError("file upload cleanup"));
+    } finally {
+      clearTimeout(timeout);
+      options?.signal?.removeEventListener("abort", abort);
+    }
   }
 
   /**
@@ -2477,11 +2568,14 @@ export class TeleCryptIOStorage {
         "file upload",
       );
     } catch (error) {
-      // A transport failure after the encrypted event was submitted cannot be
-      // distinguished from a failure before commit. Do not let a caller retry
-      // this operation and create a duplicate file; only the explicit typed
-      // mutation outcome is safe to propagate unchanged.
-      if (error instanceof MutationOutcomeUnknownError) throw error;
+      // Preserve acknowledged upload stages, including when cancellation
+      // arrived while the individual mutation was settling.
+      if (error instanceof MutationOutcomeUnknownError && error.cause instanceof MutationPartialError) {
+        throw error.cause;
+      }
+      if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
+      if (error instanceof StorageError || error instanceof MatrixError) throw error;
+      // An unclassified transport failure can still follow a committed event.
       throw new MutationOutcomeUnknownError("file upload", { cause: error });
     }
     if (signal?.aborted) throw new StorageError("operation cancelled");
@@ -2530,7 +2624,7 @@ export class TeleCryptIOStorage {
       getAccessToken: () => string | null;
       getHomeserverUrl: () => string;
     };
-    const accessToken = clientAny.getAccessToken();
+    let accessToken = clientAny.getAccessToken();
     validateMatrixToken(accessToken);
     let trustedOrigin: string;
     try {
@@ -2570,6 +2664,7 @@ export class TeleCryptIOStorage {
     if (signal?.aborted) abortExternal();
     else signal?.addEventListener("abort", abortExternal, { once: true });
     let ciphertext: ArrayBuffer;
+    let retriedAuthentication = false;
     try {
       for (;;) {
         const res = await raceWithAbort(
@@ -2616,13 +2711,21 @@ export class TeleCryptIOStorage {
         if (!res.ok) {
           const statusFailure = new Error(`media download failed: ${res.status}`);
           let detail = "";
+          let unknownToken = false;
           try {
             // Error responses are diagnostics, not product media. Consume the
             // complete body so no provider detail is discarded, then apply
             // the SDK's shared secret/control-character sanitizer before it
             // crosses the SDK boundary.
             const body = await readResponseBody(res, controller.signal);
-            detail = sanitizeDiagnosticText(new TextDecoder().decode(body.bytes));
+            const responseText = new TextDecoder().decode(body.bytes);
+            detail = sanitizeDiagnosticText(responseText);
+            if (res.status === 401) {
+              try {
+                const errorBody: unknown = JSON.parse(responseText);
+                unknownToken = isRecord(errorBody) && errorBody.errcode === "M_UNKNOWN_TOKEN";
+              } catch { /* Non-Matrix errors retain the complete diagnostic below. */ }
+            }
           } catch (bodyError) {
             const partial =
               bodyError instanceof ResponseBodyReadError
@@ -2640,6 +2743,24 @@ export class TeleCryptIOStorage {
               "media download failed while reading the response body",
               { cause: statusFailure },
             );
+          }
+          if (unknownToken && !retriedAuthentication) {
+            retriedAuthentication = true;
+            // Matrix's authenticated transport owns token refresh, including
+            // concurrent refreshes and persistence. Its media request path
+            // buffers the whole body and follows redirects, so use a small
+            // authenticated read to renew the session, then retry our bounded
+            // streaming download once with the current token.
+            await raceWithAbort(
+              this.client.whoami(),
+              controller.signal,
+              () => signal?.aborted
+                ? new StorageError("operation cancelled")
+                : new Error("media download timed out"),
+            );
+            accessToken = clientAny.getAccessToken();
+            validateMatrixToken(accessToken);
+            continue;
           }
           throw new Error(`${statusFailure.message}${detail === "" ? "" : `: ${detail}`}`);
         }

@@ -83,6 +83,15 @@ and a per-file key distributed through the room's Megolm session). The server st
 media and Matrix events, but encryption does not hide all room, event, or other metadata from the
 server or users who can read the room.
 
+If an upload is rejected after media was accepted, the SDK removes that media and any acknowledged
+attachment. A transport failure leaves accepted work intact. An upload `MutationPartialError`
+retains `treeId` and `completedIds` in the order `[mediaId, attachmentEventId?]`. Keep those IDs;
+do not repeat the upload blindly. To discard the partial upload, call
+`core.cleanupFileUpload(storage, error.treeId, error.completedIds[0], error.completedIds[1])`.
+Retry cleanup with the same IDs if it fails. A known attachment ID can also be passed to ordinary
+`core.deleteFile` even when its listing was never committed. An initial media response lost before
+the server returns any identifier still has an unknown outcome and cannot provide cleanup IDs.
+
 The Decryption Key Safe is mandatory before the public core storage operations. Inspect
 `storage.keySafe.getStatus(signal?)`. For `setup-required`, call `setup(signal?)`, offer the returned
 `recoveryKey` for copying/saving, explain that losing both this key and local decryption keys can

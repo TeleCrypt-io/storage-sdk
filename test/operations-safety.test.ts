@@ -338,6 +338,16 @@ describe("operation safety", () => {
     expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(true);
   });
 
+  it("deletes an acknowledged attachment whose upload listing was never committed", async () => {
+    const fixture = deletionFixture();
+    vi.mocked(fixture.tree.getFile).mockReturnValue(null);
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({ id: "$v1", deleted: true });
+    expect(fixture.client.redactEvent.mock.calls).toEqual([[fixture.tree.id, "$v1"]]);
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({ id: "$v1", deleted: true });
+    expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
+  });
+
   it("serializes media deletion as JSON and accepts an empty 204 response", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
       return new Response(null, { status: 204 });

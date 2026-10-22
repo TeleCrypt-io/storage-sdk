@@ -28,8 +28,7 @@ import {
   UNSTABLE_MSC3089_TREE_SUBTYPE,
   type MatrixClient,
 } from "matrix-js-sdk";
-import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
-import { Method } from "matrix-js-sdk/lib/http-api/method.js";
+import { deleteOwnedMedia } from "../media.js";
 import { validateMatrixEventId } from "./constants.js";
 import {
   FileTooLargeError,
@@ -1421,43 +1420,17 @@ export async function renameFile(
   }, "mutation");
 }
 
-interface FileDeletionHttpTransport {
-  authedRequest: <T>(
-    method: Method,
-    path: string,
-    query?: undefined,
-    body?: unknown,
-    options?: { prefix?: string; rawResponseBody?: boolean; abortSignal?: AbortSignal },
-  ) => Promise<T>;
-}
-
-function requireFileDeletionTransport(client: MatrixClient): FileDeletionHttpTransport {
-  const http = (client as unknown as { http?: FileDeletionHttpTransport }).http;
-  if (!http || typeof http.authedRequest !== "function") {
-    throw new StorageError("Matrix HTTP transport unavailable");
-  }
-  return http;
-}
-
 async function deleteFileMedia(
   storage: TeleCryptIOStorage,
   mediaIds: readonly string[],
   signal?: AbortSignal,
 ): Promise<void> {
   const client = storage.getClient();
-  const http = requireFileDeletionTransport(client);
   try {
     await withRateLimitRetry(
       () =>
         withMatrixMutationAbort(
-          () =>
-            http.authedRequest(
-              Method.Post,
-              "/io.telecrypt.storage/delete_media",
-              undefined,
-              { media_ids: [...mediaIds] },
-              { prefix: ClientPrefix.Unstable, rawResponseBody: true, abortSignal: signal },
-            ),
+          () => deleteOwnedMedia(client, mediaIds, signal),
           signal,
           "delete file media",
         ),
@@ -1482,7 +1455,6 @@ export async function deleteFile(
     if (isMarkedFileDeleted(storage, tree.id, fileId)) return { id: fileId, deleted: true };
     await storage.refreshRoomState(treeId, { signal });
     const branch = tree.getFile(fileId);
-    if (!branch) throw new StorageError("file not found");
 
     let originalEvent;
     try {
@@ -1491,7 +1463,7 @@ export async function deleteFile(
       throw new StorageError("could not resolve encrypted file safely", { cause: error });
     }
     if (originalEvent.isRedacted()) {
-      if (branch.isActive === false) {
+      if (!branch || branch.isActive === false) {
         markFileDeleted(storage.getClient(), tree.id, fileId);
         return { id: fileId, deleted: true };
       }
@@ -1517,7 +1489,9 @@ export async function deleteFile(
     const completedIds: string[] = [mediaId];
     try {
       const client = storage.getClient();
-      const metadataEventId = await storage.getFileMetadataEventId(tree.id, fileId, { signal });
+      const metadataEventId = branch
+        ? await storage.getFileMetadataEventId(tree.id, fileId, { signal })
+        : null;
       if (metadataEventId && metadataEventId !== fileId) {
         const metadataEvent = await storage.getFileRenameMetadataEvent(
           tree.id,
@@ -1540,23 +1514,23 @@ export async function deleteFile(
       const currentBranch = tree.getFile(fileId);
       const indexEvent = currentBranch?.indexEvent;
       const listingEventId = indexEvent?.getId();
-      if (!indexEvent || typeof listingEventId !== "string" || listingEventId.length === 0) {
+      if (currentBranch && (!indexEvent || typeof listingEventId !== "string" || listingEventId.length === 0)) {
         throw new StorageError("encrypted file has no listing event identifier");
       }
-      if (!indexEvent.isRedacted()) {
+      if (indexEvent && !indexEvent.isRedacted()) {
         if (indexEvent.getSender() !== client.getUserId()) {
           throw new StorageError("file listing was not authored by the owner");
         }
         await withRateLimitRetry(
           () => withMatrixMutationAbort(
-            () => client.redactEvent(tree.id, listingEventId),
+            () => client.redactEvent(tree.id, listingEventId!),
             signal,
             "delete file listing",
           ),
           signal,
         );
       }
-      completedIds.push(listingEventId);
+      if (listingEventId) completedIds.push(listingEventId);
 
       await withRateLimitRetry(
         () => withMatrixMutationAbort(
@@ -1614,7 +1588,7 @@ export async function uploadFile(
       signal,
     ).catch((error) => {
       if (error instanceof FileTooLargeError) throw error;
-      if (error instanceof MutationOutcomeUnknownError) throw error;
+      if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("upload failed", { cause: error });
     });
@@ -1645,6 +1619,20 @@ export async function uploadFile(
     }
     ensureOperationActive(signal);
     return { id: fileId, name, mimetype };
+  }, "mutation");
+}
+
+/** Discard the acknowledged stages of a failed upload using its retained IDs. */
+export async function cleanupFileUpload(
+  storage: TeleCryptIOStorage,
+  treeId: string,
+  mediaId: string,
+  fileId?: string,
+  options?: OperationOptions,
+): Promise<void> {
+  await storage.keySafe.requireReady({ signal: options?.signal });
+  return withOperationDeadline(options, async (signal) => {
+    await storage.cleanupFileUpload(treeId, mediaId, fileId, { signal });
   }, "mutation");
 }
 

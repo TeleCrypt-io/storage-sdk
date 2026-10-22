@@ -85,17 +85,19 @@ export class MutationOutcomeUnknownError extends StorageError {
   }
 }
 
-/** A multi-room mutation committed some work before a later step failed. */
+/** A multi-step mutation committed some work before a later step failed. */
 export class MutationPartialError extends StorageError {
   readonly code = "MUTATION_PARTIAL" as const;
   readonly operation: string;
   readonly completedIds: readonly string[];
+  /** Room containing the partial mutation, when the operation can target a nested folder. */
+  readonly treeId?: string;
 
   constructor(
     operation: string,
     completedIds: readonly string[],
     detail?: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { treeId?: string },
   ) {
     super(
       `${operation} failed after partial completion${detail ? `: ${detail}` : ""}; retry to reconcile current state`,
@@ -104,6 +106,7 @@ export class MutationPartialError extends StorageError {
     this.name = "MutationPartialError";
     this.operation = operation;
     this.completedIds = [...completedIds];
+    this.treeId = options?.treeId;
   }
 }
 
