@@ -105,6 +105,12 @@ room keys and signs the current login using the existing account keys. Normal us
 Setup and restore never replace an existing safe or account signing identity. Resetting the account
 password cannot recover encrypted files.
 
+Short-lived clients should call `storage.waitForKeyBackup(treeId, fileId?, options?)` after creating
+or renaming encrypted metadata and before closing. Omit `fileId` for a vault or folder. This checks
+the exact encryption session in the active server backup, including reused keys that produce no
+new backup-progress event. If verification fails, retain the local profile and retry backup;
+the metadata mutation has already committed.
+
 Pending setup state is kept beside the login's IndexedDB crypto data. A platform that snapshots
 IndexedDB to disk, such as the CLI, must supply `onKeySafeStateChanged` at creation and durably flush
 its snapshot before resolving that callback. Key Safe methods accept an optional `AbortSignal`.
