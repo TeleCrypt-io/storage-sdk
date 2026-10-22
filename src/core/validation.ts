@@ -1,3 +1,12 @@
+import {
+  EventType,
+  RoomCreateTypeField,
+  RoomType,
+  UNSTABLE_MSC3088_ENABLED,
+  UNSTABLE_MSC3088_PURPOSE,
+  UNSTABLE_MSC3089_TREE_SUBTYPE,
+} from "matrix-js-sdk";
+
 /** Shared name contract used by SDK inputs and remote projections. */
 
 export function isValidName(value: unknown): value is string {
@@ -12,4 +21,51 @@ export function validateName(value: unknown, label: string): asserts value is st
   if (!isValidName(value)) {
     throw new Error(`invalid ${label}`);
   }
+}
+
+export const STORAGE_ROOM_ENCRYPTION_ALGORITHM = "m.megolm.v1.aes-sha2";
+
+interface StorageTreeRoomLike {
+  currentState?: {
+    getStateEvents?: (eventType: string, stateKey?: string) => unknown;
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The shared Storage-room contract for both synced rooms and refreshed state. */
+export function isStorageTreeState(
+  createContent: unknown,
+  purposeContent: unknown,
+  encryptionContent: unknown,
+): boolean {
+  return (
+    isRecord(createContent) &&
+    createContent[RoomCreateTypeField] === RoomType.Space &&
+    isRecord(purposeContent) &&
+    purposeContent[UNSTABLE_MSC3088_ENABLED.name] === true &&
+    isRecord(encryptionContent) &&
+    encryptionContent.algorithm === STORAGE_ROOM_ENCRYPTION_ALGORITHM
+  );
+}
+
+/** Checks the existing Storage markers and Megolm room encryption together. */
+export function isStorageTreeRoom(room: StorageTreeRoomLike | null | undefined): boolean {
+  const getContent = (eventType: string, stateKey: string): unknown => {
+    const raw = room?.currentState?.getStateEvents?.(eventType, stateKey);
+    const event = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof event !== "object" || event === null) return undefined;
+    const getEventContent = (event as { getContent?: unknown }).getContent;
+    return typeof getEventContent === "function"
+      ? getEventContent.call(event)
+      : undefined;
+  };
+
+  return isStorageTreeState(
+    getContent(EventType.RoomCreate, ""),
+    getContent(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name),
+    getContent(EventType.RoomEncryption, ""),
+  );
 }

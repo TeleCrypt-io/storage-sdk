@@ -21,11 +21,6 @@ import {
 import {
   EventType,
   MatrixError,
-  RoomCreateTypeField,
-  RoomType,
-  UNSTABLE_MSC3088_ENABLED,
-  UNSTABLE_MSC3088_PURPOSE,
-  UNSTABLE_MSC3089_TREE_SUBTYPE,
   type MatrixClient,
 } from "matrix-js-sdk";
 import { deleteOwnedMedia } from "../media.js";
@@ -40,7 +35,7 @@ import {
   StorageError,
 } from "./errors.js";
 import { ConditionTimeoutError, waitForCondition } from "./poll.js";
-import { validateName } from "./validation.js";
+import { isStorageTreeRoom, validateName } from "./validation.js";
 import { prepareReaderHistorySharing } from "../sharing.js";
 import {
   isFileDeleted,
@@ -811,25 +806,6 @@ function hasActiveSpaceParent(room: {
   return events.some((event) => isActiveRelationEvent(event as RelationEvent));
 }
 
-function isReviewedStorageTreeRoom(room: {
-  currentState?: { getStateEvents?: (eventType: string, stateKey?: string) => unknown };
-} | null | undefined): boolean {
-  const createEvent = room?.currentState?.getStateEvents?.(EventType.RoomCreate, "") as
-    | { getContent?: () => unknown }
-    | null
-    | undefined;
-  const createContent = createEvent?.getContent?.() as Record<string, unknown> | undefined;
-  const purposeEvent = room?.currentState?.getStateEvents?.(
-    UNSTABLE_MSC3088_PURPOSE.name,
-    UNSTABLE_MSC3089_TREE_SUBTYPE.name,
-  ) as { getContent?: () => unknown } | null | undefined;
-  const purposeContent = purposeEvent?.getContent?.() as Record<string, unknown> | undefined;
-  return (
-    createContent?.[RoomCreateTypeField] === RoomType.Space &&
-    purposeContent?.[UNSTABLE_MSC3088_ENABLED.name] === true
-  );
-}
-
 /** Rooms where this account is invited and the room looks like a file tree. */
 export async function listPendingInvites(
   storage: TeleCryptIOStorage,
@@ -860,7 +836,7 @@ export async function listPendingInvites(
 
       // Invite state may not have MSC3089 tree metadata yet — accept rooms whose
       // create event marks them as a file tree space.
-      if (isReviewedStorageTreeRoom(room)) {
+      if (isStorageTreeRoom(room)) {
         invites.push({
           id: room.roomId,
           name: roomDisplayName(storage, room.roomId),
@@ -906,7 +882,7 @@ export async function declineInvite(
       if (
         !currentRoom ||
         hasActiveSpaceParent(currentRoom) ||
-        !isReviewedStorageTreeRoom(currentRoom)
+        !isStorageTreeRoom(currentRoom)
       ) {
         throw new StorageError("decline failed");
       }

@@ -53,7 +53,12 @@ import {
   ResponseBodyReadError,
 } from "./core/http.js";
 import { sanitizeDiagnosticText } from "./core/oidc.js";
-import { validateName } from "./core/validation.js";
+import {
+  isStorageTreeRoom,
+  isStorageTreeState,
+  STORAGE_ROOM_ENCRYPTION_ALGORITHM,
+  validateName,
+} from "./core/validation.js";
 import { ConditionTimeoutError, waitForCondition } from "./core/poll.js";
 import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
@@ -796,11 +801,19 @@ export class TeleCryptIOStorage {
     roomId: string,
     content: MetadataEventContent,
   ): Promise<string> {
+    await this.refreshRoomState(roomId);
+    this.requireEncryptedStorageRoom(roomId);
     const response = await this.client.sendMessage(roomId, content as never);
     return validateMatrixEventId(
       (response as unknown as { event_id?: unknown } | undefined)?.event_id,
       "storage metadata response event ID",
     );
+  }
+
+  private requireEncryptedStorageRoom(roomId: string): void {
+    if (!isStorageTreeRoom(this.client.getRoom(roomId))) {
+      throw new StorageError("storage room encryption is unavailable or unsupported");
+    }
   }
 
   private async readEncryptedMetadataMessage(
@@ -925,7 +938,7 @@ export class TeleCryptIOStorage {
           }
           const wire = event.getWireContent();
           if (event.isRedacted() || event.isDecryptionFailure() ||
-            wire.algorithm !== "m.megolm.v1.aes-sha2" || typeof wire.session_id !== "string" || !wire.session_id) {
+            wire.algorithm !== STORAGE_ROOM_ENCRYPTION_ALGORITHM || typeof wire.session_id !== "string" || !wire.session_id) {
             throw new StorageError("encrypted storage session is unavailable");
           }
           sessionId = wire.session_id;
@@ -1114,6 +1127,7 @@ export class TeleCryptIOStorage {
     // publishing new encrypted content to an existing vault.
     await this.refreshRoomState(treeId, { signal });
     if (signal?.aborted) throw new StorageError("operation cancelled");
+    this.requireEncryptedStorageRoom(treeId);
     const bytes = encryptedContents instanceof Uint8Array
       ? encryptedContents
       : new Uint8Array(encryptedContents);
@@ -1305,8 +1319,8 @@ export class TeleCryptIOStorage {
     const event = (type: string, key = "") => state.find((item) => item.type === type && item.state_key === key);
     const create = event(EventType.RoomCreate);
     const purpose = event(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name);
-    if ((create?.content as Record<string, unknown>)?.[RoomCreateTypeField] !== RoomType.Space ||
-        (purpose?.content as Record<string, unknown>)?.[UNSTABLE_MSC3088_ENABLED.name] !== true) return false;
+    const encryption = event(EventType.RoomEncryption);
+    if (!isStorageTreeState(create?.content, purpose?.content, encryption?.content)) return false;
     const userId = this.client.getUserId();
     if (!userId || create?.sender !== userId ||
         (event(EventType.RoomMember, userId)?.content as Record<string, unknown>)?.membership !== "join") {
@@ -2047,7 +2061,7 @@ export class TeleCryptIOStorage {
         {
           type: EventType.RoomEncryption,
           state_key: "",
-          content: { algorithm: "m.megolm.v1.aes-sha2" },
+          content: { algorithm: STORAGE_ROOM_ENCRYPTION_ALGORITHM },
         },
       ],
     };
@@ -2064,7 +2078,9 @@ export class TeleCryptIOStorage {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       try {
         const tree = this.client.unstableGetFileTreeSpace(roomId) as unknown as TreeSpace | null;
-        if (tree) return this.decorateTreeSpace(tree);
+        if (tree && isStorageTreeRoom(this.client.getRoom(roomId))) {
+          return this.decorateTreeSpace(tree);
+        }
       } catch (error) {
         lastError = error;
         // The room can be present before its complete state has been applied
@@ -2103,6 +2119,9 @@ export class TeleCryptIOStorage {
     this.decoratedTreeSpaces.add(tree as object);
 
     const originalGetDirectories = tree.getDirectories.bind(tree);
+    const originalGetDirectory = typeof tree.getDirectory === "function"
+      ? tree.getDirectory.bind(tree)
+      : undefined;
     const originalListFiles = typeof tree.listFiles === "function"
       ? tree.listFiles.bind(tree)
       : () => [];
@@ -2110,7 +2129,22 @@ export class TeleCryptIOStorage {
       ? tree.getFile.bind(tree)
       : () => null;
     tree.getDirectories = () =>
-      originalGetDirectories().map((child) => this.decorateTreeSpace(child));
+      originalGetDirectories()
+        .filter((child) =>
+          !isTreeDeleted(this.client, child.id) &&
+          isStorageTreeRoom(this.client.getRoom(child.id)),
+        )
+        .map((child) => this.decorateTreeSpace(child));
+    if (originalGetDirectory) {
+      tree.getDirectory = (roomId: string) => {
+        const child = originalGetDirectory(roomId);
+        return child &&
+          !isTreeDeleted(this.client, child.id) &&
+          isStorageTreeRoom(this.client.getRoom(child.id))
+          ? this.decorateTreeSpace(child)
+          : undefined;
+      };
+    }
     tree.createDirectory = (name: string) => this.createSubtree(tree, name);
     tree.setName = (name: string) => this.writeTreeName(tree.id, name);
     tree.listFiles = () => originalListFiles().map((branch) => this.decorateFileBranch(tree.id, branch));
@@ -2303,16 +2337,15 @@ export class TeleCryptIOStorage {
     for (const room of rooms) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       if (isTreeDeleted(this.client, room.roomId)) continue;
-      const tree = this.client.unstableGetFileTreeSpace(
-        room.roomId,
-      ) as unknown as TreeSpace | null;
+      let tree = this.getTree(room.roomId);
       if (tree) {
         // Existing owner sessions repair the persisted permissions on load;
         // readers never attempt this owner-only mutation.
         if (this.getStateEvent(room.roomId, EventType.RoomCreate, "")?.getSender() === this.client.getUserId()) {
           await this.refreshRoomState(room.roomId, { signal });
+          tree = this.getTree(room.roomId);
         }
-        trees.push(this.decorateTreeSpace(tree));
+        if (tree) trees.push(tree);
       }
     }
     return trees;
@@ -2524,6 +2557,7 @@ export class TeleCryptIOStorage {
 
   getTree(roomId: string): TreeSpace | null {
     if (isTreeDeleted(this.client, roomId)) return null;
+    if (!isStorageTreeRoom(this.client.getRoom(roomId))) return null;
     const tree = this.client.unstableGetFileTreeSpace(
       roomId,
     ) as unknown as TreeSpace | null;

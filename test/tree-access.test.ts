@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { EventType, MatrixEvent, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
+import { EventType, MatrixEvent, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
 import { TeleCryptIOStorage, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 import { joinVault, listSubfolders } from "../src/core/operations.js";
 import { markTreeDeleted } from "../src/deletion-markers.js";
@@ -12,6 +12,7 @@ function permissionFixture(userId = owner) {
   const state = [
     { type: EventType.RoomCreate, state_key: "", sender: owner, content: { type: "m.space" } },
     { type: UNSTABLE_MSC3088_PURPOSE.name, state_key: UNSTABLE_MSC3089_TREE_SUBTYPE.name, content: { [UNSTABLE_MSC3088_ENABLED.name]: true } },
+    { type: EventType.RoomEncryption, state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } },
     { type: EventType.RoomMember, state_key: owner, content: { membership: "join" } },
     { type: EventType.RoomPowerLevels, state_key: "", content: {
       state_default: 0, events_default: 0, users_default: 0, invite: 100,
@@ -59,6 +60,20 @@ describe("existing Storage permissions", () => {
     expect(f.client.sendStateEvent).not.toHaveBeenCalled();
   });
 
+  it.each(["missing", "unsupported"])("does not repair owner permissions when encryption is %s", async (encryption) => {
+    const f = permissionFixture();
+    const encryptionEvent = f.state.find((event) => event.type === EventType.RoomEncryption)!;
+    if (encryption === "missing") {
+      f.state.splice(f.state.indexOf(encryptionEvent), 1);
+    } else {
+      encryptionEvent.content = { algorithm: "m.megolm.v1.aes-ctr" };
+    }
+
+    await f.storage.refreshRoomState(roomId);
+
+    expect(f.client.sendStateEvent).not.toHaveBeenCalled();
+  });
+
   it("does not restore disabled Storage markers or deleted trees", async () => {
     const f = permissionFixture();
     const purpose = f.state.find((event) => event.type === UNSTABLE_MSC3088_PURPOSE.name)!;
@@ -79,6 +94,78 @@ describe("existing Storage permissions", () => {
     await f.storage.refreshRoomState(roomId);
     expect(f.client.sendStateEvent.mock.calls.filter((call) => call[1] === EventType.RoomPowerLevels)).toHaveLength(1);
     expect(f.state.find((event) => event.type === EventType.RoomJoinRules)?.content).toEqual({ join_rule: "invite" });
+  });
+});
+
+function storageRoom(roomId: string, algorithm?: string) {
+  const events = new Map<string, { getContent: () => Record<string, unknown>; getSender: () => string }>();
+  const put = (type: string, stateKey: string, content: Record<string, unknown>, sender = owner) =>
+    events.set(`${type}\u0000${stateKey}`, { getContent: () => content, getSender: () => sender });
+  put(EventType.RoomCreate, "", { [RoomCreateTypeField]: RoomType.Space });
+  put(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name, {
+    [UNSTABLE_MSC3088_ENABLED.name]: true,
+  });
+  if (algorithm !== undefined) put(EventType.RoomEncryption, "", { algorithm });
+  return {
+    roomId,
+    currentState: {
+      getStateEvents: (type: string, stateKey = "") => events.get(`${type}\u0000${stateKey}`) ?? null,
+    },
+  };
+}
+
+function projectedTree(id: string, directories: TreeSpace[] = [], isTopLevel = true): TreeSpace {
+  return {
+    id,
+    room: { name: "Encrypted storage" },
+    isTopLevel,
+    getDirectories: () => directories,
+    getDirectory: (roomId: string) => directories.find((directory) => directory.id === roomId),
+  } as unknown as TreeSpace;
+}
+
+describe("encrypted Storage room discovery", () => {
+  it("requires Megolm encryption for direct, top-level, and nested discovery", async () => {
+    const rootId = "!root:example.test";
+    const validChildId = "!valid-child:example.test";
+    const missingChildId = "!missing-child:example.test";
+    const unsupportedChildId = "!unsupported-child:example.test";
+    const validChild = projectedTree(validChildId, [], false);
+    const missingChild = projectedTree(missingChildId, [], false);
+    const unsupportedChild = projectedTree(unsupportedChildId, [], false);
+    const root = projectedTree(rootId, [validChild, missingChild, unsupportedChild]);
+    const rooms = new Map([
+      [rootId, storageRoom(rootId, "m.megolm.v1.aes-sha2")],
+      [validChildId, storageRoom(validChildId, "m.megolm.v1.aes-sha2")],
+      [missingChildId, storageRoom(missingChildId)],
+      [unsupportedChildId, storageRoom(unsupportedChildId, "m.megolm.v1.aes-ctr")],
+    ]);
+    const trees = new Map([
+      [rootId, root],
+      [validChildId, validChild],
+      [missingChildId, missingChild],
+      [unsupportedChildId, unsupportedChild],
+    ]);
+    const client = {
+      getRoom: (id: string) => rooms.get(id) ?? null,
+      getRooms: () => [...rooms.values()],
+      getUserId: () => "@reader:example.test",
+      unstableGetFileTreeSpace: (id: string) => trees.get(id) ?? null,
+    };
+    const storage = new TeleCryptIOStorage(client as never);
+
+    expect(storage.getTree(rootId)).not.toBeNull();
+    expect(storage.getTree(validChildId)).not.toBeNull();
+    expect(storage.getTree(missingChildId)).toBeNull();
+    expect(storage.getTree(unsupportedChildId)).toBeNull();
+    await expect(storage.listTrees()).resolves.toEqual([
+      expect.objectContaining({ id: rootId }),
+      expect.objectContaining({ id: validChildId }),
+    ]);
+    expect(root.getDirectories().map((directory) => directory.id)).toEqual([validChildId]);
+    expect(root.getDirectory(validChildId)?.id).toBe(validChildId);
+    expect(root.getDirectory(missingChildId)).toBeUndefined();
+    expect(root.getDirectory(unsupportedChildId)).toBeUndefined();
   });
 });
 

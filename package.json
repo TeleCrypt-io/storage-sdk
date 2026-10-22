@@ -22,7 +22,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": "24.20.0"
+    "node": "24.21.0"
   },
   "publishConfig": {
     "access": "public"
@@ -48,7 +48,7 @@
     "eslint": "10.9.0",
     "fake-indexeddb": "6.2.5",
     "typescript": "5.9.3",
-    "vitest": "4.1.11"
+    "vitest": "4.1.12"
   },
   "repository": {
     "type": "git",

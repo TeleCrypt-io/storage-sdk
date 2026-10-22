@@ -190,7 +190,40 @@ describe("OIDC token refresh response validation", () => {
     expect(causeMessage).not.toContain("alice@example.test");
     expect(causeMessage).not.toContain("@alice:example.test");
     expect(causeMessage).not.toContain("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-    expect(causeMessage).toContain('refresh_token="<redacted>"');
+    expect(causeMessage).toContain('refresh_token=\\"<redacted>\\"');
+  });
+
+  it("redacts decoded sensitive keys throughout provider JSON without losing safe fields", async () => {
+    const body = String.raw`{"error":"invalid_grant","\u0072efresh_token":"escaped-refresh-secret","data":[{"\u0063lient_secret":"nested-client-secret","status":"useful","children":[{"\u0061ccess_token":"array-access-secret","title":"kept"}]}],"request_id":"req-123"}`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(body, {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      })),
+    );
+
+    let caught: unknown;
+    try {
+      await refreshWithNoopPersistence()("refresh");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const error = caught as Error;
+    expect(error.cause).toMatchObject({ name: "OidcResponseError", status: 400 });
+    const causeMessage = (error.cause as Error).message;
+    expect(causeMessage).toContain('"error":"invalid_grant"');
+    expect(causeMessage).toContain('"refresh_token":"<redacted>"');
+    expect(causeMessage).toContain('"client_secret":"<redacted>"');
+    expect(causeMessage).toContain('"access_token":"<redacted>"');
+    expect(causeMessage).toContain('"status":"useful"');
+    expect(causeMessage).toContain('"title":"kept"');
+    expect(causeMessage).toContain('"request_id":"req-123"');
+    expect(causeMessage).not.toContain("escaped-refresh-secret");
+    expect(causeMessage).not.toContain("nested-client-secret");
+    expect(causeMessage).not.toContain("array-access-secret");
   });
 
   it("retains provider error classification and redacts its token", async () => {

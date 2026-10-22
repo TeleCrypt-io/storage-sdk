@@ -86,6 +86,9 @@ describe("pending invites", () => {
               getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }),
             };
           }
+          if (type === EventType.RoomEncryption) {
+            return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+          }
           return null;
         },
       },

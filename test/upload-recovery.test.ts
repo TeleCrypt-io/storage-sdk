@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { EventType, MatrixError, UNSTABLE_MSC3089_BRANCH } from "matrix-js-sdk";
+import { EventType, MatrixError, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3089_BRANCH, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { MutationPartialError } from "../src/core/errors.js";
 import { uploadFile } from "../src/core/operations.js";
@@ -32,8 +32,18 @@ function fixture() {
   const client = {
     getUserId: () => owner,
     unstableGetFileTreeSpace: () => tree,
-    getRoom: () => ({ currentState: { getStateEvents: (type: string) =>
-      type === UNSTABLE_MSC3089_BRANCH.name && listed ? listing : null } }),
+    getRoom: () => ({ currentState: { getStateEvents: (type: string, stateKey = "") => {
+      if (type === EventType.RoomCreate && stateKey === "") {
+        return { getSender: () => owner, getContent: () => ({ [RoomCreateTypeField]: RoomType.Space }) };
+      }
+      if (type === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
+        return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+      }
+      if (type === EventType.RoomEncryption && stateKey === "") {
+        return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+      }
+      return type === UNSTABLE_MSC3089_BRANCH.name && listed ? listing : null;
+    } } }),
     uploadContent: vi.fn(async () => { mediaExists = true; return { content_uri: mediaId }; }),
     sendMessage: vi.fn(async () => { attachmentExists = true; return { event_id: fileId }; }),
     sendStateEvent: vi.fn(async () => { listed = true; return { event_id: "$listing" }; }),

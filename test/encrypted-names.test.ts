@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { EventType, MsgType, UNSTABLE_MSC3089_BRANCH } from "matrix-js-sdk";
+import { EventType, MsgType, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3089_BRANCH, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
 import { TeleCryptIOStorage, type FileBranch, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 
 const ROOM_ID = "!private-storage:example.test";
@@ -23,6 +23,7 @@ function fixture() {
   const events = new Map<string, ReturnType<typeof encryptedEvent>>();
   let metadataPointer: Record<string, unknown> = { event_id: "$tree-name" };
   let metadataSender = OWNER;
+  let encryptionAlgorithm: string | undefined = "m.megolm.v1.aes-sha2";
   let branchContent: Record<string, unknown> = { active: true, metadata_event_id: "$file-event" };
   let listingEventId = "$listing-event";
   let branchSender = OWNER;
@@ -65,7 +66,18 @@ function fixture() {
     currentState: {
       getStateEvents: (type: string, stateKey: string) => {
         if (type === EventType.RoomCreate && stateKey === "") {
-          return { getSender: () => OWNER };
+          return {
+            getSender: () => OWNER,
+            getContent: () => ({ [RoomCreateTypeField]: RoomType.Space }),
+          };
+        }
+        if (type === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
+          return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+        }
+        if (type === EventType.RoomEncryption && stateKey === "") {
+          return encryptionAlgorithm === undefined
+            ? null
+            : { getContent: () => ({ algorithm: encryptionAlgorithm }) };
         }
         if (type === "io.telecrypt.storage.metadata" && stateKey === "") {
           return { getSender: () => metadataSender, getContent: () => metadataPointer };
@@ -121,10 +133,39 @@ function fixture() {
     sentStates,
     getBranchContent: () => branchContent,
     getMetadataPointer: () => metadataPointer,
+    setEncryptionAlgorithm: (algorithm: string | undefined) => { encryptionAlgorithm = algorithm; },
   };
 }
 
 describe("encrypted storage names", () => {
+  it.each([undefined, "m.megolm.v1.aes-ctr"])("blocks retained tree and file handles after room encryption becomes %s", async (algorithm) => {
+    const test = fixture();
+    const storage = new TeleCryptIOStorage(test.client as never);
+    const tree = await storage.createTree("Protected vault");
+    const file = tree.getFile("$file-event")!;
+    test.client.uploadContent.mockClear();
+    test.client.sendMessage.mockClear();
+    test.client.sendStateEvent.mockClear();
+    test.setEncryptionAlgorithm(algorithm);
+
+    await expect(storage.uploadFile(tree, "new.txt", new Uint8Array([1]).buffer, "text/plain")).rejects.toMatchObject({
+      name: "StorageError",
+      message: "storage room encryption is unavailable or unsupported",
+    });
+    await expect(tree.setName("new vault name")).rejects.toMatchObject({
+      name: "StorageError",
+      message: "storage room encryption is unavailable or unsupported",
+    });
+    await expect(file.setName("new file name")).rejects.toMatchObject({
+      name: "StorageError",
+      message: "storage room encryption is unavailable or unsupported",
+    });
+
+    expect(test.client.uploadContent).not.toHaveBeenCalled();
+    expect(test.client.sendMessage).not.toHaveBeenCalled();
+    expect(test.client.sendStateEvent).not.toHaveBeenCalled();
+  });
+
   it("stores tree names in encrypted messages and publishes only a generic room name and pointer", async () => {
     const test = fixture();
     const storage = new TeleCryptIOStorage(test.client as never);

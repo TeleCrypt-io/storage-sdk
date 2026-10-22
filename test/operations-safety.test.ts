@@ -48,11 +48,25 @@ function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
   } as unknown as TreeSpace;
 }
 
+function encryptedStorageStateEvent(eventType: string, stateKey = ""): unknown {
+  if (eventType === EventType.RoomCreate && stateKey === "") {
+    return { getContent: () => ({ type: "m.space" }) };
+  }
+  if (eventType === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
+    return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+  }
+  if (eventType === EventType.RoomEncryption && stateKey === "") {
+    return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+  }
+  return undefined;
+}
+
 function reviewedInviteRoom(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     currentState: {
       getStateEvents: (type: string, stateKey: string) => {
         if (type === EventType.RoomCreate) return { getContent: () => ({ type: "m.space" }) };
+        if (type === EventType.RoomEncryption) return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
         if (type === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
           return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
         }
@@ -1237,6 +1251,8 @@ describe("operation safety", () => {
       getMyMembership: () => "join",
       currentState: {
         getStateEvents: (eventType: string, stateKey?: string) => {
+          const storageEvent = encryptedStorageStateEvent(eventType, stateKey);
+          if (storageEvent) return storageEvent;
           const events = [];
           if (roomId === root.id && eventType === EventType.SpaceChild) {
             events.push({
@@ -1311,7 +1327,7 @@ describe("operation safety", () => {
     const room = {
       roomId: root.id,
       getMyMembership: () => "join",
-      currentState: { getStateEvents: () => [] },
+      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
     };
     const forget = vi.fn();
     const client = {
@@ -1341,7 +1357,7 @@ describe("operation safety", () => {
     const room = {
       roomId: folder.id,
       getMyMembership: () => "join",
-      currentState: { getStateEvents: () => [] },
+      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
     };
     const forget = vi.fn();
     const client = {
@@ -1388,6 +1404,8 @@ describe("operation safety", () => {
       currentState: {
         setStateEvents: vi.fn(),
         getStateEvents: (eventType: string, stateKey?: string) => {
+          const storageEvent = encryptedStorageStateEvent(eventType, stateKey);
+          if (storageEvent) return storageEvent;
           if (stateKey !== undefined) {
             return relationEvents.get(`${roomId}\u0000${eventType}\u0000${stateKey}`) ?? null;
           }
@@ -1531,7 +1549,7 @@ describe("operation safety", () => {
       roomId: root.id,
       getMembers: vi.fn(() => [member]),
       getMyMembership: () => "join",
-      currentState: { getStateEvents: () => [] },
+      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
     };
     const client = {
       getUserId: () => "@owner:example.test",

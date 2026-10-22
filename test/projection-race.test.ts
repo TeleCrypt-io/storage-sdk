@@ -1,6 +1,12 @@
 import { DecryptionKeySafe } from "../src/key-safe.js";
 beforeEach(() => { vi.spyOn(DecryptionKeySafe.prototype, "requireReady").mockResolvedValue(undefined); });
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  EventType,
+  UNSTABLE_MSC3088_ENABLED,
+  UNSTABLE_MSC3088_PURPOSE,
+  UNSTABLE_MSC3089_TREE_SUBTYPE,
+} from "matrix-js-sdk";
 import { TeleCryptIOStorage, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 import {
   downloadFile as downloadCoreFile,
@@ -8,6 +14,24 @@ import {
   listPendingInvites,
 } from "../src/core/operations.js";
 import { markFileDeleted, markTreeDeleted } from "../src/deletion-markers.js";
+
+function encryptedRoom() {
+  return {
+    currentState: {
+      setStateEvents: vi.fn(),
+      getStateEvents: (type: string, stateKey?: string) => {
+        if (type === EventType.RoomCreate && stateKey === "") return { getContent: () => ({ type: "m.space" }) };
+        if (type === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
+          return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+        }
+        if (type === EventType.RoomEncryption && stateKey === "") {
+          return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+        }
+        return [];
+      },
+    },
+  };
+}
 
 function treeWithFile(roomId: string, fileId: string): TreeSpace {
   const file = { id: fileId, getName: () => "stale.txt" };
@@ -43,7 +67,7 @@ describe("deletion race projection guards", () => {
     const fileId = "$deleted-file";
     const tree = treeWithFile(roomId, fileId);
     const client = {
-      getRoom: () => ({ currentState: { setStateEvents: vi.fn() } }),
+      getRoom: encryptedRoom,
       http: { authedRequest: vi.fn().mockResolvedValue([]) },
       unstableGetFileTreeSpace: () => tree,
     };
@@ -61,6 +85,7 @@ describe("deletion race projection guards", () => {
     const getFile = vi.fn(() => tree.getFile(fileId));
     tree.getFile = getFile;
     const client = {
+      getRoom: encryptedRoom,
       unstableGetFileTreeSpace: () => tree,
     };
     const storage = new TeleCryptIOStorage(client as never);

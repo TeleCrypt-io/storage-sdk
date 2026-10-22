@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  EventType,
+  UNSTABLE_MSC3088_ENABLED,
+  UNSTABLE_MSC3088_PURPOSE,
+  UNSTABLE_MSC3089_TREE_SUBTYPE,
+} from "matrix-js-sdk";
+import {
   TeleCryptIOStorage,
   type TreeSpace,
   withMatrixMutationAbort,
@@ -7,10 +13,34 @@ import {
 } from "../src/TeleCryptIOStorage.js";
 import { RoomCleanupIncompleteError } from "../src/core/errors.js";
 
+function storageRoomState(
+  getOtherStateEvents: (eventType: string, stateKey?: string) => unknown = () => [],
+) {
+  return {
+    setStateEvents: vi.fn(),
+    getStateEvents: vi.fn((eventType: string, stateKey?: string) => {
+      if (eventType === EventType.RoomCreate && stateKey === "") {
+        return { getContent: () => ({ type: "m.space" }) };
+      }
+      if (eventType === UNSTABLE_MSC3088_PURPOSE.name && stateKey === UNSTABLE_MSC3089_TREE_SUBTYPE.name) {
+        return { getContent: () => ({ [UNSTABLE_MSC3088_ENABLED.name]: true }) };
+      }
+      if (eventType === EventType.RoomEncryption && stateKey === "") {
+        return { getContent: () => ({ algorithm: "m.megolm.v1.aes-sha2" }) };
+      }
+      return getOtherStateEvents(eventType, stateKey);
+    }),
+  };
+}
+
+function treeRoom(name: string) {
+  return { name, currentState: storageRoomState() };
+}
+
 function tree(id: string, name: string, isTopLevel: boolean): TreeSpace {
   return {
     id,
-    room: { name },
+    room: treeRoom(name),
     isTopLevel,
     getDirectories: () => [],
   } as unknown as TreeSpace;
@@ -41,7 +71,7 @@ function storageForTest(rawClient: unknown): TeleCryptIOStorage {
 
 describe("tree mutations", () => {
   function sharedParent() {
-    const state = { setStateEvents: vi.fn(), getStateEvents: () => [] };
+    const state = storageRoomState();
     const parent = { ...tree("!parent:example.test", "Parent", true), room: { name: "Parent", currentState: state } } as TreeSpace;
     const child = { ...tree("!child:example.test", "Child", false), room: { name: "Child", currentState: state }, invite: vi.fn().mockResolvedValue(undefined) } as TreeSpace;
     const client = {
@@ -91,11 +121,11 @@ describe("tree mutations", () => {
   it("routes createDirectory through the linked-subtree path and refreshes both rooms", async () => {
     const parentRoom = {
       name: "Parent",
-      currentState: { setStateEvents: vi.fn(), getStateEvents: vi.fn(() => []) },
+      currentState: storageRoomState(),
     };
     const childRoom = {
       name: "Child",
-      currentState: { setStateEvents: vi.fn(), getStateEvents: vi.fn(() => []) },
+      currentState: storageRoomState(),
     };
     const parent = { ...tree("!parent:example.test", "Parent", true), room: parentRoom } as unknown as TreeSpace;
     const child = { ...tree("!child:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
@@ -213,6 +243,8 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => rooms,
+      getRoom: (roomId: string) => trees.get(roomId)?.room ?? null,
+      http: { authedRequest: vi.fn(async () => []) },
       createRoom: vi.fn(async (options: Record<string, unknown>) => {
         expect(options.creation_content).toEqual({ type: "m.space" });
         rooms.push({ roomId: created.id });
@@ -268,6 +300,8 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => rooms,
+      getRoom: (roomId: string) => trees.get(roomId)?.room ?? null,
+      http: { authedRequest: vi.fn(async () => []) },
       createRoom: vi.fn(async () => {
         const next = created[createCount];
         createCount += 1;
@@ -296,7 +330,7 @@ describe("tree mutations", () => {
       getDirectories: () => children,
       room: {
         name: "Parent",
-        currentState: { setStateEvents: vi.fn() },
+        currentState: storageRoomState(),
       },
     } as unknown as TreeSpace;
     const createdChildren = [
@@ -309,7 +343,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => rooms,
-      getRoom: (roomId: string) => (roomId === parent.id ? parent.room : null),
+      getRoom: (roomId: string) => trees.get(roomId)?.room ?? null,
       createRoom: vi.fn(async () => {
         const child = createdChildren[children.length];
         rooms.push({ roomId: child.id });
@@ -344,16 +378,13 @@ describe("tree mutations", () => {
   });
 
   it("reports incomplete cleanup after an ambiguous child link", async () => {
-    const childRoom = { currentState: { getStateEvents: vi.fn(() => []) } };
+    const childRoom = { currentState: storageRoomState() };
     const child = { ...tree("!child-failed:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$parent-link",
           getSender: () => "@alice:example.test",
         })),
-      },
     };
     const parent = {
       ...tree("!parent-failed:example.test", "Parent", true),
@@ -397,13 +428,10 @@ describe("tree mutations", () => {
   it("redacts a parent link committed before an ambiguous send failure", async () => {
     const child = tree("!child-ambiguous:example.test", "Child", false);
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$ambiguous-parent-link",
           getSender: () => "@alice:example.test",
         })),
-      },
     };
     const parent = {
       ...tree("!parent-ambiguous:example.test", "Parent", true),
@@ -415,7 +443,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => [{ roomId: parent.id }, { roomId: child.id }],
-      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : null),
+      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : roomId === child.id ? child.room : null),
       createRoom: vi.fn(async () => ({ room_id: child.id })),
       unstableGetFileTreeSpace: vi.fn((roomId: string) => trees.get(roomId) ?? null),
       // The server may have accepted this event even though the client saw a
@@ -446,13 +474,10 @@ describe("tree mutations", () => {
   it("does not redact another actor's replacement relation during compensation", async () => {
     const child = tree("!child-foreign-link:example.test", "Child", false);
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$foreign-parent-link",
           getSender: () => "@mallory:example.test",
         })),
-      },
     };
     const parent = {
       ...tree("!parent-foreign-link:example.test", "Parent", true),
@@ -463,7 +488,7 @@ describe("tree mutations", () => {
       getUserId: () => "@alice:example.test",
       getDomain: () => "example.test",
       getRooms: () => [{ roomId: parent.id }, { roomId: child.id }],
-      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : null),
+      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : roomId === child.id ? child.room : null),
       createRoom: vi.fn(async () => ({ room_id: child.id })),
       unstableGetFileTreeSpace: vi.fn((roomId: string) => (roomId === parent.id ? parent : child)),
       sendStateEvent: vi.fn().mockRejectedValue(new Error("ambiguous parent link failure")),
@@ -493,22 +518,16 @@ describe("tree mutations", () => {
   it("rolls back a child-side parent link committed before an ambiguous send failure", async () => {
     const child = tree("!child-side-ambiguous:example.test", "Child", false);
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$parent-side-link",
           getSender: () => "@alice:example.test",
         })),
-      },
     };
     const childRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$child-side-link",
           getSender: () => "@alice:example.test",
         })),
-      },
     };
     const parent = {
       ...tree("!parent-child-side:example.test", "Parent", true),
@@ -545,22 +564,16 @@ describe("tree mutations", () => {
   it("reports incomplete cleanup when child-side redaction leaves a live parent link", async () => {
     const child = tree("!child-side-stale:example.test", "Child", false);
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$parent-link",
           getContent: () => ({}),
         })),
-      },
     };
     const childRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$child-link",
           getContent: () => ({ via: ["example.test"] }),
         })),
-      },
     };
     const parent = {
       ...tree("!parent-child-side-stale:example.test", "Parent", true),
@@ -609,16 +622,13 @@ describe("tree mutations", () => {
   });
 
   it("wraps a failed room cleanup with the original and cleanup errors", async () => {
-    const childRoom = { currentState: { getStateEvents: vi.fn(() => []) } };
+    const childRoom = { currentState: storageRoomState() };
     const child = { ...tree("!child-redact-failed:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
     const parentRoom = {
-      currentState: {
-        setStateEvents: vi.fn(),
-        getStateEvents: vi.fn(() => ({
+      currentState: storageRoomState(() => ({
           getId: () => "$parent-link",
           getSender: () => "@alice:example.test",
         })),
-      },
     };
     const parent = {
       ...tree("!parent-redact-failed:example.test", "Parent", true),

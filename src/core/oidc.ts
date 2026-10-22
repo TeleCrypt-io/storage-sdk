@@ -135,10 +135,8 @@ const DIAGNOSTIC_EMAIL = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]
 const DIAGNOSTIC_MXID = /@[A-Z0-9._=+\-/]+:[A-Z0-9.-]+/giu;
 const DIAGNOSTIC_ULID = /\b[0-9A-HJKMNP-TV-Z]{26}\b/giu;
 
-/** Keep provider diagnostics useful without allowing credentials, customer
- * identifiers, or control characters from an untrusted response to cross the
- * SDK boundary. */
-export function sanitizeDiagnosticText(value: string): string {
+/** Existing fallback for plain or malformed provider diagnostics. */
+function sanitizeUnstructuredDiagnosticText(value: string): string {
   const quotedValue = `"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,};\\]]+`;
   return value
     .replace(/(Bearer\s+)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',}]+)/giu, "$1<redacted>")
@@ -159,6 +157,30 @@ export function sanitizeDiagnosticText(value: string): string {
     .replace(DIAGNOSTIC_ULID, "<redacted>")
     .replace(/[\r\n\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, " ")
     .trim();
+}
+
+function sanitizeDiagnosticJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => sanitizeDiagnosticJson(item));
+  if (typeof value === "string") return sanitizeUnstructuredDiagnosticText(value);
+  if (typeof value !== "object" || value === null) return value;
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      DIAGNOSTIC_SECRET_FIELD.test(key) ? "<redacted>" : sanitizeDiagnosticJson(item),
+    ]),
+  );
+}
+
+/** Keep provider diagnostics useful without allowing credentials, customer
+ * identifiers, or control characters from an untrusted response to cross the
+ * SDK boundary. Structured JSON uses decoded property names at every depth. */
+export function sanitizeDiagnosticText(value: string): string {
+  try {
+    return JSON.stringify(sanitizeDiagnosticJson(JSON.parse(value)));
+  } catch {
+    return sanitizeUnstructuredDiagnosticText(value);
+  }
 }
 
 class OidcResponseError extends Error {
