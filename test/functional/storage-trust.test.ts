@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MatrixEvent } from "matrix-js-sdk";
+import {
+  AllDevicesIsolationMode,
+  EventShieldColour,
+  EventShieldReason,
+  OnlySignedDevicesIsolationMode,
+} from "matrix-js-sdk/lib/crypto-api/index.js";
 import { encryptAttachment } from "matrix-encrypt-attachment";
 import { writeFile } from "node:fs/promises";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
@@ -7,7 +13,7 @@ import * as core from "../../src/core/operations.js";
 import { registerTestUser, loginNewDevice } from "../harness/users.js";
 import { waitFor } from "../harness/waitFor.js";
 
-const output = "/home/ubuntu/harness.git/artifacts/storage-trust/phase1/native-final-results.json";
+const output = process.env.STORAGE_TRUST_RESULTS_PATH;
 const findings: Record<string, unknown> = {};
 const clients: TeleCryptIOStorage[] = [];
 const rooms: Array<{ storage: TeleCryptIOStorage; id: string }> = [];
@@ -19,6 +25,9 @@ let pauseToken: string | undefined;
 let syncHeld = false;
 let releaseSync: (() => void) | undefined;
 let syncGate = Promise.resolve();
+type ToDeviceRecipient = { userId: string; deviceId: string };
+type ToDeviceRequestCapture = { eventType: string; recipients: ToDeviceRecipient[]; status: number };
+let recipientCapture: { accessToken: string; requests: ToDeviceRequestCapture[] } | undefined;
 
 async function openStorage(user: Awaited<ReturnType<typeof registerTestUser>>) {
   const storage = await TeleCryptIOStorage.create({
@@ -41,7 +50,40 @@ async function storageUser(prefix: string) {
 
 async function save(name: string, value: unknown) {
   findings[name] = value;
-  await writeFile(output, JSON.stringify(findings, null, 2) + "\n", { mode: 0o600 });
+  if (output) await writeFile(output, JSON.stringify(findings, null, 2) + "\n", { mode: 0o600 });
+}
+
+async function captureToDeviceRecipients<T>(accessToken: string, action: () => Promise<T>) {
+  if (recipientCapture) throw new Error("to-device recipient capture is already active");
+  const capture = { accessToken, requests: [] as ToDeviceRequestCapture[] };
+  recipientCapture = capture;
+  try {
+    const result = await action();
+    return { result, requests: capture.requests };
+  } finally {
+    recipientCapture = undefined;
+  }
+}
+
+function recipientsFor(requests: ToDeviceRequestCapture[], userId: string): Set<string> {
+  return new Set(requests.flatMap((request) => request.recipients
+    .filter((recipient) => recipient.userId === userId)
+    .map((recipient) => recipient.deviceId)));
+}
+
+async function encryptionInfo(storage: TeleCryptIOStorage, raw: object) {
+  const event = new MatrixEvent(structuredClone(raw) as never);
+  await storage.getClient().decryptEventIfNeeded(event);
+  const info = await storage.getClient().getCrypto()!.getEncryptionInfoForEvent(event);
+  return {
+    decrypted: !event.isDecryptionFailure(),
+    body: event.getContent().body,
+    failure: event.decryptionFailureReason,
+    shieldColour: info ? EventShieldColour[info.shieldColour] : null,
+    shieldReason: info?.shieldReason === null || info?.shieldReason === undefined
+      ? null
+      : EventShieldReason[info.shieldReason],
+  };
 }
 
 async function vault(name: string, readers: Array<Awaited<ReturnType<typeof storageUser>>> = [reader]) {
@@ -96,11 +138,40 @@ async function waitForDecryption(storage: TeleCryptIOStorage, raw: object, succe
   }, { label: `event decryption success=${success}`, timeoutMs: 15000 });
 }
 
+async function waitForDecryptionFailure(storage: TeleCryptIOStorage, raw: object, reason: string) {
+  return waitFor(async () => {
+    const result = await decrypt(storage, raw);
+    return !result.success && result.error === reason ? result : null;
+  }, { label: `event decryption failure=${reason}`, timeoutMs: 15000 });
+}
+
 beforeAll(async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-    const response = await nativeFetch(input, init);
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const token = headers.get("authorization")?.replace(/^Bearer /i, "");
+    const activeCapture = recipientCapture;
+    const pathname = new URL(url).pathname;
+    const toDevice = pathname.match(/\/sendToDevice\/([^/]+)\//);
+    let recipients: ToDeviceRecipient[] | undefined;
+    if (activeCapture && token === activeCapture.accessToken && toDevice) {
+      const body = typeof init?.body === "string"
+        ? init.body
+        : input instanceof Request
+          ? await input.clone().text()
+          : undefined;
+      const payload = body ? JSON.parse(body) as { messages?: Record<string, Record<string, unknown>> } : undefined;
+      recipients = Object.entries(payload?.messages ?? {}).flatMap(([userId, devices]) =>
+        Object.keys(devices).map((deviceId) => ({ userId, deviceId })));
+    }
+    const response = await nativeFetch(input, init);
+    if (activeCapture && recipients) {
+      activeCapture.requests.push({
+        eventType: decodeURIComponent(toDevice![1]!),
+        recipients,
+        status: response.status,
+      });
+    }
     if (pauseToken && new URL(url).pathname.endsWith("/sync") && headers.get("authorization") === `Bearer ${pauseToken}`) {
       syncHeld = true;
       await syncGate;
@@ -149,6 +220,12 @@ describe("Matrix device trust and Storage metadata authorship", () => {
     }, { label: "second owner login signed by owner identity", timeoutMs: 20000 });
     const recovered = await core.downloadFile(secondOwner, tree.id, before.id);
     expect(new TextDecoder().decode(recovered.bytes)).toBe("historical owner content");
+    const beforeRaw = await ownerClient.fetchRoomEvent(tree.id, before.id);
+    const recoveredHistoryInfo = await encryptionInfo(secondOwner, beforeRaw);
+    const ownerHistoryInfo = await encryptionInfo(owner.storage, beforeRaw);
+    await save("recovered_history_encryption_info", { recoveredHistoryInfo, ownerHistoryInfo });
+    expect(recoveredHistoryInfo.decrypted).toBe(true);
+    expect(ownerHistoryInfo.decrypted).toBe(true);
 
     // A message from that legitimate owner device remains valid as the name
     // metadata event, including when the pointer is authored by the first.
@@ -163,6 +240,10 @@ describe("Matrix device trust and Storage metadata authorship", () => {
       "",
     );
     expect(await owner.storage.getTreeName(tree.id)).toBe("owner second device name");
+    const multiDeviceRaw = await ownerClient.fetchRoomEvent(tree.id, multiDeviceMessage.event_id);
+    const multiDeviceInfo = await encryptionInfo(owner.storage, multiDeviceRaw);
+    await save("owner_multidevice_encryption_info", multiDeviceInfo);
+    expect(multiDeviceInfo.decrypted).toBe(true);
 
     const warm = await readerClient.sendMessage(tree.id, {
       msgtype: "io.telecrypt.storage.metadata",
@@ -205,6 +286,41 @@ describe("Matrix device trust and Storage metadata authorship", () => {
       expect(result).toBe("Encrypted storage");
       expect(error).toBeUndefined();
 
+      const ownerCrypto = ownerClient.getCrypto()!;
+      ownerCrypto.setDeviceIsolationMode(new AllDevicesIsolationMode(false));
+      const mismatchMessage = await readerClient.sendMessage(tree.id, {
+        msgtype: "io.telecrypt.storage.metadata",
+        body: "mismatched-sender-guard-probe",
+      } as never);
+      const mismatchGenuine = await readerClient.fetchRoomEvent(tree.id, mismatchMessage.event_id);
+      const mismatchId = `$trust_mismatch_guard_${Date.now()}`;
+      const mismatch = { ...mismatchGenuine, event_id: mismatchId, sender: owner.user.userId };
+      const mismatchProbe = new MatrixEvent(structuredClone(mismatch) as never);
+      await ownerClient.decryptEventIfNeeded(mismatchProbe);
+      const mismatchInfo = await ownerCrypto.getEncryptionInfoForEvent(mismatchProbe);
+      const readMismatch = vi.spyOn(ownerClient, "fetchRoomEvent").mockImplementation(async (roomId, eventId) =>
+        eventId === mismatchId ? structuredClone(mismatch) : nativeRead(roomId, eventId));
+      await ownerClient.sendStateEvent(
+        tree.id,
+        "io.telecrypt.storage.metadata" as never,
+        { event_id: mismatchId } as never,
+        "",
+      );
+      const mismatchName = await new TeleCryptIOStorage(ownerClient).getTreeName(tree.id);
+      readMismatch.mockRestore();
+      await save("mismatched_sender_guard", {
+        cryptoDecryptionSucceeded: !mismatchProbe.isDecryptionFailure(),
+        cryptoShieldColour: mismatchInfo ? EventShieldColour[mismatchInfo.shieldColour] : null,
+        cryptoShieldReason: mismatchInfo?.shieldReason === null || mismatchInfo?.shieldReason === undefined
+          ? null
+          : EventShieldReason[mismatchInfo.shieldReason],
+        sdkReturnedGenericName: mismatchName === "Encrypted storage",
+      });
+      expect(mismatchProbe.isDecryptionFailure()).toBe(false);
+      expect(mismatchInfo?.shieldReason).toBe(EventShieldReason.MISMATCHED_SENDER);
+      expect(mismatchName).toBe("Encrypted storage");
+      ownerCrypto.setDeviceIsolationMode(new OnlySignedDevicesIsolationMode());
+
       await ownerClient.sendStateEvent(
         tree.id,
         "io.telecrypt.storage.metadata" as never,
@@ -231,12 +347,13 @@ describe("Matrix device trust and Storage metadata authorship", () => {
       await save("cross_room_substitution", { accepted: crossName === "attacker-controlled-name", returnedName: crossName, error: crossError });
       expect(crossName).not.toBe("attacker-controlled-name");
     } finally {
+      owner.storage.getClient().getCrypto()?.setDeviceIsolationMode(new OnlySignedDevicesIsolationMode());
       resumeOwnerSync();
       await owner.storage.getTree(tree.id)?.setName("Authenticated metadata binding restored");
     }
   }, 180000);
 
-  it("excludes an unsigned recipient device until its owner restores and signs it", async () => {
+  it("stops sending future keys to an old unsigned recipient after policy transition", async () => {
     const tree = await vault("Signed recipient device");
     const unsignedUser = await loginNewDevice(reader.user);
     const unsigned = await openStorage(unsignedUser);
@@ -259,36 +376,114 @@ describe("Matrix device trust and Storage metadata authorship", () => {
     const trustBefore = await ownerCrypto.getDeviceVerificationStatus(reader.user.userId, unsignedUser.deviceId);
     expect(trustBefore?.signedByOwner).toBe(false);
 
-    const unsignedFuture = await upload(owner.storage, tree.id, "unsigned.txt", "not sent to unsigned devices");
-    expect(new TextDecoder().decode((await core.downloadFile(reader.storage, tree.id, unsignedFuture.id)).bytes))
-      .toBe("not sent to unsigned devices");
-    const unsignedRaw = await owner.storage.getClient().fetchRoomEvent(tree.id, unsignedFuture.id);
-    const unsignedResult = await waitForDecryption(unsigned, unsignedRaw, false);
-    await save("unsigned_recipient_future_keys", {
-      signedByOwnerBeforeRestore: trustBefore?.signedByOwner,
-      futureDescriptorDecrypts: unsignedResult.success,
-      decryptionFailure: unsignedResult.error,
-    });
-    expect(unsignedResult.success).toBe(false);
+    const ownerClient = owner.storage.getClient();
+    try {
+      ownerCrypto.setDeviceIsolationMode(new AllDevicesIsolationMode(false));
+      await ownerCrypto.forceDiscardSession(tree.id);
+      const allDevicesWrite = await captureToDeviceRecipients(owner.user.accessToken, () =>
+        upload(owner.storage, tree.id, "old-policy.txt", "old AllDevices session"));
+      const allDevicesRaw = await ownerClient.fetchRoomEvent(tree.id, allDevicesWrite.result.id);
+      const allDevicesSession = (allDevicesRaw as { content?: { session_id?: string } }).content?.session_id;
+      const allDevicesRequests = allDevicesWrite.requests.filter((request) => request.eventType === "m.room.encrypted");
+      const allDevicesRecipients = recipientsFor(allDevicesRequests, reader.user.userId);
+      const allDevicesUnsigned = await waitForDecryption(unsigned, allDevicesRaw, true);
+      const allDevicesSigned = await waitForDecryption(reader.storage, allDevicesRaw, true);
 
-    const restore = await unsigned.keySafe.restore(reader.recoveryKey);
-    expect(restore.state).toBe("ready");
-    expect(restore.imported).toBeGreaterThan(0);
-    await waitFor(async () => {
-      const status = await ownerCrypto.getDeviceVerificationStatus(reader.user.userId, unsignedUser.deviceId);
-      return status?.signedByOwner ?? false;
-    }, { label: "reader's recovered device signed by reader identity", timeoutMs: 20000 });
+      ownerCrypto.setDeviceIsolationMode(new OnlySignedDevicesIsolationMode());
+      const transitioned = await captureToDeviceRecipients(owner.user.accessToken, async () => {
+        const treeSpace = owner.storage.getTree(tree.id)!;
+        await treeSpace.setName("post-transition tree name");
+        expect(await owner.storage.getTreeName(tree.id)).toBe("post-transition tree name");
+        const pointer = ownerClient.getRoom(tree.id)!.currentState
+          .getStateEvents("io.telecrypt.storage.metadata", "") as MatrixEvent;
+        const nameId = (pointer.getContent() as { event_id: string }).event_id;
+        const nameRaw = await ownerClient.fetchRoomEvent(tree.id, nameId);
+        const file = await upload(owner.storage, tree.id, "post-transition.txt", "new OnlySigned session");
+        const fileRaw = await ownerClient.fetchRoomEvent(tree.id, file.id);
+        return { nameId, nameRaw, file, fileRaw };
+      });
+      const transitionRequests = transitioned.requests.filter((request) => request.eventType === "m.room.encrypted");
+      const transitionRecipients = recipientsFor(transitionRequests, reader.user.userId);
+      const transitionedNameSession = (transitioned.result.nameRaw as { content?: { session_id?: string } }).content?.session_id;
+      const transitionedFileSession = (transitioned.result.fileRaw as { content?: { session_id?: string } }).content?.session_id;
+      const transitionedNameForUnsigned = await waitForDecryptionFailure(
+        unsigned,
+        transitioned.result.nameRaw,
+        "MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE",
+      );
+      const transitionedFileForUnsigned = await waitForDecryptionFailure(
+        unsigned,
+        transitioned.result.fileRaw,
+        "MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE",
+      );
+      const transitionedNameForReader = await waitForDecryption(reader.storage, transitioned.result.nameRaw, true);
+      const transitionedFileForReader = await waitForDecryption(reader.storage, transitioned.result.fileRaw, true);
 
-    const restoredFuture = await upload(owner.storage, tree.id, "restored.txt", "available after device restore");
-    const restoredRaw = await owner.storage.getClient().fetchRoomEvent(tree.id, restoredFuture.id);
-    const restoredResult = await waitForDecryption(unsigned, restoredRaw, true);
-    await save("restored_recipient_future_keys", {
-      signedByOwnerAfterRestore: true,
-      futureDescriptorDecrypts: restoredResult.success,
-      body: restoredResult.body,
-    });
-    expect(restoredResult.success).toBe(true);
-    expect(restoredResult.body).toBe("restored.txt");
+      const restore = await unsigned.keySafe.restore(reader.recoveryKey);
+      expect(restore.state).toBe("ready");
+      expect(restore.imported).toBeGreaterThan(0);
+      await waitFor(async () => {
+        const status = await ownerCrypto.getDeviceVerificationStatus(reader.user.userId, unsignedUser.deviceId);
+        return status?.signedByOwner ?? false;
+      }, { label: "reader's recovered device signed by reader identity", timeoutMs: 20000 });
+      await ownerCrypto.forceDiscardSession(tree.id);
+      const restoredWrite = await captureToDeviceRecipients(owner.user.accessToken, () =>
+        upload(owner.storage, tree.id, "restored.txt", "available after device restore"));
+      const restoredRaw = await ownerClient.fetchRoomEvent(tree.id, restoredWrite.result.id);
+      const restoredRequests = restoredWrite.requests.filter((request) => request.eventType === "m.room.encrypted");
+      const restoredRecipients = recipientsFor(restoredRequests, reader.user.userId);
+      const restoredResult = await waitForDecryption(unsigned, restoredRaw, true);
+      await save("signed_recipient_policy_transition", {
+        signedByOwnerBeforeRestore: trustBefore?.signedByOwner,
+        allDevices: {
+          encryptedToDeviceRequests: allDevicesRequests,
+          recipients: [...allDevicesRecipients],
+          session: allDevicesSession,
+          unsignedReader: allDevicesUnsigned,
+          signedReader: allDevicesSigned,
+        },
+        onlySignedTransition: {
+          encryptedToDeviceRequests: transitionRequests,
+          recipients: [...transitionRecipients],
+          sessions: [transitionedNameSession, transitionedFileSession],
+          unsignedName: transitionedNameForUnsigned,
+          unsignedFile: transitionedFileForUnsigned,
+          signedName: transitionedNameForReader,
+          signedFile: transitionedFileForReader,
+        },
+        restoredSignedDevice: {
+          signedByOwner: true,
+          encryptedToDeviceRequests: restoredRequests,
+          recipients: [...restoredRecipients],
+          descriptor: restoredResult,
+        },
+      });
+
+      expect(allDevicesRequests.length).toBeGreaterThan(0);
+      expect(allDevicesRequests.every((request) => request.status >= 200 && request.status < 300)).toBe(true);
+      expect(allDevicesRecipients.has(unsignedUser.deviceId)).toBe(true);
+      expect(allDevicesRecipients.has(reader.user.deviceId)).toBe(true);
+      expect(allDevicesUnsigned.success).toBe(true);
+      expect(allDevicesUnsigned.body).toBe("old-policy.txt");
+      expect(allDevicesSigned.success).toBe(true);
+      expect(transitionRequests.every((request) => request.status >= 200 && request.status < 300)).toBe(true);
+      expect(transitionedNameSession).not.toBe(allDevicesSession);
+      expect(transitionedFileSession).toBe(transitionedNameSession);
+      expect(transitionRecipients.has(reader.user.deviceId)).toBe(true);
+      expect(transitionRecipients.has(unsignedUser.deviceId)).toBe(false);
+      expect(transitionedNameForUnsigned.success).toBe(false);
+      expect(transitionedNameForUnsigned.error).toBe("MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE");
+      expect(transitionedFileForUnsigned.success).toBe(false);
+      expect(transitionedFileForUnsigned.error).toBe("MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE");
+      expect(transitionedNameForReader.success).toBe(true);
+      expect(transitionedFileForReader.success).toBe(true);
+      expect(restoredRequests.every((request) => request.status >= 200 && request.status < 300)).toBe(true);
+      expect(restoredRecipients.has(unsignedUser.deviceId)).toBe(true);
+      expect(restoredResult.success).toBe(true);
+      expect(restoredResult.body).toBe("restored.txt");
+    } finally {
+      ownerCrypto.setDeviceIsolationMode(new OnlySignedDevicesIsolationMode());
+    }
   }, 180000);
 
   it("rotates future retained-handle writes after removal before sync catches up", async () => {
@@ -366,7 +561,7 @@ describe("Matrix device trust and Storage metadata authorship", () => {
         ...(findings.revocation_retained_handles_before_sync as Record<string, unknown>),
         remainingRecipientDownloadedUpload: new TextDecoder().decode(survivorDownload.bytes),
       };
-      await writeFile(output, JSON.stringify(findings, null, 2) + "\n", { mode: 0o600 });
+      await save("revocation_retained_handles_before_sync", findings.revocation_retained_handles_before_sync);
     } finally {
       resumeOwnerSync();
     }

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SyncState } from "matrix-js-sdk";
+import { OnlySignedDevicesIsolationMode } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { TeleCryptIOStorage } from "../src/TeleCryptIOStorage.js";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import {
@@ -60,7 +61,7 @@ describe("bootstrap and recovery safety", () => {
 
     const storage = await bootstrap(client, { ...bootstrapOptions(), startClient: false });
     expect(client.startClient).not.toHaveBeenCalled();
-    expect(setDeviceIsolationMode).toHaveBeenCalledWith(expect.objectContaining({ kind: 1 }));
+    expect(setDeviceIsolationMode).toHaveBeenCalledWith(expect.any(OnlySignedDevicesIsolationMode));
     expect(checkKeyBackupAndEnable).toHaveBeenCalledTimes(1);
 
     await storage.startSync();
