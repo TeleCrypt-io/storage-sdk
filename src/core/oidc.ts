@@ -159,9 +159,9 @@ function sanitizeUnstructuredDiagnosticText(value: string): string {
     .trim();
 }
 
-/** Keep provider diagnostics useful without allowing credentials, customer
- * identifiers, or control characters from an untrusted response to cross the
- * SDK boundary. Structured JSON uses decoded property names at every depth. */
+/** Redact recognized secret fields and identifiers in provider diagnostics.
+ * Structured JSON uses decoded property names at every depth; the text fallback
+ * is limited to patterns recognized in unstructured input. */
 export function sanitizeDiagnosticText(value: string): string {
   try {
     return JSON.stringify(JSON.parse(value), (key, item: unknown) => {
