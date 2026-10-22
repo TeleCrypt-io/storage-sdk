@@ -22,7 +22,10 @@ function fixture() {
     isRedacted: () => false,
     isDecryptionFailure: () => false,
   };
-  const crypto = { getActiveSessionBackupVersion: vi.fn().mockResolvedValue("7") };
+  const crypto = {
+    getActiveSessionBackupVersion: vi.fn().mockResolvedValue("7"),
+    getEncryptionInfoForEvent: vi.fn().mockResolvedValue({ shieldColour: 0, shieldReason: null }),
+  };
   const client = {
     getUserId: () => owner,
     getCrypto: () => crypto,

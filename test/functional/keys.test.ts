@@ -104,6 +104,13 @@ describe("key management", () => {
     const userA = await registerTestUser("recover");
     const storageA = await createStorage(userA);
     try {
+      const { recoveryKey } = await storageA.keys.setupRecovery();
+      expect(recoveryKey).toBeTruthy();
+      await waitFor(() => storageA.keys.isRecoverySetup(), {
+        label: "backup active on device A",
+        timeoutMs: 15000,
+      });
+
       const tree = await storageA.createTree("RecoveryTest");
       await waitForTreeName(storageA, tree.id, "RecoveryTest");
 
@@ -120,15 +127,7 @@ describe("key management", () => {
         { label: "file visible on device A", timeoutMs: 15000 },
       );
 
-      const { recoveryKey } = await storageA.keys.setupRecovery();
-      expect(recoveryKey).toBeTruthy();
-
-      // Backup engine believes it is active...
-      await waitFor(() => storageA.keys.isRecoverySetup(), {
-        label: "backup active on device A",
-        timeoutMs: 15000,
-      });
-      // ...AND the file's room key has actually reached the server (the
+      // The file's room key must reach the server (the
       // upload is asynchronous background work, separate from "active").
       await waitForServerBackupCount(userA.accessToken, 1);
 
@@ -197,6 +196,12 @@ describe("key management", () => {
     const userA = await registerTestUser("recoverbad");
     const storageA = await createStorage(userA);
     try {
+      await storageA.keys.setupRecovery();
+      await waitFor(() => storageA.keys.isRecoverySetup(), {
+        label: "backup active on device A",
+        timeoutMs: 15000,
+      });
+
       const tree = await storageA.createTree("BadRecoveryTest");
       await waitForTreeName(storageA, tree.id, "BadRecoveryTest");
 
@@ -211,11 +216,6 @@ describe("key management", () => {
         { label: "file visible on device A", timeoutMs: 15000 },
       );
 
-      await storageA.keys.setupRecovery();
-      await waitFor(() => storageA.keys.isRecoverySetup(), {
-        label: "backup active on device A",
-        timeoutMs: 15000,
-      });
       await waitForServerBackupCount(userA.accessToken, 1);
 
       // A well-formed but cryptographically wrong recovery key: a genuine

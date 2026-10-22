@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventType, MsgType, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3089_BRANCH, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
+import { EventShieldReason } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { TeleCryptIOStorage, type FileBranch, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 
 const ROOM_ID = "!private-storage:example.test";
@@ -28,6 +29,7 @@ function fixture() {
   let listingEventId = "$listing-event";
   let branchSender = OWNER;
   let idSequence = 0;
+  let shieldReason: EventShieldReason | null = null;
   const sentMessages: Array<{ roomId: string; content: Record<string, unknown>; eventId: string }> = [];
   const sentStates: Array<{ roomId: string; type: string; content: Record<string, unknown>; stateKey: string }> = [];
   const rawBranch = {
@@ -89,6 +91,9 @@ function fixture() {
   const client = {
     getUserId: () => OWNER,
     getDomain: () => "example.test",
+    getCrypto: () => ({
+      getEncryptionInfoForEvent: vi.fn().mockImplementation(async () => ({ shieldColour: shieldReason === null ? 0 : 2, shieldReason })),
+    }),
     getRooms: () => [room],
     getRoom: (roomId: string) => roomId === ROOM_ID ? room : null,
     createRoom: vi.fn(async () => ({ room_id: ROOM_ID })),
@@ -134,6 +139,7 @@ function fixture() {
     getBranchContent: () => branchContent,
     getMetadataPointer: () => metadataPointer,
     setEncryptionAlgorithm: (algorithm: string | undefined) => { encryptionAlgorithm = algorithm; },
+    setShieldReason: (reason: EventShieldReason | null) => { shieldReason = reason; },
   };
 }
 
@@ -186,6 +192,15 @@ describe("encrypted storage names", () => {
     expect(await storage.getTreeName(tree.id)).toBe("My private vault");
     expect(test.client.decryptEventIfNeeded).toHaveBeenCalled();
     expect(tree.room.name).toBe("Encrypted storage");
+  });
+
+  it("uses the crypto engine sender mismatch result for encrypted metadata", async () => {
+    const test = fixture();
+    const storage = new TeleCryptIOStorage(test.client as never);
+    const tree = await storage.createTree("Authenticated vault name");
+    test.setShieldReason(EventShieldReason.MISMATCHED_SENDER);
+
+    expect(await storage.getTreeName(tree.id)).toBe("Encrypted storage");
   });
 
   it("keeps names listable before key recovery and resolves them on retry afterward", async () => {

@@ -48,6 +48,9 @@ function mediaClient(
   const ownerEvent = { getSender: () => "@owner:example.test" };
   return {
     getUserId: () => "@owner:example.test",
+    getCrypto: () => ({
+      getEncryptionInfoForEvent: vi.fn().mockResolvedValue({ shieldColour: 0, shieldReason: null }),
+    }),
     getRoom: () => ({
       currentState: {
         getStateEvents: (type: string, stateKey: string) =>

@@ -17,6 +17,10 @@ import {
   UNSTABLE_MSC3089_LEAF,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
 } from "matrix-js-sdk";
+import {
+  EventShieldReason,
+  OnlySignedDevicesIsolationMode,
+} from "matrix-js-sdk/lib/crypto-api/index.js";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
@@ -844,6 +848,13 @@ export class TeleCryptIOStorage {
     ) {
       throw new StorageError("encrypted storage metadata is invalid or unavailable");
     }
+
+    const crypto = this.client.getCrypto();
+    if (!crypto) throw new StorageError("encryption is not initialized");
+    const encryptionInfo = await crypto.getEncryptionInfoForEvent(event);
+    if (!encryptionInfo || encryptionInfo.shieldReason === EventShieldReason.MISMATCHED_SENDER) {
+      throw new UndecryptableFileError();
+    }
     return event;
   }
 
@@ -1451,6 +1462,9 @@ export class TeleCryptIOStorage {
         "crypto init",
         opts.signal,
       );
+      const crypto = client.getCrypto();
+      if (!crypto) throw new StorageError("encryption is not initialized");
+      crypto.setDeviceIsolationMode(new OnlySignedDevicesIsolationMode());
       progress("Encryption ready — opening secure store…");
 
       storage = new TeleCryptIOStorage(client, opts, opts);

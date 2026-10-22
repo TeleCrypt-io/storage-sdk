@@ -49,27 +49,31 @@ describe("bootstrap and recovery safety", () => {
 
   it("can initialize crypto before starting room sync", async () => {
     const checkKeyBackupAndEnable = vi.fn().mockResolvedValue(null);
+    const setDeviceIsolationMode = vi.fn();
     const client = {
       initRustCrypto: vi.fn().mockResolvedValue(undefined),
       startClient: vi.fn().mockResolvedValue(undefined),
       getSyncState: vi.fn().mockReturnValue(SyncState.Prepared),
-      getCrypto: () => ({ checkKeyBackupAndEnable }),
+      getCrypto: () => ({ checkKeyBackupAndEnable, setDeviceIsolationMode }),
       stopClient: vi.fn(),
     };
 
     const storage = await bootstrap(client, { ...bootstrapOptions(), startClient: false });
     expect(client.startClient).not.toHaveBeenCalled();
+    expect(setDeviceIsolationMode).toHaveBeenCalledWith(expect.objectContaining({ kind: 1 }));
     expect(checkKeyBackupAndEnable).toHaveBeenCalledTimes(1);
 
     await storage.startSync();
     await storage.startSync();
     expect(client.startClient).toHaveBeenCalledTimes(1);
     expect(client.startClient).toHaveBeenCalledWith({ initialSyncLimit: 10 });
+    expect(setDeviceIsolationMode.mock.invocationCallOrder[0]).toBeLessThan(client.startClient.mock.invocationCallOrder[0]!);
   });
 
   it("stops a client when startClient rejects after startup begins", async () => {
     const client = {
       initRustCrypto: vi.fn().mockResolvedValue(undefined),
+      getCrypto: () => ({ setDeviceIsolationMode: vi.fn() }),
       startClient: vi.fn().mockRejectedValue(new Error("initial sync failed")),
       stopClient: vi.fn(),
     };
@@ -83,6 +87,7 @@ describe("bootstrap and recovery safety", () => {
     try {
       const client = {
         initRustCrypto: vi.fn().mockResolvedValue(undefined),
+        getCrypto: () => ({ setDeviceIsolationMode: vi.fn() }),
         startClient: vi.fn().mockReturnValue(new Promise<void>(() => {})),
         stopClient: vi.fn(),
       };
@@ -100,6 +105,7 @@ describe("bootstrap and recovery safety", () => {
     const controller = new AbortController();
     const client = {
       initRustCrypto: vi.fn().mockResolvedValue(undefined),
+      getCrypto: () => ({ setDeviceIsolationMode: vi.fn() }),
       startClient: vi.fn().mockReturnValue(new Promise<void>(() => {})),
       stopClient: vi.fn(),
     };
@@ -112,6 +118,7 @@ describe("bootstrap and recovery safety", () => {
   it("stops a client when first-sync waiting times out", async () => {
     const client = {
       initRustCrypto: vi.fn().mockResolvedValue(undefined),
+      getCrypto: () => ({ setDeviceIsolationMode: vi.fn() }),
       startClient: vi.fn().mockResolvedValue(undefined),
       getSyncState: vi.fn().mockReturnValue(null),
       on: vi.fn(),
