@@ -54,6 +54,7 @@ import {
 } from "./core/http.js";
 import { sanitizeDiagnosticText } from "./core/oidc.js";
 import { validateName } from "./core/validation.js";
+import { ConditionTimeoutError, waitForCondition } from "./core/poll.js";
 import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
 import { DecryptionKeySafe, type KeySafePersistenceOptions } from "./key-safe.js";
@@ -848,8 +849,7 @@ export class TeleCryptIOStorage {
     this.treeNames.set(roomId, name);
   }
 
-  /** Resolves an encrypted vault/folder name through its pointer state event. */
-  async getTreeName(roomId: string, options?: MatrixRequestOptions): Promise<string> {
+  private async getTreeMetadataEvent(roomId: string, options?: MatrixRequestOptions): Promise<MatrixEvent> {
     if (options?.signal?.aborted) throw new StorageError("operation cancelled");
     await this.refreshRoomState(roomId, options);
     const pointer = this.getStateEvent(roomId, STORAGE_METADATA_EVENT_TYPE, "");
@@ -863,15 +863,7 @@ export class TeleCryptIOStorage {
       throw new StorageError("encrypted storage name is unavailable");
     }
     const metadataEventId = validateMatrixEventId(pointerContent.event_id, "storage metadata event ID");
-    let event: MatrixEvent;
-    try {
-      event = await this.readEncryptedMetadataMessage(roomId, metadataEventId);
-    } catch (error) {
-      // A new device can list storage before restoring room keys. Keep the
-      // room visible with a generic label; a later call retries decryption.
-      if (error instanceof UndecryptableFileError) return GENERIC_TREE_NAME;
-      throw error;
-    }
+    const event = await this.readEncryptedMetadataMessage(roomId, metadataEventId);
     const content = event.getContent();
     if (
       !isRecord(content) ||
@@ -882,8 +874,93 @@ export class TeleCryptIOStorage {
       throw new StorageError("encrypted storage name is invalid or unavailable");
     }
     validateName(content.body, "name");
+    return event;
+  }
+
+  /** Resolves an encrypted vault/folder name through its pointer state event. */
+  async getTreeName(roomId: string, options?: MatrixRequestOptions): Promise<string> {
+    let event: MatrixEvent;
+    try {
+      event = await this.getTreeMetadataEvent(roomId, options);
+    } catch (error) {
+      // A new device can list storage before restoring room keys. Keep the
+      // room visible with a generic label; a later call retries decryption.
+      if (error instanceof UndecryptableFileError) return GENERIC_TREE_NAME;
+      throw error;
+    }
+    const content = event.getContent();
     this.treeNames.set(roomId, content.body);
     return content.body;
+  }
+
+  /**
+   * Waits for the current encrypted vault/folder name, or file metadata, to
+   * have its session in the active native key backup. Checks the exact session
+   * even when encryption reuses a key and the backup engine emits no new event.
+   */
+  async waitForKeyBackup(
+    treeId: string,
+    fileId?: string,
+    options?: MatrixRequestOptions,
+  ): Promise<void> {
+    validateMatrixRoomId(treeId);
+    if (fileId !== undefined) validateMatrixEventId(fileId, "file event ID");
+    const timeoutMs = matrixRequestTimeout({ timeoutMs: options?.timeoutMs ?? options?.localTimeoutMs ?? 20_000 });
+    const signal = matrixRequestSignal(options);
+    const crypto = this.client.getCrypto();
+    if (!crypto) throw new StorageError("crypto is not initialized");
+    let sessionId: string | undefined;
+    try {
+      await waitForCondition(async (signal) => {
+        if (!sessionId) {
+          let event: MatrixEvent;
+          if (fileId === undefined) {
+            event = await this.getTreeMetadataEvent(treeId, { signal });
+          } else {
+            const metadataId = await this.getFileMetadataEventId(treeId, fileId, { signal });
+            if (!metadataId) throw new StorageError("encrypted file name is unavailable");
+            event = metadataId === fileId
+              ? await this.getOriginalFileEvent(treeId, fileId)
+              : await this.getFileRenameMetadataEvent(treeId, fileId, metadataId);
+          }
+          const wire = event.getWireContent();
+          if (event.isRedacted() || event.isDecryptionFailure() ||
+            wire.algorithm !== "m.megolm.v1.aes-sha2" || typeof wire.session_id !== "string" || !wire.session_id) {
+            throw new StorageError("encrypted storage session is unavailable");
+          }
+          sessionId = wire.session_id;
+        }
+        if (signal?.aborted) throw new StorageError("operation cancelled");
+        const version = await crypto.getActiveSessionBackupVersion();
+        if (!version) return null;
+        let backup: unknown;
+        try {
+          backup = await this.client.http.authedRequest<unknown>(
+            Method.Get,
+            `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
+            { version },
+            undefined,
+            { prefix: ClientPrefix.V3, abortSignal: signal },
+          );
+        } catch (error) {
+          if (error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND") return null;
+          throw error;
+        }
+        const sessionData = isRecord(backup) ? backup.session_data : undefined;
+        if (!isRecord(backup) || !Number.isSafeInteger(backup.first_message_index) ||
+          (backup.first_message_index as number) < 0 || !isRecord(sessionData) ||
+          ["ciphertext", "ephemeral", "mac"].some((key) => typeof sessionData[key] !== "string" || !sessionData[key])) {
+          throw new StorageError("server key backup session is invalid");
+        }
+        return true;
+      }, { timeoutMs, signal });
+    } catch (error) {
+      if (signal?.aborted) throw new StorageError("operation cancelled", { cause: error });
+      if (error instanceof ConditionTimeoutError) {
+        throw new StorageError("key backup did not settle before timeout; retry key backup", { cause: error });
+      }
+      throw error;
+    }
   }
 
   private async writeFileName(treeId: string, fileId: string, name: string): Promise<void> {
