@@ -12,8 +12,8 @@ unmerged Matrix proposal.
 npm install @telecrypt-io/storage
 ```
 
-The SDK supports Node.js `24.22.1` as its exact engine version. Its release tooling uses the
-bundled npm `11.19.0`.
+The SDK supports Node.js `24.22.1` as its exact engine version. Its release tooling requires
+npm `11.19.0`.
 
 ## Browser quick start
 
