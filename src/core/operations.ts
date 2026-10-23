@@ -349,8 +349,10 @@ async function refreshTreeSpaces(
     if (seen.has(space.id)) continue;
     seen.add(space.id);
     await storage.refreshRoomState(space.id, { signal });
-    const current = storage.getTree(space.id);
-    const refreshedSpace = current?.id === space.id ? current : space;
+    const refreshedSpace = storage.getTree(space.id);
+    if (!refreshedSpace || refreshedSpace.id !== space.id) {
+      throw new StorageError("storage space lookup failed");
+    }
     spaces.push(refreshedSpace);
     pending.push(...await activeTreeDirectories(storage, refreshedSpace, signal));
   }
@@ -376,10 +378,8 @@ function readRelationEvents(
   roomId: string,
   eventType: string,
   stateKey?: string,
-  fallbackRoom?: { currentState?: RelationState } | null,
 ): RelationEvent[] | null {
-  const room = (client.getRoom?.(roomId) ?? fallbackRoom) as
-    { currentState?: RelationState } | null | undefined;
+  const room = client.getRoom(roomId) as { currentState?: RelationState } | null;
   const currentState = room?.currentState;
   if (!currentState?.getStateEvents) return null;
   const result = currentState.getStateEvents(eventType, stateKey);
@@ -407,13 +407,7 @@ async function activeTreeDirectories(
   signal?: AbortSignal,
 ): Promise<TreeSpace[]> {
   const client = storage.getClient();
-  const childEvents = readRelationEvents(
-    client,
-    tree.id,
-    EventType.SpaceChild,
-    undefined,
-    tree.room as unknown as { currentState?: RelationState },
-  );
+  const childEvents = readRelationEvents(client, tree.id, EventType.SpaceChild);
   if (childEvents === null) throw new StorageError("storage folder state is unavailable");
   const activeChildIds = new Set<string>();
   for (const event of childEvents) {
@@ -434,13 +428,6 @@ async function activeTreeDirectories(
         async () => {
           const directory = storage.getTree(childId);
           if (directory?.id === childId) return directory;
-          // The SDK projection remains useful when a custom store does not
-          // expose getTree directly, but an active relation alone is not
-          // enough to treat an unavailable room as a resolved descendant.
-          const projected = typeof tree.getDirectories === "function"
-            ? tree.getDirectories().find((child) => child.id === childId)
-            : undefined;
-          if (projected) return projected;
           if (!joined && client.getRoom?.(childId)?.getMyMembership?.() === "invite") {
             await joinTreeRoom(storage, childId, signal ?? new AbortController().signal);
             joined = true;

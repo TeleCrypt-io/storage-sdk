@@ -38,7 +38,10 @@ import {
 import { waitForCondition } from "../src/core/poll.js";
 import { isFileDeleted, isTreeDeleted, markTreeDeleted } from "../src/deletion-markers.js";
 
-function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
+type TestTree = TreeSpace & { setChildLinks(children: TreeSpace[]): void };
+
+function makeTree(id: string, name: string, isTopLevel: boolean): TestTree {
+  let children: TreeSpace[] = [];
   const currentState: { getStateEvents: (type: string, stateKey?: string) => unknown } = {
     getStateEvents: () => null,
   };
@@ -50,17 +53,23 @@ function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
     id,
     room,
     isTopLevel,
-    getDirectories: () => [],
+    getDirectories: () => children,
+    setChildLinks: (next: TreeSpace[]) => { children = next; },
     listFiles: () => [],
-  } as unknown as TreeSpace;
+  } as unknown as TestTree;
   currentState.getStateEvents = (type: string) =>
     type === EventType.SpaceChild
-      ? tree.getDirectories().map((child) => ({
+      ? children.map((child) => ({
           getStateKey: () => child.id,
           getContent: () => ({ via: ["example.test"] }),
         }))
       : null;
   return tree;
+}
+
+function roomLookup(...trees: TreeSpace[]) {
+  const rooms = new Map(trees.map((tree) => [tree.id, tree.room]));
+  return (roomId: string) => rooms.get(roomId) ?? null;
 }
 
 function encryptedStorageStateEvent(eventType: string, stateKey = ""): unknown {
@@ -114,6 +123,7 @@ describe("history sharing readiness", () => {
     const verify = vi.fn(async () => ({ signedByOwner: true }));
     const client = {
       ...sharingCrypto(), getUserId: () => "@owner:example.test",
+      getRoom: roomLookup(tree),
       getCrypto: () => ({ getDeviceVerificationStatus: verify }),
     };
     const storage = {
@@ -1678,9 +1688,10 @@ describe("operation safety", () => {
   it("does not hide a native media upload denial behind an existing invitation", async () => {
     const tree = makeTree("!vault:example.test", "Vault", true);
     tree.invite = vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(tree) };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => tree,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test" }),
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
       listMembers: vi.fn()
@@ -1699,9 +1710,10 @@ describe("operation safety", () => {
     const tree = makeTree("!vault:example.test", "Vault", true);
     const failure = new Error("already in the room, secret=do-not-ignore");
     tree.invite = vi.fn().mockRejectedValue(failure);
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(tree) };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => tree,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test" }),
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
     } as unknown as TeleCryptIOStorage;
@@ -1714,14 +1726,15 @@ describe("operation safety", () => {
   it("applies share and unshare across every known nested room", async () => {
     const child = makeTree("!child-share:example.test", "Child", false);
     const root = makeTree("!root-share:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     root.invite = vi.fn().mockResolvedValue(undefined);
     const client = { ...sharingCrypto(),
       getUserId: () => "@owner:example.test",
+      getRoom: roomLookup(root, child),
       kick: vi.fn().mockResolvedValue(undefined),
     };
     const storage = { keySafe: { requireReady: async () => undefined },
-      getTree: () => root,
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
@@ -1747,13 +1760,13 @@ describe("operation safety", () => {
     const late = makeTree("!late-share:example.test", "Late", false);
     const child = makeTree("!child-refresh-share:example.test", "Child", false);
     const root = makeTree("!root-refresh-share:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     root.invite = vi.fn().mockResolvedValue(undefined);
     child.invite = vi.fn().mockResolvedValue(undefined);
     late.invite = vi.fn().mockResolvedValue(undefined);
     const trees = new Map([[root.id, root], [child.id, child], [late.id, late]]);
     const refreshRoomState = vi.fn(async (roomId: string) => {
-      if (roomId === child.id) child.getDirectories = () => [late];
+      if (roomId === child.id) child.setChildLinks([late]);
     });
     const client = {
       ...sharingCrypto(),
@@ -1785,12 +1798,13 @@ describe("operation safety", () => {
   it("invites a user separately when a nested room is not yet joined", async () => {
     const child = makeTree("!child-share-invite:example.test", "Child", false);
     const root = makeTree("!root-share-invite:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     root.invite = vi.fn().mockResolvedValue(undefined);
     child.invite = vi.fn().mockResolvedValue(undefined);
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
-      getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test" }),
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
       getRoomMembership: vi.fn().mockImplementation(async (roomId: string) =>
@@ -1809,9 +1823,10 @@ describe("operation safety", () => {
   it("rejects self-sharing and self-unsharing before a membership mutation", async () => {
     const root = makeTree("!self:example.test", "Root", true);
     const kick = vi.fn();
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root), kick };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test", kick }),
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
@@ -1829,9 +1844,10 @@ describe("operation safety", () => {
   it("refuses to kick an existing owner during unshare", async () => {
     const root = makeTree("!owner:example.test", "Root", true);
     const kick = vi.fn();
+    const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root), kick };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@admin:example.test", kick }),
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([
         { userId: "@owner:example.test", role: "owner", membership: "join" },
@@ -1848,11 +1864,12 @@ describe("operation safety", () => {
   it("refuses to demote an owner discovered in a descendant during share", async () => {
     const child = makeTree("!child-owner:example.test", "Child", false);
     const root = makeTree("!root-owner:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     root.invite = vi.fn().mockResolvedValue(undefined);
+    const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
-      getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@admin:example.test" }),
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn()
         .mockResolvedValueOnce([])
@@ -1868,12 +1885,13 @@ describe("operation safety", () => {
   it("reports share as partial after an earlier room invite commit", async () => {
     const child = makeTree("!child-share-partial:example.test", "Child", false);
     const root = makeTree("!root-share-partial:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     root.invite = vi.fn().mockResolvedValue(undefined);
     child.invite = vi.fn().mockRejectedValue(new Error("child invite failed"));
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
-      getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test" }),
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
       getRoomMembership: vi.fn().mockResolvedValue(null),
@@ -1889,14 +1907,15 @@ describe("operation safety", () => {
   it("reports unshare as partial after an earlier room membership commit", async () => {
     const child = makeTree("!child-unshare-partial:example.test", "Child", false);
     const root = makeTree("!root-unshare-partial:example.test", "Root", true);
-    root.getDirectories = () => [child];
+    root.setChildLinks([child]);
     const kick = vi
       .fn()
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("child kick failed"));
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child), kick };
     const storage = { keySafe: { requireReady: async () => undefined },
-      getTree: () => root,
-      getClient: () => ({ ...sharingCrypto(), getUserId: () => "@owner:example.test", kick }),
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
+      getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
