@@ -6,7 +6,7 @@ import * as core from "../../src/core/operations.js";
 import { registerTestUser, loginNewDevice } from "../harness/users.js";
 import { waitFor } from "../harness/waitFor.js";
 
-const evidence = "/home/ubuntu/harness.git/artifacts/storage-bugfixes-20261023/sdk-native-regressions.json";
+const evidence = process.env.STORAGE_MUTATION_REGRESSIONS_RESULTS_PATH;
 const findings: Record<string, unknown> = {};
 const clients: TeleCryptIOStorage[] = [];
 const rooms: Array<{ storage: TeleCryptIOStorage; id: string }> = [];
@@ -22,7 +22,7 @@ let syncGate = Promise.resolve();
 
 async function save(name: string, value: unknown) {
   findings[name] = value;
-  await writeFile(evidence, JSON.stringify(findings, null, 2) + "\n", { mode: 0o600 });
+  if (evidence) await writeFile(evidence, JSON.stringify(findings, null, 2) + "\n", { mode: 0o600 });
 }
 
 async function openStorage(user: Awaited<ReturnType<typeof registerTestUser>>) {
