@@ -54,8 +54,6 @@ import type {
   DeleteResult,
   JoinResult,
   Member,
-  RecoveryRestore,
-  RecoverySetup,
   RenameResult,
   ShareResult,
   UnshareResult,
@@ -1637,24 +1635,6 @@ export async function downloadFile(
       name: await storage.getFileName(tree.id, fileId, { signal }),
     };
   });
-}
-
-export async function setupRecovery(
-  storage: TeleCryptIOStorage,
-  options?: OperationOptions,
-): Promise<RecoverySetup> {
-  return withOperationDeadline(options, (signal) => storage.keys.setupRecovery(signal), "mutation");
-}
-
-export async function restoreRecovery(
-  storage: TeleCryptIOStorage,
-  recoveryKey: string,
-  options?: OperationOptions,
-): Promise<RecoveryRestore> {
-  return withOperationDeadline(options, (signal) =>
-    storage.keys.restoreFromRecoveryKey(recoveryKey, signal),
-    "mutation",
-  );
 }
 
 function tsToIso(ts: number | undefined | null): string | null {

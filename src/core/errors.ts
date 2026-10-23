@@ -9,71 +9,7 @@ export class StorageError extends Error {
   }
 }
 
-/** Setup would replace account recovery state, which this SDK never does. */
-export class RecoveryAlreadyConfiguredError extends StorageError {
-  readonly code = "RECOVERY_ALREADY_CONFIGURED" as const;
-
-  constructor() {
-    super(
-      "recovery is already configured for this account; use the existing Recovery Key or restore it on this device",
-    );
-    this.name = "RecoveryAlreadyConfiguredError";
-  }
-}
-
-/** Restore failed without exposing provider or crypto-library error details. */
-export class RecoveryRestoreError extends StorageError {
-  readonly code = "RECOVERY_RESTORE_FAILED" as const;
-
-  constructor(cause?: unknown) {
-    super(
-      "recovery restore failed; verify the Recovery Key and account",
-      cause === undefined ? undefined : { cause },
-    );
-    this.name = "RecoveryRestoreError";
-  }
-}
-
-/** Setup failed before the generated Recovery Key could be safely returned. */
-export class RecoverySetupError extends StorageError {
-  readonly code = "RECOVERY_SETUP_FAILED" as const;
-
-  constructor(cause?: unknown) {
-    super(
-      "recovery setup did not complete; check recovery status before retrying",
-      cause === undefined ? undefined : { cause },
-    );
-    this.name = "RecoverySetupError";
-  }
-}
-
-/** The recovery setup transport result is ambiguous; state must be checked before retrying. */
-export class RecoverySetupAmbiguousError extends StorageError {
-  readonly code = "RECOVERY_SETUP_AMBIGUOUS" as const;
-
-  constructor(cause?: unknown) {
-    super(
-      "recovery setup may have completed; check recovery status before retrying",
-      cause === undefined ? undefined : { cause },
-    );
-    this.name = "RecoverySetupAmbiguousError";
-  }
-}
-
-/** Recovery restore was cancelled after the provider may have changed state. */
-export class RecoveryRestoreAmbiguousError extends StorageError {
-  readonly code = "RECOVERY_RESTORE_AMBIGUOUS" as const;
-
-  constructor(cause?: unknown) {
-    super(
-      "recovery restore may have completed; check recovery status before retrying",
-      cause === undefined ? undefined : { cause },
-    );
-    this.name = "RecoveryRestoreAmbiguousError";
-  }
-}
-
-/** A Matrix mutation was cancelled after its request started. */
+/** A mutation may have committed before its response was lost. */
 export class MutationOutcomeUnknownError extends StorageError {
   readonly code = "MUTATION_OUTCOME_UNKNOWN" as const;
   readonly operation: string;
