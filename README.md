@@ -12,7 +12,7 @@ unmerged Matrix proposal.
 npm install @telecrypt-io/storage
 ```
 
-The SDK supports Node.js `24.21.0` as its exact engine version. Its release tooling uses the
+The SDK supports Node.js `24.22.1` as its exact engine version. Its release tooling uses the
 bundled npm `11.19.0`.
 
 ## Browser quick start
@@ -108,9 +108,25 @@ room keys and signs the current login using the existing account keys. Normal us
 Setup and restore never replace an existing safe or account signing identity. Resetting the account
 password cannot recover encrypted files.
 
+In SDK 0.10, `storage.keySafe` replaces `storage.keys.*`, `core.setupRecovery`, and
+`core.restoreRecovery`; those obsolete entry points and their recovery-specific result/error types
+have been removed. Use the setup, explicit `confirmSaved`, status and restore flow above. A returned
+Recovery Key alone does not mean the user has saved it or that this login is ready. Existing saved
+Recovery Keys, account signing keys and encrypted files remain valid; do not create a replacement Safe.
+
+| Removed entry point | Replacement |
+| --- | --- |
+| `storage.keys.setupRecovery()` / `core.setupRecovery(storage)` | `storage.keySafe.setup()`, then `confirmSaved()` after the user saves the key |
+| `storage.keys.getStatus()` / `isRecoverySetup()` | `storage.keySafe.getStatus()`; normal storage access requires `state === "ready"` |
+| `storage.keys.restoreFromRecoveryKey(key)` / `core.restoreRecovery(storage, key)` | `storage.keySafe.restore(key)` |
+
+Use `KeySafeStatus` instead of the former `RecoveryStatus` topology. Safe operations return their
+typed results directly and report failures through `StorageError`; callers should no longer import
+the removed `RecoverySetup`, `RecoveryRestore`, or `Recovery*Error` types.
+
 Short-lived clients should call `storage.waitForKeyBackup(treeId, fileId?, options?)` after creating
 or renaming encrypted metadata and before closing. Omit `fileId` for a vault or folder. This checks
-the exact encryption session in the active server backup, including reused keys that produce no
+the attachment and current name encryption sessions in the active server backup, including reused keys that produce no
 new backup-progress event. If verification fails, retain the local profile and retry backup;
 the metadata mutation has already committed.
 

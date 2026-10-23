@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import { EventType } from "matrix-js-sdk";
+import { EventType, UNSTABLE_MSC3089_BRANCH } from "matrix-js-sdk";
 import { writeFile } from "node:fs/promises";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
 import * as core from "../../src/core/operations.js";
@@ -94,6 +94,55 @@ beforeAll(async () => {
   reader = await storageUser("mutation_regression_reader");
   ownerB = await openStorage(await loginNewDevice(owner.user));
   await ownerB.keySafe.restore(owner.recoveryKey);
+}, 120000);
+
+it.each([false, true])("reconciles rename after another device deletes the file (interrupted cleanup: %s)", async (interruptCleanup) => {
+  const storage = owner.storage;
+  const vault = await core.createVault(storage, "Concurrent deletion");
+  const file = await core.uploadFile(storage, vault.id, "before.txt", new TextEncoder().encode("race"), "text/plain");
+  await storage.waitForKeyBackup(vault.id, file.id);
+  await waitFor(() => ownerB.getTree(vault.id), { label: "second device sees vault", timeoutMs: 15000 });
+  const client = storage.getClient();
+  const send = client.sendMessage.bind(client);
+  const redact = client.redactEvent.bind(client);
+  let release!: () => void;
+  let paused = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const sendSpy = vi.spyOn(client, "sendMessage").mockImplementation(async (...args) => {
+    if ((args[1] as Record<string, unknown>).body === "after.txt") {
+      paused = true;
+      await gate;
+    }
+    return send(...args);
+  });
+  const redactSpy = vi.spyOn(client, "redactEvent").mockImplementation(async (...args) => {
+    if (interruptCleanup) throw new Error("rename cleanup temporarily unavailable");
+    return redact(...args);
+  });
+  const renamed = core.renameFile(storage, vault.id, file.id, "after.txt").catch((error: unknown) => error);
+  try {
+    await waitFor(() => paused, { label: "rename paused after validation", timeoutMs: 15000 });
+    await core.deleteFile(ownerB, vault.id, file.id);
+    release();
+    expect(await renamed).toBeInstanceOf(Error);
+    sendSpy.mockRestore();
+    redactSpy.mockRestore();
+    // Retry from the device that already completed deletion: its local marker
+    // must not hide a late owner-authored listing from reconciliation.
+    await core.deleteFile(ownerB, vault.id, file.id);
+    await storage.refreshRoomState(vault.id);
+    expect(await core.listFiles(storage, vault.id)).toEqual([]);
+    const listing = client.getRoom(vault.id)?.currentState.getStateEvents(UNSTABLE_MSC3089_BRANCH.name, file.id);
+    expect(listing?.isRedacted()).toBe(true);
+    await save(`concurrentRenameDelete-${interruptCleanup}`, { renameRejected: true, deleteRetryCompleted: true, listingRedacted: true });
+  } finally {
+    release();
+    await renamed;
+    sendSpy.mockRestore();
+    redactSpy.mockRestore();
+    await core.deleteFile(ownerB, vault.id, file.id);
+    await core.deleteVault(ownerB, vault.id);
+  }
 }, 120000);
 
 afterAll(async () => {

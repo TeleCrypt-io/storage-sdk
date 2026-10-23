@@ -1,6 +1,6 @@
 {
   "name": "@telecrypt-io/storage",
-  "version": "0.9.5",
+  "version": "0.10.0",
   "license": "BUSL-1.1",
   "type": "module",
   "packageManager": "npm@11.19.0",
@@ -22,7 +22,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": "24.21.0"
+    "node": "24.22.1"
   },
   "publishConfig": {
     "access": "public"

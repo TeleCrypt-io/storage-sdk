@@ -236,4 +236,40 @@ describe("mandatory Decryption Key Safe", () => {
     await expect(f.safe.confirmSaved()).rejects.toThrow("disk full");
     expect(await f.make().getStatus()).toEqual({ state: "confirmation-required", recoveryKey: f.encoded });
   });
+
+  it("serializes setup and status through the same Safe", async () => {
+    const f = fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const configure = f.crypto.bootstrapSecretStorage.getMockImplementation()!;
+    f.crypto.bootstrapSecretStorage.mockImplementationOnce(async (options) => {
+      await gate;
+      return configure(options);
+    });
+    const setup = f.safe.setup();
+    let statusReturned = false;
+    const status = f.safe.getStatus().then((result) => { statusReturned = true; return result; });
+    await vi.waitFor(() => expect(f.crypto.bootstrapSecretStorage).toHaveBeenCalled());
+    expect(statusReturned).toBe(false);
+    release();
+    await setup;
+    expect(await status).toEqual({ state: "confirmation-required", recoveryKey: f.encoded });
+  });
+
+  it("preserves the saved key and stops setup at the next boundary after cancellation", async () => {
+    const f = fixture();
+    const controller = new AbortController();
+    const configure = f.crypto.bootstrapSecretStorage.getMockImplementation()!;
+    f.crypto.bootstrapSecretStorage.mockImplementationOnce(async (options) => {
+      await configure(options);
+      controller.abort();
+    });
+    await expect(f.safe.setup(controller.signal)).rejects.toThrow("operation cancelled");
+    expect(f.crypto.bootstrapCrossSigning).not.toHaveBeenCalled();
+    expect(await f.safe.getStatus()).toEqual({ state: "confirmation-required", recoveryKey: f.encoded });
+    await f.safe.setup();
+    await f.safe.confirmSaved();
+    expect(await f.safe.getStatus()).toEqual({ state: "ready" });
+    expect(f.crypto.createRecoveryKeyFromPassphrase).toHaveBeenCalledOnce();
+  });
 });

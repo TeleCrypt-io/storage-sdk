@@ -25,15 +25,9 @@ import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
 import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api/index.js";
-import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import type { TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
 import {
   FileTooLargeError,
-  RecoveryAlreadyConfiguredError,
-  RecoveryRestoreError,
-  RecoverySetupAmbiguousError,
-  RecoverySetupError,
-  RecoveryRestoreAmbiguousError,
   MutationOutcomeUnknownError,
   MutationPartialError,
   RoomCreationAmbiguousError,
@@ -64,7 +58,6 @@ import {
   validateName,
 } from "./core/validation.js";
 import { ConditionTimeoutError, waitForCondition } from "./core/poll.js";
-import type { RecoveryStatus } from "./core/types.js";
 import { isTreeDeleted } from "./deletion-markers.js";
 import { DecryptionKeySafe, type KeySafePersistenceOptions } from "./key-safe.js";
 import { prepareReaderHistorySharing } from "./sharing.js";
@@ -133,7 +126,7 @@ export interface CreateTeleCryptIOStorageOptions {
   /**
    * Use a persistent crypto store (IndexedDB) so keys survive a restart on this
    * device. This is the default (`true`) — it is what makes both same-device
-   * restart recovery and (via `keys.setupRecovery`/`restoreFromRecoveryKey`)
+   * restart recovery and (via `keySafe.setup`/`keySafe.restore`)
    * new-device recovery possible. Set explicitly to `false` to opt into an
    * in-memory, amnesiac store; this must be a deliberate choice, e.g. for a
    * short-lived process that should never persist secrets to disk.
@@ -162,8 +155,8 @@ export interface CreateTeleCryptIOStorageOptions {
   signal?: AbortSignal;
   /**
    * Optional platform-supplied crypto callbacks (e.g. to source the secret
-   * storage key from an OS keychain instead of prompting). `keys.setupRecovery`
-   * and `keys.restoreFromRecoveryKey` temporarily override
+   * storage key from an OS keychain instead of prompting). `keySafe.setup`
+   * and `keySafe.restore` temporarily override
    * `getSecretStorageKey`/`cacheSecretStorageKey` on this object for the
    * duration of the call, then restore whatever was here before.
    */
@@ -206,7 +199,6 @@ export interface CreateFromOidcOptions {
   cryptoCallbacks?: CryptoCallbacks;
 }
 
-const recoveryMutationQueues = new WeakMap<MatrixClient, Promise<void>>();
 const treeMutationQueues = new WeakMap<MatrixClient, Promise<void>>();
 const TREE_SYNC_TIMEOUT_MS = 15000;
 const MEDIA_TIMEOUT_MS = 30000;
@@ -505,60 +497,18 @@ interface SecretStorageStatusShape {
   ready: boolean;
 }
 
-interface CrossSigningStatusShape {
-  publicKeysOnDevice: boolean;
-  privateKeysCachedLocally: {
-    masterKey: boolean;
-    selfSigningKey: boolean;
-    userSigningKey: boolean;
-  };
-  privateKeysInSecretStorage: boolean;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validateSecretStorageStatus(value: unknown): SecretStorageStatusShape {
-  if (!isRecord(value)) throw new RecoverySetupAmbiguousError();
+  if (!isRecord(value)) throw new StorageError("secret-storage status is unavailable or invalid");
   const defaultKeyId = value.defaultKeyId;
   if (defaultKeyId !== null && (typeof defaultKeyId !== "string" || defaultKeyId.length === 0)) {
-    throw new RecoverySetupAmbiguousError();
+    throw new StorageError("secret-storage status is unavailable or invalid");
   }
-  if (typeof value.ready !== "boolean") throw new RecoverySetupAmbiguousError();
+  if (typeof value.ready !== "boolean") throw new StorageError("secret-storage status is unavailable or invalid");
   return { defaultKeyId, ready: value.ready };
-}
-
-function validateBackupVersion(value: unknown): string | null {
-  if (value !== null && (typeof value !== "string" || value.length === 0)) {
-    throw new RecoverySetupAmbiguousError();
-  }
-  return value;
-}
-
-function validateCrossSigningStatus(value: unknown): CrossSigningStatusShape {
-  if (!isRecord(value) || typeof value.publicKeysOnDevice !== "boolean" ||
-      typeof value.privateKeysInSecretStorage !== "boolean" ||
-      !isRecord(value.privateKeysCachedLocally)) {
-    throw new RecoverySetupAmbiguousError();
-  }
-  const cached = value.privateKeysCachedLocally;
-  if (
-    typeof cached.masterKey !== "boolean" ||
-    typeof cached.selfSigningKey !== "boolean" ||
-    typeof cached.userSigningKey !== "boolean"
-  ) {
-    throw new RecoverySetupAmbiguousError();
-  }
-  return {
-    publicKeysOnDevice: value.publicKeysOnDevice,
-    privateKeysCachedLocally: {
-      masterKey: cached.masterKey,
-      selfSigningKey: cached.selfSigningKey,
-      userSigningKey: cached.userSigningKey,
-    },
-    privateKeysInSecretStorage: value.privateKeysInSecretStorage,
-  };
 }
 
 class RecoveryCryptoTimeoutError extends Error {
@@ -933,48 +883,54 @@ export class TeleCryptIOStorage {
     const signal = matrixRequestSignal(options);
     const crypto = this.client.getCrypto();
     if (!crypto) throw new StorageError("crypto is not initialized");
-    let sessionId: string | undefined;
+    let sessionIds: Set<string> | undefined;
     try {
       await waitForCondition(async (signal) => {
-        if (!sessionId) {
-          let event: MatrixEvent;
+        if (!sessionIds) {
+          const events: MatrixEvent[] = [];
           if (fileId === undefined) {
-            event = await this.getTreeMetadataEvent(treeId, { signal });
+            events.push(await this.getTreeMetadataEvent(treeId, { signal }));
           } else {
+            // The attachment contains the file key; a later rename may use a
+            // different session. Both must be recoverable.
+            events.push(await this.getOriginalFileEvent(treeId, fileId));
             const metadataId = await this.getFileMetadataEventId(treeId, fileId, { signal });
             if (!metadataId) throw new StorageError("encrypted file name is unavailable");
-            event = metadataId === fileId
-              ? await this.getOriginalFileEvent(treeId, fileId)
-              : await this.getFileRenameMetadataEvent(treeId, fileId, metadataId);
+            if (metadataId !== fileId) events.push(await this.getFileRenameMetadataEvent(treeId, fileId, metadataId));
           }
-          const wire = event.getWireContent();
-          if (event.isRedacted() || event.isDecryptionFailure() ||
-            wire.algorithm !== STORAGE_ROOM_ENCRYPTION_ALGORITHM || typeof wire.session_id !== "string" || !wire.session_id) {
-            throw new StorageError("encrypted storage session is unavailable");
+          sessionIds = new Set();
+          for (const event of events) {
+            const wire = event.getWireContent();
+            if (event.isRedacted() || event.isDecryptionFailure() ||
+              wire.algorithm !== STORAGE_ROOM_ENCRYPTION_ALGORITHM || typeof wire.session_id !== "string" || !wire.session_id) {
+              throw new StorageError("encrypted storage session is unavailable");
+            }
+            sessionIds.add(wire.session_id);
           }
-          sessionId = wire.session_id;
         }
         if (signal?.aborted) throw new StorageError("operation cancelled");
         const version = await crypto.getActiveSessionBackupVersion();
         if (!version) return null;
-        let backup: unknown;
-        try {
-          backup = await this.client.http.authedRequest<unknown>(
-            Method.Get,
-            `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
-            { version },
-            undefined,
-            { prefix: ClientPrefix.V3, abortSignal: signal },
-          );
-        } catch (error) {
-          if (error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND") return null;
-          throw error;
-        }
-        const sessionData = isRecord(backup) ? backup.session_data : undefined;
-        if (!isRecord(backup) || !Number.isSafeInteger(backup.first_message_index) ||
-          (backup.first_message_index as number) < 0 || !isRecord(sessionData) ||
-          ["ciphertext", "ephemeral", "mac"].some((key) => typeof sessionData[key] !== "string" || !sessionData[key])) {
-          throw new StorageError("server key backup session is invalid");
+        for (const sessionId of sessionIds) {
+          let backup: unknown;
+          try {
+            backup = await this.client.http.authedRequest<unknown>(
+              Method.Get,
+              `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
+              { version },
+              undefined,
+              { prefix: ClientPrefix.V3, abortSignal: signal },
+            );
+          } catch (error) {
+            if (error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND") return null;
+            throw error;
+          }
+          const sessionData = isRecord(backup) ? backup.session_data : undefined;
+          if (!isRecord(backup) || !Number.isSafeInteger(backup.first_message_index) ||
+            (backup.first_message_index as number) < 0 || !isRecord(sessionData) ||
+            ["ciphertext", "ephemeral", "mac"].some((key) => typeof sessionData[key] !== "string" || !sessionData[key])) {
+            throw new StorageError("server key backup session is invalid");
+          }
         }
         return true;
       }, { timeoutMs, signal });
@@ -1014,12 +970,20 @@ export class TeleCryptIOStorage {
       body: name,
       file_event_id: fileId,
     });
-    await this.client.sendStateEvent(
+    const listing = await this.client.sendStateEvent(
       treeId,
       UNSTABLE_MSC3089_BRANCH.name,
       { active: true, metadata_event_id: metadataEventId } as never,
       fileId,
     );
+    // Another device can delete the attachment after the preflight check.
+    // Its redaction wins over this rename, including a late listing update.
+    if ((await this.getOriginalFileEvent(treeId, fileId, true)).isRedacted()) {
+      await this.client.redactEvent(treeId, listing.event_id);
+      await this.client.redactEvent(treeId, metadataEventId);
+      this.fileNames.delete(this.fileNameKey(treeId, fileId));
+      throw new StorageError("file was deleted while renaming; the rename was removed");
+    }
     this.fileNames.set(this.fileNameKey(treeId, fileId), name);
   }
 
@@ -1387,11 +1351,11 @@ export class TeleCryptIOStorage {
 
   /**
    * Recommended entry point: builds the MatrixClient with a persistent crypto
-   * store and the secret-storage callback wiring `keys.*` needs, starts the
+   * store and the secret-storage callback wiring `keySafe` needs, starts the
    * client, waits for the first sync, and returns a ready TeleCryptIOStorage.
    *
    * The plain constructor remains available for advanced callers who need to
-   * build/configure the MatrixClient themselves; in that case `keys.*` only
+   * build/configure the MatrixClient themselves; in that case `keySafe` only
    * works if the caller wires equivalent cryptoCallbacks onto the client at
    * construction time (see `cryptoCallbacks` above for why: matrix-js-sdk
    * captures a single callbacks object at MatrixClient construction, so it
@@ -1689,361 +1653,6 @@ export class TeleCryptIOStorage {
       callbacks.getSecretStorageKey = prevGetKey;
       callbacks.cacheSecretStorageKey = prevCache;
     }
-  }
-
-  private async withRecoveryMutation<T>(
-    operation: (signal?: AbortSignal) => Promise<T>,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    const previous = recoveryMutationQueues.get(this.client) ?? Promise.resolve();
-    const run = previous.catch(() => undefined).then(() => {
-      if (signal?.aborted) throw new StorageError("operation cancelled");
-      return operation(signal);
-    });
-    recoveryMutationQueues.set(
-      this.client,
-      run.then(
-        () => undefined,
-        () => undefined,
-      ),
-    );
-    return run;
-  }
-
-  /**
-   * Bootstraps cross-signing and secret storage with a brand-new server-side
-   * key backup, and returns the Recovery Key for the caller to show the user.
-   * This is what makes `restoreFromRecoveryKey` on another device possible.
-   */
-  private async keysSetupRecovery(signal?: AbortSignal): Promise<{ recoveryKey: string }> {
-    return this.withRecoveryMutation((queuedSignal) => this.performKeysSetupRecovery(queuedSignal), signal);
-  }
-
-  private async performKeysSetupRecovery(signal?: AbortSignal): Promise<{ recoveryKey: string }> {
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    const crypto = this.requireCrypto();
-
-    // Recovery setup is deliberately one-way for an account. Replacing an
-    // existing secret-storage key or backup can strand files on other devices;
-    // never disable or reset either resource just to mint a new key.
-    let status: SecretStorageStatusShape;
-    let backupVersion: string | null;
-    let crossSigningStatus: CrossSigningStatusShape | undefined;
-    try {
-      const crossSigningPromise =
-        typeof crypto.getCrossSigningStatus === "function"
-          ? withRecoveryCryptoDeadline(() => crypto.getCrossSigningStatus(), signal, "cross-signing status")
-          : Promise.resolve(undefined);
-      const [rawStatus, rawBackupVersion, rawCrossSigningStatus] = await Promise.all([
-        withRecoveryCryptoDeadline(() => crypto.getSecretStorageStatus(), signal, "secret-storage status"),
-        withRecoveryCryptoDeadline(() => crypto.getActiveSessionBackupVersion(), signal, "backup status"),
-        crossSigningPromise,
-      ]);
-      const validatedStatus = validateSecretStorageStatus(rawStatus);
-      const validatedBackupVersion = validateBackupVersion(rawBackupVersion);
-      const validatedCrossSigningStatus =
-        rawCrossSigningStatus === undefined
-          ? undefined
-          : validateCrossSigningStatus(rawCrossSigningStatus);
-      status = validatedStatus;
-      backupVersion = validatedBackupVersion;
-      crossSigningStatus = validatedCrossSigningStatus;
-    } catch (error) {
-      // A failed preflight cannot prove that recovery is absent. This is a
-      // permanent fail-closed boundary: callers must obtain an independent
-      // status result before attempting another one-way setup.
-      if (signal?.aborted && error instanceof StorageError) {
-        throw error;
-      }
-      throw new RecoverySetupAmbiguousError(error);
-    }
-    if (status.defaultKeyId || status.ready || backupVersion !== null) {
-      throw new RecoveryAlreadyConfiguredError();
-    }
-    if (
-      crossSigningStatus?.publicKeysOnDevice &&
-      !crossSigningStatus.privateKeysInSecretStorage &&
-      !Object.values(crossSigningStatus.privateKeysCachedLocally).every(Boolean)
-    ) {
-      throw new RecoverySetupAmbiguousError();
-    }
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-
-    try {
-      await withRecoveryCryptoDeadline(() => crypto.bootstrapCrossSigning({}), signal, "cross-signing bootstrap");
-    } catch (error) {
-      // Cross-signing setup can commit server-side state before a transport
-      // failure is observed. Do not turn that uncertainty into a retry that
-      // could replace recovery state.
-      throw new RecoverySetupAmbiguousError(error);
-    }
-    // CryptoApi mutations do not accept an AbortSignal. Once one has settled,
-    // do not cross the next one-way mutation boundary: the caller may already
-    // have timed out and would otherwise lose the only key it could display.
-    if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-
-    let generated: Awaited<ReturnType<typeof crypto.createRecoveryKeyFromPassphrase>>;
-    try {
-      generated = await withRecoveryCryptoDeadline(
-        () => crypto.createRecoveryKeyFromPassphrase(),
-        signal,
-        "recovery-key generation",
-      );
-    } catch (error) {
-      throw new RecoverySetupAmbiguousError(error);
-    }
-    if (!generated.encodedPrivateKey) {
-      throw new RecoverySetupAmbiguousError();
-    }
-    if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-
-    let generatedWasUsed = false;
-    try {
-      await this.withSecretStorageKey(generated.privateKey, async () => {
-        if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-        await withRecoveryCryptoDeadline(() => crypto.bootstrapSecretStorage({
-            createSecretStorageKey: async () => {
-              if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-              generatedWasUsed = true;
-              return generated;
-            },
-            // The preflight above proves that this account has no active
-            // backup.  Matrix 42 does not create a backup when this option is
-            // omitted; it only stores a key for an already-existing backup.
-            // Keep the preflight/postflight ambiguity handling around this
-            // one-way operation: an uncertain result must never be retried.
-            // The per-client queue closes the local race; callers must inspect
-            // the resulting status before attempting setup from another client.
-            setupNewKeyBackup: true,
-          }), signal, "secret-storage bootstrap");
-        if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-        await withRecoveryCryptoDeadline(
-          () => crypto.checkKeyBackupAndEnable(),
-          signal,
-          "key-backup enable",
-        );
-      }, signal);
-      if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-      if (!generatedWasUsed) throw new RecoverySetupAmbiguousError();
-    } catch (error) {
-      if (error instanceof RecoverySetupAmbiguousError) throw error;
-      // Both calls can commit server-side state before a transport error. A
-      // status probe distinguishes a clean failure from an unsafe retry.
-      try {
-        const [rawAfterStatus, rawAfterBackup] = await Promise.all([
-          withRecoveryCryptoDeadline(() => crypto.getSecretStorageStatus(), signal, "secret-storage status"),
-          withRecoveryCryptoDeadline(() => crypto.getActiveSessionBackupVersion(), signal, "backup status"),
-        ]);
-        const afterStatus = validateSecretStorageStatus(rawAfterStatus);
-        const afterBackup = validateBackupVersion(rawAfterBackup);
-        if (afterStatus.defaultKeyId || afterStatus.ready || afterBackup !== null) {
-          throw new RecoverySetupAmbiguousError();
-        }
-      } catch (statusError) {
-        if (statusError instanceof RecoverySetupAmbiguousError) {
-          throw new RecoverySetupAmbiguousError(
-            new AggregateError([error, statusError], "recovery setup and status verification were both inconclusive", {
-              cause: error,
-            }),
-          );
-        }
-        if (statusError instanceof RecoverySetupError) throw statusError;
-        // A failed status probe cannot prove that the one-way operation did
-        // not commit. Never turn that uncertainty into an apparently safe
-        // retry that could replace account recovery state.
-        throw new RecoverySetupAmbiguousError(
-          new AggregateError([error, statusError], "recovery setup and status verification failed", {
-            cause: error,
-          }),
-        );
-      }
-      throw new RecoverySetupError(error);
-    }
-
-    try {
-      const [rawAfterStatus, rawAfterBackup] = await Promise.all([
-        withRecoveryCryptoDeadline(() => crypto.getSecretStorageStatus(), signal, "secret-storage status"),
-        withRecoveryCryptoDeadline(() => crypto.getActiveSessionBackupVersion(), signal, "backup status"),
-      ]);
-      const afterStatus = validateSecretStorageStatus(rawAfterStatus);
-      const afterBackup = validateBackupVersion(rawAfterBackup);
-      if (!afterStatus.ready || afterBackup === null) throw new RecoverySetupAmbiguousError();
-    } catch (error) {
-      if (error instanceof RecoverySetupAmbiguousError) throw error;
-      throw new RecoverySetupAmbiguousError(error);
-    }
-
-    // This is the last boundary before exposing the only recovery credential
-    // to the caller. Cancellation here must not return a key that the caller
-    // may already have abandoned.
-    if (signal?.aborted) throw new RecoverySetupAmbiguousError();
-    return { recoveryKey: generated.encodedPrivateKey };
-  }
-
-  /** Is there an active key backup and a ready secret storage right now? */
-  private async keysIsRecoverySetup(signal?: AbortSignal): Promise<boolean> {
-    return this.withRecoveryMutation(
-      (queuedSignal) => {
-        if (queuedSignal?.aborted) throw new StorageError("operation cancelled");
-        return this.performKeysIsRecoverySetup(queuedSignal);
-      },
-      signal,
-    );
-  }
-
-  private async performKeysIsRecoverySetup(signal?: AbortSignal): Promise<boolean> {
-    const crypto = this.client.getCrypto();
-    if (!crypto) return false;
-    try {
-      const [rawStorageStatus, rawBackupVersion] = await Promise.all([
-        withRecoveryCryptoDeadline(() => crypto.getSecretStorageStatus(), signal, "secret-storage status"),
-        withRecoveryCryptoDeadline(() => crypto.getActiveSessionBackupVersion(), signal, "backup status"),
-      ]);
-      const storageStatus = validateSecretStorageStatus(rawStorageStatus);
-      const backupVersion = validateBackupVersion(rawBackupVersion);
-      return storageStatus.ready && backupVersion !== null;
-    } catch (error) {
-      throw new RecoverySetupAmbiguousError(error);
-    }
-  }
-
-  /** Returns one consistent recovery topology snapshot without exposing raw crypto callbacks. */
-  private async keysGetRecoveryStatus(signal?: AbortSignal): Promise<RecoveryStatus> {
-    return this.withRecoveryMutation(
-      async (queuedSignal) => {
-        if (queuedSignal?.aborted) throw new StorageError("operation cancelled");
-        const crypto = this.requireCrypto();
-        try {
-          const [rawSecretStorage, rawBackupVersion, rawCrossSigning] = await Promise.all([
-            withRecoveryCryptoDeadline(() => crypto.getSecretStorageStatus(), queuedSignal, "secret-storage status"),
-            withRecoveryCryptoDeadline(() => crypto.getActiveSessionBackupVersion(), queuedSignal, "backup status"),
-            withRecoveryCryptoDeadline(() => crypto.getCrossSigningStatus(), queuedSignal, "cross-signing status"),
-          ]);
-          const secretStorage = validateSecretStorageStatus(rawSecretStorage);
-          const backupVersion = validateBackupVersion(rawBackupVersion);
-          const crossSigning = validateCrossSigningStatus(rawCrossSigning);
-          const privateKeysCachedLocally = Object.values(crossSigning.privateKeysCachedLocally).every(Boolean);
-          const ready =
-            crossSigning.publicKeysOnDevice &&
-            (privateKeysCachedLocally || crossSigning.privateKeysInSecretStorage) &&
-            secretStorage.ready &&
-            backupVersion !== null;
-          const unconfigured =
-            !crossSigning.publicKeysOnDevice &&
-            !secretStorage.defaultKeyId &&
-            backupVersion === null;
-          return {
-            state: ready ? "ready" : unconfigured ? "unconfigured" : "partial",
-            crossSigning: {
-              publicKeysOnDevice: crossSigning.publicKeysOnDevice,
-              privateKeysCachedLocally,
-              privateKeysInSecretStorage: crossSigning.privateKeysInSecretStorage,
-            },
-            secretStorage: {
-              ready: secretStorage.ready,
-              defaultKeyId: secretStorage.defaultKeyId,
-            },
-            backupVersion,
-          };
-        } catch (error) {
-          throw new RecoverySetupAmbiguousError(error);
-        }
-      },
-      signal,
-    );
-  }
-
-  /**
-   * On a new device: unlocks secret storage with the Recovery Key, loads the
-   * key-backup decryption key out of secret storage, and restores the key
-   * backup so previously-uploaded files become decryptable again.
-   *
-   * Throws a clear error (never silently "succeeds" with zero keys) if the
-   * recovery key is malformed or does not unlock this account's secret
-   * storage / key backup.
-   */
-  private async keysRestoreFromRecoveryKey(
-    recoveryKey: string,
-    signal?: AbortSignal,
-  ): Promise<{ imported: number; total: number }> {
-    return this.withRecoveryMutation(
-      (queuedSignal) => this.performKeysRestoreFromRecoveryKey(recoveryKey, queuedSignal),
-      signal,
-    );
-  }
-
-  private async performKeysRestoreFromRecoveryKey(
-    recoveryKey: string,
-    signal?: AbortSignal,
-  ): Promise<{ imported: number; total: number }> {
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-    const crypto = this.requireCrypto();
-
-    if (
-      typeof recoveryKey !== "string" ||
-      recoveryKey.length === 0 ||
-      /[^A-Za-z0-9 ]/.test(recoveryKey)
-    ) {
-      throw new RecoveryRestoreError();
-    }
-
-    let privateKey: Uint8Array<ArrayBuffer>;
-    try {
-      privateKey = decodeRecoveryKey(recoveryKey);
-    } catch (error) {
-      throw new RecoveryRestoreError(error);
-    }
-    if (signal?.aborted) throw new StorageError("operation cancelled");
-
-    return this.withSecretStorageKey(privateKey, async () => {
-      try {
-        await withRecoveryCryptoDeadline(
-          () => crypto.loadSessionBackupPrivateKeyFromSecretStorage(),
-          signal,
-          "backup-key load",
-        );
-        if (signal?.aborted) throw new RecoveryRestoreAmbiguousError();
-      } catch (error) {
-        if (error instanceof RecoveryRestoreAmbiguousError) throw error;
-        throw new RecoveryRestoreError(error);
-      }
-
-      try {
-        const result = await withRecoveryCryptoDeadline(
-          () => crypto.restoreKeyBackup(),
-          signal,
-          "key-backup restore",
-        );
-        if (signal?.aborted) throw new RecoveryRestoreAmbiguousError();
-        if (!Number.isSafeInteger(result.imported) || !Number.isSafeInteger(result.total) || result.imported < 0 || result.total < result.imported) {
-          throw new RecoveryRestoreError();
-        }
-        return { imported: result.imported, total: result.total };
-      } catch (error) {
-        if (error instanceof RecoveryRestoreAmbiguousError) throw error;
-        if (error instanceof RecoveryRestoreError) throw error;
-        throw new RecoveryRestoreError(error);
-      }
-    }, signal);
-  }
-
-  /** Key-management API: setup, status, and restore for server-side Secure Backup. */
-  get keys(): {
-    setupRecovery: (signal?: AbortSignal) => Promise<{ recoveryKey: string }>;
-    isRecoverySetup: (signal?: AbortSignal) => Promise<boolean>;
-    getStatus: (signal?: AbortSignal) => Promise<RecoveryStatus>;
-    restoreFromRecoveryKey: (
-      recoveryKey: string,
-      signal?: AbortSignal,
-    ) => Promise<{ imported: number; total: number }>;
-  } {
-    return {
-      setupRecovery: (signal?: AbortSignal) => this.keysSetupRecovery(signal),
-      isRecoverySetup: (signal?: AbortSignal) => this.keysIsRecoverySetup(signal),
-      getStatus: (signal?: AbortSignal) => this.keysGetRecoveryStatus(signal),
-      restoreFromRecoveryKey: (recoveryKey: string, signal?: AbortSignal) =>
-        this.keysRestoreFromRecoveryKey(recoveryKey, signal),
-    };
   }
 
   /**

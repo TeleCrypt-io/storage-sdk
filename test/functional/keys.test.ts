@@ -1,294 +1,70 @@
-// Layer 2 (server-side Secure Backup + restore) needs a persistent crypto store
-// so that a genuinely new device's *own* crypto state survives its own restart,
-// and so bootstrapped secrets/backup state are written where matrix-js-sdk
-// expects to find them. Node has no native IndexedDB, so we polyfill it for
-// this file only (vitest isolates each test file's globals).
 import "fake-indexeddb/auto";
-import { describe, it, expect } from "vitest";
-import { decodeRecoveryKey } from "matrix-js-sdk/src/crypto-api/recovery-key";
-import { registerTestUser, loginNewDevice } from "../harness/users";
-import { stopTestClient } from "../harness/clients";
-import { waitFor } from "../harness/waitFor";
-import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage";
-import { RecoveryAlreadyConfiguredError } from "../../src/core/errors";
+import { expect, it } from "vitest";
+import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
+import { TeleCryptIOStorage, createVault, uploadFile, listVaults, listFiles, downloadFile, deleteFile, deleteVault } from "../../src/index.js";
+import { registerTestUser, loginNewDevice } from "../harness/users.js";
 
-const BASE_URL = "http://localhost:8008";
-
-async function createStorage(user: {
-  userId: string;
-  accessToken: string;
-  deviceId: string;
-}): Promise<TeleCryptIOStorage> {
-  return TeleCryptIOStorage.create({
-    baseUrl: BASE_URL,
-    serverName: "localhost:8008",
-    userId: user.userId,
-    accessToken: user.accessToken,
-    deviceId: user.deviceId,
+it("uses the public Safe API for confirmation, existing-key recovery and ordinary storage", async () => {
+  const user = await registerTestUser("public_safe");
+  const open = (device: typeof user, startClient = true) => TeleCryptIOStorage.create({
+    ...device, baseUrl: "http://localhost:8008", serverName: "localhost:8008", startClient,
   });
-}
+  const original = await open(user);
+  let fresh: TeleCryptIOStorage | undefined;
+  let vaultId: string | undefined;
+  let mediaId: string | undefined;
+  try {
+    expect(await original.keySafe.getStatus()).toEqual({ state: "setup-required" });
+    const { recoveryKey } = await original.keySafe.setup();
+    expect(await original.keySafe.getStatus()).toEqual({ state: "confirmation-required", recoveryKey });
+    await expect(listVaults(original)).rejects.toThrow("Set up or unlock");
+    await original.keySafe.confirmSaved();
+    expect(await original.keySafe.getStatus()).toEqual({ state: "ready" });
+    const version = await original.getClient().getCrypto()!.getActiveSessionBackupVersion();
+    const safeKeyId = (await original.getClient().secretStorage.getKey())![0];
+    const vault = await createVault(original, "Public Safe recovery");
+    vaultId = vault.id;
+    const bytes = new TextEncoder().encode("public API recovery bytes");
+    const file = await uploadFile(original, vault.id, "private.txt", bytes, "text/plain");
+    mediaId = (await original.getOriginalFileEvent(vault.id, file.id)).getContent().file.url;
+    await original.waitForKeyBackup(vault.id, file.id);
+    await original.waitForKeyBackup(vault.id);
+    original.getClient().stopClient();
 
-async function waitForTreeName(storage: TeleCryptIOStorage, treeId: string, expected: string): Promise<void> {
-  await waitFor(async () => {
-    try {
-      return (await storage.getTreeName(treeId)) === expected;
-    } catch {
-      return false;
-    }
-  }, { label: "encrypted tree name visible", timeoutMs: 15000 });
-}
-
-/** Polls the raw server-side key backup endpoint until it reports at least
- * one stored key. This is the authoritative proof that the background backup
- * engine has actually finished uploading — `getActiveSessionBackupVersion()`
- * only proves the engine believes a backup is active, not that any given
- * session has reached the server yet. */
-async function waitForServerBackupCount(
-  accessToken: string,
-  minCount: number,
-): Promise<number> {
-  return waitFor(
-    async () => {
-      const res = await fetch(`${BASE_URL}/_matrix/client/v3/room_keys/version`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+    fresh = await open(await loginNewDevice(user), false);
+    expect(await fresh.keySafe.getStatus()).toEqual({ state: "restore-required" });
+    await expect(fresh.keySafe.setup()).rejects.toThrow("already exists");
+    await expect(fresh.keySafe.restore("not a recovery key")).rejects.toThrow("Invalid");
+    await expect(fresh.keySafe.restore(encodeRecoveryKey(new Uint8Array(32).fill(8)))).rejects.toThrow("does not unlock");
+    await expect(listVaults(fresh)).rejects.toThrow("Set up or unlock");
+    const restored = await fresh.keySafe.restore(recoveryKey);
+    expect(restored.imported).toBeGreaterThan(0);
+    expect(await fresh.keySafe.getStatus()).toEqual({ state: "ready" });
+    expect(await fresh.getClient().getCrypto()!.getActiveSessionBackupVersion()).toBe(version);
+    expect((await fresh.getClient().secretStorage.getKey())![0]).toBe(safeKeyId);
+    expect((await listFiles(fresh, vault.id)).map((entry) => entry.name)).toEqual(["private.txt"]);
+    expect((await downloadFile(fresh, vault.id, file.id)).bytes).toEqual(bytes);
+    await expect(fresh.keySafe.setup()).rejects.toThrow("already exists");
+    await deleteFile(fresh, vault.id, file.id);
+    mediaId = undefined;
+    await deleteVault(fresh, vault.id);
+    vaultId = undefined;
+  } finally {
+    // If an assertion failed after the original crypto engine stopped, use
+    // this test owner's ordinary APIs to remove its known media and room.
+    const request = async (path: string, body: object) => {
+      const response = await fetch(`http://localhost:8008${path}`, {
+        method: "POST", headers: { Authorization: `Bearer ${user.accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       });
-      if (!res.ok) return null;
-      const info = (await res.json()) as { count?: number };
-      return (info.count ?? 0) >= minCount ? info.count! : null;
-    },
-    { label: `server backup count >= ${minCount}`, timeoutMs: 20000 },
-  );
-}
-
-describe("key management", () => {
-  it("5.1 setupRecovery bootstraps cross-signing + secret storage + key backup", async () => {
-    const user = await registerTestUser("key");
-    const storage = await createStorage(user);
+      if (!response.ok) throw new Error(`cleanup failed: ${response.status} ${await response.text()}`);
+    };
     try {
-      const { recoveryKey } = await storage.keys.setupRecovery();
-      expect(recoveryKey).toBeTruthy();
-      expect(typeof recoveryKey).toBe("string");
-
-      // The returned key must be a genuine, well-formed recovery key.
-      const decoded = decodeRecoveryKey(recoveryKey);
-      expect(decoded.byteLength).toBe(32);
-
-      await waitFor(() => storage.keys.isRecoverySetup(), {
-        label: "recovery active after setupRecovery",
-        timeoutMs: 15000,
-      });
+      if (mediaId) await request("/_matrix/client/unstable/io.telecrypt.storage/delete_media", { media_ids: [mediaId] });
+      if (vaultId) for (const action of ["leave", "forget"]) await request(`/_matrix/client/v3/rooms/${encodeURIComponent(vaultId)}/${action}`, {});
     } finally {
-      stopTestClient(storage.getClient());
+      fresh?.getClient().stopClient();
+      original.getClient().stopClient();
     }
-  });
-
-  it("5.2 isRecoverySetup reflects state before and after setupRecovery", async () => {
-    const user = await registerTestUser("key");
-    const storage = await createStorage(user);
-    try {
-      expect(await storage.keys.isRecoverySetup()).toBe(false);
-
-      await storage.keys.setupRecovery();
-
-      const ready = await waitFor(() => storage.keys.isRecoverySetup(), {
-        label: "isRecoverySetup() becomes true",
-        timeoutMs: 15000,
-      });
-      expect(ready).toBe(true);
-    } finally {
-      stopTestClient(storage.getClient());
-    }
-  });
-
-  it("5.3 a genuinely new device recovers files via the Recovery Key", async () => {
-    const userA = await registerTestUser("recover");
-    const storageA = await createStorage(userA);
-    try {
-      const { recoveryKey } = await storageA.keys.setupRecovery();
-      expect(recoveryKey).toBeTruthy();
-      await waitFor(() => storageA.keys.isRecoverySetup(), {
-        label: "backup active on device A",
-        timeoutMs: 15000,
-      });
-
-      const tree = await storageA.createTree("RecoveryTest");
-      await waitForTreeName(storageA, tree.id, "RecoveryTest");
-
-      const plaintext = new TextEncoder().encode(
-        "lost laptop recovery test content",
-      ).buffer as ArrayBuffer;
-      await storageA.uploadFile(tree, "important.txt", plaintext, "text/plain");
-
-      await waitFor(
-        () => {
-          const fs = tree.listFiles();
-          return fs.length > 0 ? fs : null;
-        },
-        { label: "file visible on device A", timeoutMs: 15000 },
-      );
-
-      // The file's room key must reach the server (the
-      // upload is asynchronous background work, separate from "active").
-      await waitForServerBackupCount(userA.accessToken, 1);
-
-      // Device B: a genuine second device for the same user — new device_id,
-      // new access_token, empty crypto store (verified via the negative
-      // control below).
-      const userB = await loginNewDevice(userA);
-      const storageB = await createStorage(userB);
-      try {
-        const treesB = await waitFor(
-          async () => {
-            const ts = await storageB.listTrees();
-            return ts.length > 0 ? ts : null;
-          },
-          { label: "device B lists trees", timeoutMs: 15000 },
-        );
-        const treeB = treesB.find((t) => t.id === tree.id);
-        expect(treeB).toBeDefined();
-
-        const filesB = await waitFor(
-          () => {
-            const fs = treeB!.listFiles();
-            return fs.length > 0 ? fs : null;
-          },
-          { label: "device B sees the file", timeoutMs: 15000 },
-        );
-
-        // NEGATIVE CONTROL: device B has no keys yet, so it must NOT be able
-        // to decrypt. This proves the empty start — if this assertion fails,
-        // device B's crypto store is leaking from device A's, and the later
-        // "success" would be meaningless. Also asserts the CLEAR error
-        // message (regression: this used to surface as an opaque
-        // "Cannot read properties of undefined (reading 'url')").
-        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow(
-          /undecryptable on this device/,
-        );
-
-        const restoreResult = await storageB.keys.restoreFromRecoveryKey(recoveryKey);
-        expect(restoreResult.imported).toBeGreaterThan(0);
-        expect(restoreResult.imported).toBeLessThanOrEqual(restoreResult.total);
-
-        // Decryption settling can take a moment after the keys land locally —
-        // poll real decrypt success, not the clock.
-        const downloaded = await waitFor(
-          async () => {
-            try {
-              return await storageB.downloadFile(filesB[0]);
-            } catch {
-              return null;
-            }
-          },
-          { label: "device B decrypts the file after restore", timeoutMs: 15000 },
-        );
-
-        expect(new Uint8Array(downloaded.data)).toEqual(new Uint8Array(plaintext));
-        expect(downloaded.mimetype).toBe("text/plain");
-      } finally {
-        stopTestClient(storageB.getClient());
-      }
-    } finally {
-      stopTestClient(storageA.getClient());
-    }
-  });
-
-  it("5.4 restoreFromRecoveryKey fails cleanly with a wrong Recovery Key", async () => {
-    const userA = await registerTestUser("recoverbad");
-    const storageA = await createStorage(userA);
-    try {
-      await storageA.keys.setupRecovery();
-      await waitFor(() => storageA.keys.isRecoverySetup(), {
-        label: "backup active on device A",
-        timeoutMs: 15000,
-      });
-
-      const tree = await storageA.createTree("BadRecoveryTest");
-      await waitForTreeName(storageA, tree.id, "BadRecoveryTest");
-
-      const plaintext = new TextEncoder().encode("must stay unrecoverable")
-        .buffer as ArrayBuffer;
-      await storageA.uploadFile(tree, "secret.txt", plaintext, "text/plain");
-      await waitFor(
-        () => {
-          const fs = tree.listFiles();
-          return fs.length > 0 ? fs : null;
-        },
-        { label: "file visible on device A", timeoutMs: 15000 },
-      );
-
-      await waitForServerBackupCount(userA.accessToken, 1);
-
-      // A well-formed but cryptographically wrong recovery key: a genuine
-      // recovery key generated for an unrelated account. Decodes cleanly, but
-      // must not unlock userA's secret storage / key backup.
-      const throwawayUser = await registerTestUser("throwaway");
-      const throwawayStorage = await createStorage(throwawayUser);
-      const { recoveryKey: wrongKey } = await throwawayStorage.keys.setupRecovery();
-      stopTestClient(throwawayStorage.getClient());
-
-      const userB = await loginNewDevice(userA);
-      const storageB = await createStorage(userB);
-      try {
-        const treesB = await waitFor(
-          async () => {
-            const ts = await storageB.listTrees();
-            return ts.length > 0 ? ts : null;
-          },
-          { label: "device B lists trees", timeoutMs: 15000 },
-        );
-        const treeB = treesB.find((t) => t.id === tree.id);
-        expect(treeB).toBeDefined();
-
-        const filesB = await waitFor(
-          () => {
-            const fs = treeB!.listFiles();
-            return fs.length > 0 ? fs : null;
-          },
-          { label: "device B sees the file", timeoutMs: 15000 },
-        );
-
-        // Garbage input: fails at decode, before ever touching the network.
-        await expect(
-          storageB.keys.restoreFromRecoveryKey("not a real recovery key"),
-        ).rejects.toThrow();
-
-        // Well-formed but wrong key: must fail cleanly, not silently "succeed".
-        await expect(
-          storageB.keys.restoreFromRecoveryKey(wrongKey),
-        ).rejects.toThrow();
-
-        // Device B still cannot decrypt the file — no partial/silent success.
-        await expect(storageB.downloadFile(filesB[0])).rejects.toThrow(
-          /undecryptable on this device/,
-        );
-      } finally {
-        stopTestClient(storageB.getClient());
-      }
-    } finally {
-      stopTestClient(storageA.getClient());
-    }
-  });
-
-  it("5.5 setupRecovery refuses to replace existing recovery state", async () => {
-    const user = await registerTestUser("recover_existing");
-    const storage = await createStorage(user);
-    try {
-      // First setup on a fresh account: works, and leaves 4S + backup behind.
-      const first = await storage.keys.setupRecovery();
-      expect(first.recoveryKey).toBeTruthy();
-      await waitFor(() => storage.keys.isRecoverySetup(), {
-        label: "recovery active after first setup",
-        timeoutMs: 15000,
-      });
-
-      // A second setup must never disable or replace the existing secret
-      // storage/key backup, because that could strand other devices.
-      await expect(storage.keys.setupRecovery()).rejects.toBeInstanceOf(
-        RecoveryAlreadyConfiguredError,
-      );
-      expect(await storage.keys.isRecoverySetup()).toBe(true);
-    } finally {
-      stopTestClient(storage.getClient());
-    }
-  });
-});
+  }
+}, 120000);
