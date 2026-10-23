@@ -80,14 +80,23 @@ describe("OIDC/MAS login", () => {
       baseUrl: HOMESERVER, serverName: "localhost:8008",
       userId: `@${user.localpart}:localhost:8008`, accessToken: result.access_token, deviceId,
     });
+    let treeId: string | undefined;
+    let fileId: string | undefined;
+    let mediaClient: ReturnType<typeof createClient> | undefined;
     try {
+      // OIDC login does not set up the account signing identity. The Safe is
+      // mandatory for encrypted storage operations, just as in the other OIDC
+      // storage tests below.
+      await storage.keySafe.setup();
+      await storage.keySafe.confirmSaved();
       const tree = await storage.createTree("Media refresh");
+      treeId = tree.id;
       const bytes = new TextEncoder().encode("encrypted bytes after token renewal");
-      const fileId = await storage.uploadFile(tree, "refresh.txt", bytes.buffer, "text/plain");
+      fileId = await storage.uploadFile(tree, "refresh.txt", bytes.buffer, "text/plain");
       const event = await storage.getOriginalFileEvent(tree.id, fileId);
       const persist = vi.fn(async () => undefined);
       const refresh = vi.fn(oidc.buildTokenRefreshFunction(authMetadata, clientId, persist, deviceId));
-      const mediaClient = createClient({
+      mediaClient = createClient({
         baseUrl: HOMESERVER, userId: `@${user.localpart}:localhost:8008`, deviceId,
         accessToken: "rejected-media-token", refreshToken: result.refresh_token,
         tokenRefreshFunction: refresh,
@@ -102,8 +111,17 @@ describe("OIDC/MAS login", () => {
       expect(persist).toHaveBeenCalledTimes(1);
       expect(mediaClient.getAccessToken()).not.toBe("rejected-media-token");
     } finally {
-      storage.getClient().stopClient();
-      vi.restoreAllMocks();
+      try {
+        if (treeId && fileId) await core.deleteFile(storage, treeId, fileId);
+      } finally {
+        try {
+          if (treeId) await core.deleteVault(storage, treeId);
+        } finally {
+          mediaClient?.stopClient();
+          storage.getClient().stopClient();
+          vi.restoreAllMocks();
+        }
+      }
     }
   }, 45_000);
 
