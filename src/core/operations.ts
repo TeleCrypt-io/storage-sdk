@@ -335,36 +335,26 @@ async function refreshDeletionRooms(
   return parents;
 }
 
-function snapshotTreeSpaces(root: TreeSpace): TreeSpace[] {
+async function refreshTreeSpaces(
+  storage: TeleCryptIOStorage,
+  root: TreeSpace,
+  signal: AbortSignal,
+): Promise<TreeSpace[]> {
   const spaces: TreeSpace[] = [];
   const seen = new Set<string>();
   const pending = [root];
   while (pending.length > 0) {
-    const tree = pending.pop();
-    if (!tree || seen.has(tree.id)) continue;
-    seen.add(tree.id);
-    spaces.push(tree);
-    let children: TreeSpace[];
-    try {
-      children = tree.getDirectories();
-    } catch (error) {
-      if (error instanceof StorageError) throw error;
-      throw new StorageError("could not enumerate storage folders", { cause: error });
-    }
-    pending.push(...children);
+    ensureOperationActive(signal);
+    const space = pending.pop()!;
+    if (seen.has(space.id)) continue;
+    seen.add(space.id);
+    await storage.refreshRoomState(space.id, { signal });
+    const current = storage.getTree(space.id);
+    const refreshedSpace = current?.id === space.id ? current : space;
+    spaces.push(refreshedSpace);
+    pending.push(...await activeTreeDirectories(storage, refreshedSpace, signal));
   }
   return spaces;
-}
-
-async function refreshTreeSpaces(
-  storage: TeleCryptIOStorage,
-  spaces: TreeSpace[],
-  signal: AbortSignal,
-): Promise<void> {
-  for (const space of spaces) {
-    ensureOperationActive(signal);
-    await storage.refreshRoomState(space.id, { signal });
-  }
 }
 
 type RelationEvent = {
@@ -386,8 +376,10 @@ function readRelationEvents(
   roomId: string,
   eventType: string,
   stateKey?: string,
+  fallbackRoom?: { currentState?: RelationState } | null,
 ): RelationEvent[] | null {
-  const room = client.getRoom?.(roomId) as { currentState?: RelationState } | null | undefined;
+  const room = (client.getRoom?.(roomId) ?? fallbackRoom) as
+    { currentState?: RelationState } | null | undefined;
   const currentState = room?.currentState;
   if (!currentState?.getStateEvents) return null;
   const result = currentState.getStateEvents(eventType, stateKey);
@@ -415,7 +407,13 @@ async function activeTreeDirectories(
   signal?: AbortSignal,
 ): Promise<TreeSpace[]> {
   const client = storage.getClient();
-  const childEvents = readRelationEvents(client, tree.id, EventType.SpaceChild);
+  const childEvents = readRelationEvents(
+    client,
+    tree.id,
+    EventType.SpaceChild,
+    undefined,
+    tree.room as unknown as { currentState?: RelationState },
+  );
   if (childEvents === null) throw new StorageError("storage folder state is unavailable");
   const activeChildIds = new Set<string>();
   for (const event of childEvents) {
@@ -435,7 +433,14 @@ async function activeTreeDirectories(
       return await waitForCondition(
         async () => {
           const directory = storage.getTree(childId);
-          if (directory) return directory;
+          if (directory?.id === childId) return directory;
+          // The SDK projection remains useful when a custom store does not
+          // expose getTree directly, but an active relation alone is not
+          // enough to treat an unavailable room as a resolved descendant.
+          const projected = typeof tree.getDirectories === "function"
+            ? tree.getDirectories().find((child) => child.id === childId)
+            : undefined;
+          if (projected) return projected;
           if (!joined && client.getRoom?.(childId)?.getMyMembership?.() === "invite") {
             await joinTreeRoom(storage, childId, signal ?? new AbortController().signal);
             joined = true;
@@ -968,9 +973,7 @@ export async function shareVault(
     const pending = withTreeMutation(storage.getClient(), async () => {
       try {
         ensureOperationActive(operation.signal);
-        await storage.refreshRoomState(tree.id, { signal: operation.signal });
-        const spaces = snapshotTreeSpaces(tree);
-        await refreshTreeSpaces(storage, spaces, operation.signal);
+        const spaces = await refreshTreeSpaces(storage, tree, operation.signal);
         const currentUser = storage.getClient().getUserId();
         if (currentUser && userId === currentUser) {
           throw new StorageError("share target is the current user");
@@ -1065,9 +1068,7 @@ export async function unshareVault(
         if (currentUser && userId === currentUser) {
           throw new StorageError("unshare target is the current user");
         }
-        await storage.refreshRoomState(tree.id, { signal: operation.signal });
-        const spaces = snapshotTreeSpaces(tree);
-        await refreshTreeSpaces(storage, spaces, operation.signal);
+        const spaces = await refreshTreeSpaces(storage, tree, operation.signal);
         for (const space of spaces) {
           ensureOperationActive(operation.signal);
           const members = await withRateLimitRetry(

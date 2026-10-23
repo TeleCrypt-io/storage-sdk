@@ -39,13 +39,28 @@ import { waitForCondition } from "../src/core/poll.js";
 import { isFileDeleted, isTreeDeleted, markTreeDeleted } from "../src/deletion-markers.js";
 
 function makeTree(id: string, name: string, isTopLevel: boolean): TreeSpace {
-  return {
+  const currentState: { getStateEvents: (type: string, stateKey?: string) => unknown } = {
+    getStateEvents: () => null,
+  };
+  const room = {
+    name,
+    currentState,
+  };
+  const tree = {
     id,
-    room: { name },
+    room,
     isTopLevel,
     getDirectories: () => [],
     listFiles: () => [],
   } as unknown as TreeSpace;
+  currentState.getStateEvents = (type: string) =>
+    type === EventType.SpaceChild
+      ? tree.getDirectories().map((child) => ({
+          getStateKey: () => child.id,
+          getContent: () => ({ via: ["example.test"] }),
+        }))
+      : null;
+  return tree;
 }
 
 function encryptedStorageStateEvent(eventType: string, stateKey = ""): unknown {
@@ -1726,6 +1741,45 @@ describe("operation safety", () => {
       removed: true,
     });
     expect(client.kick.mock.calls.map(([roomId]) => roomId).sort()).toEqual([child.id, root.id].sort());
+  });
+
+  it("discovers descendants from each room after refreshing its current state", async () => {
+    const late = makeTree("!late-share:example.test", "Late", false);
+    const child = makeTree("!child-refresh-share:example.test", "Child", false);
+    const root = makeTree("!root-refresh-share:example.test", "Root", true);
+    root.getDirectories = () => [child];
+    root.invite = vi.fn().mockResolvedValue(undefined);
+    child.invite = vi.fn().mockResolvedValue(undefined);
+    late.invite = vi.fn().mockResolvedValue(undefined);
+    const trees = new Map([[root.id, root], [child.id, child], [late.id, late]]);
+    const refreshRoomState = vi.fn(async (roomId: string) => {
+      if (roomId === child.id) child.getDirectories = () => [late];
+    });
+    const client = {
+      ...sharingCrypto(),
+      getUserId: () => "@owner:example.test",
+      getRoom: (roomId: string) => trees.get(roomId)?.room ?? null,
+    };
+    const storage = {
+      keySafe: { requireReady: async () => undefined },
+      getTree: (roomId: string) => trees.get(roomId) ?? null,
+      getClient: () => client,
+      refreshRoomState,
+      listMembers: vi.fn().mockResolvedValue([]),
+      getRoomMembership: vi.fn().mockResolvedValue(null),
+    } as unknown as TeleCryptIOStorage;
+
+    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).resolves.toMatchObject({
+      role: "viewer",
+    });
+    expect(refreshRoomState.mock.calls.map(([roomId]) => roomId)).toEqual([
+      root.id,
+      child.id,
+      late.id,
+    ]);
+    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(child.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(late.invite).toHaveBeenCalledWith("@target:example.test", false);
   });
 
   it("invites a user separately when a nested room is not yet joined", async () => {

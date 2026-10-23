@@ -990,6 +990,25 @@ export class TeleCryptIOStorage {
   private async writeFileName(treeId: string, fileId: string, name: string): Promise<void> {
     validateName(name, "file name");
     validateMatrixEventId(fileId, "file event ID");
+    await this.refreshRoomState(treeId);
+    this.requireEncryptedStorageRoom(treeId);
+    const branch = this.getTree(treeId)?.getFile(fileId);
+    const indexEvent = branch?.indexEvent;
+    const indexContent = indexEvent?.getContent();
+    if (
+      !branch ||
+      branch.isActive === false ||
+      !indexEvent ||
+      indexEvent.isRedacted() ||
+      indexEvent.getSender() !== this.getTreeOwnerId(treeId) ||
+      !isRecord(indexContent) ||
+      indexContent.active !== true
+    ) {
+      throw new StorageError("file not found");
+    }
+    const originalEvent = await this.getOriginalFileEvent(treeId, fileId, true);
+    if (originalEvent.isRedacted()) throw new StorageError("file not found");
+
     const metadataEventId = await this.sendEncryptedMetadataMessage(treeId, {
       msgtype: STORAGE_METADATA_MSGTYPE,
       body: name,

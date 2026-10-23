@@ -32,6 +32,11 @@ function fixture() {
   let shieldReason: EventShieldReason | null = null;
   const sentMessages: Array<{ roomId: string; content: Record<string, unknown>; eventId: string }> = [];
   const sentStates: Array<{ roomId: string; type: string; content: Record<string, unknown>; stateKey: string }> = [];
+  events.set("$file-event", encryptedEvent("$file-event", {
+    msgtype: MsgType.File,
+    body: "original.txt",
+    file: { url: "mxc://example.test/original" },
+  }));
   const rawBranch = {
     id: "$file-event",
     roomId: ROOM_ID,
@@ -140,6 +145,13 @@ function fixture() {
     getMetadataPointer: () => metadataPointer,
     setEncryptionAlgorithm: (algorithm: string | undefined) => { encryptionAlgorithm = algorithm; },
     setShieldReason: (reason: EventShieldReason | null) => { shieldReason = reason; },
+    redactListing: () => { branchContent = {}; },
+    redactOriginal: () => {
+      events.set("$file-event", {
+        ...encryptedEvent("$file-event", {}),
+        isRedacted: () => true,
+      });
+    },
   };
 }
 
@@ -289,5 +301,25 @@ describe("encrypted storage names", () => {
       "renamed-report.pdf",
     );
     expect(tree.room.name).toBe("Encrypted storage");
+  });
+
+  it.each([
+    ["a redacted file listing", (test: ReturnType<typeof fixture>) => test.redactListing()],
+    ["a redacted original attachment", (test: ReturnType<typeof fixture>) => test.redactOriginal()],
+  ])("does not rename a retained file handle after %s", async (_description, redact) => {
+    const test = fixture();
+    const storage = new TeleCryptIOStorage(test.client as never);
+    const tree = await storage.createTree("Vault name");
+    const retainedFile = tree.getFile("$file-event")!;
+    const messageCount = test.sentMessages.length;
+    const stateCount = test.sentStates.length;
+    redact(test);
+
+    await expect(retainedFile.setName("resurrected.txt")).rejects.toMatchObject({
+      name: "StorageError",
+      message: "file not found",
+    });
+    expect(test.sentMessages).toHaveLength(messageCount);
+    expect(test.sentStates).toHaveLength(stateCount);
   });
 });
