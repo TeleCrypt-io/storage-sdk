@@ -1416,7 +1416,6 @@ export async function deleteFile(
   await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
-    if (isMarkedFileDeleted(storage, tree.id, fileId)) return { id: fileId, deleted: true };
     await storage.refreshRoomState(treeId, { signal });
     const branch = tree.getFile(fileId);
 
@@ -1431,26 +1430,31 @@ export async function deleteFile(
         markFileDeleted(storage.getClient(), tree.id, fileId);
         return { id: fileId, deleted: true };
       }
-      throw new StorageError("file listing is active but its attachment event is redacted");
     }
-    const originalContent = originalEvent.getContent();
-    const fileDescriptor =
-      typeof originalContent === "object" &&
-      originalContent !== null &&
-      !Array.isArray(originalContent) &&
-      "file" in originalContent &&
-      typeof originalContent.file === "object" &&
-      originalContent.file !== null &&
-      !Array.isArray(originalContent.file)
-        ? originalContent.file as Record<string, unknown>
-        : undefined;
-    const mediaId = fileDescriptor?.url;
-    if (typeof mediaId !== "string" || mediaId.length === 0) {
-      throw new StorageError("encrypted file has no media identifier");
+    const completedIds: string[] = [];
+    if (originalEvent.isRedacted()) {
+      // A concurrent rename can publish its listing after deletion completed.
+      // Reconcile that owner-authored state without needing the deleted media URL.
+      completedIds.push(fileId);
+    } else {
+      const originalContent = originalEvent.getContent();
+      const fileDescriptor =
+        typeof originalContent === "object" &&
+        originalContent !== null &&
+        !Array.isArray(originalContent) &&
+        "file" in originalContent &&
+        typeof originalContent.file === "object" &&
+        originalContent.file !== null &&
+        !Array.isArray(originalContent.file)
+          ? originalContent.file as Record<string, unknown>
+          : undefined;
+      const mediaId = fileDescriptor?.url;
+      if (typeof mediaId !== "string" || mediaId.length === 0) {
+        throw new StorageError("encrypted file has no media identifier");
+      }
+      await deleteFileMedia(storage, [mediaId], signal);
+      completedIds.push(mediaId);
     }
-    await deleteFileMedia(storage, [mediaId], signal);
-
-    const completedIds: string[] = [mediaId];
     try {
       const client = storage.getClient();
       const metadataEventId = branch
@@ -1496,7 +1500,7 @@ export async function deleteFile(
       }
       if (listingEventId) completedIds.push(listingEventId);
 
-      await withRateLimitRetry(
+      if (!originalEvent.isRedacted()) await withRateLimitRetry(
         () => withMatrixMutationAbort(
           () => client.redactEvent(tree.id, fileId),
           signal,
@@ -1504,7 +1508,7 @@ export async function deleteFile(
         ),
         signal,
       );
-      completedIds.push(fileId);
+      if (!completedIds.includes(fileId)) completedIds.push(fileId);
     } catch (error) {
       throw new MutationPartialError(
         "delete file",

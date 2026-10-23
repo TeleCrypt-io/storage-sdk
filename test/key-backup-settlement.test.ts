@@ -64,9 +64,24 @@ describe("native key backup settlement", () => {
   it("uses the current encrypted file rename session", async () => {
     const { storage, event } = fixture();
     vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(metadataId);
+    vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
     const rename = vi.spyOn(storage, "getFileRenameMetadataEvent").mockResolvedValue(event as never);
     await storage.waitForKeyBackup(treeId, fileId);
     expect(rename).toHaveBeenCalledWith(treeId, fileId, metadataId);
+  });
+
+  it("also backs up the attachment when its rename uses a different session", async () => {
+    const { storage, client, event } = fixture();
+    vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(metadataId);
+    vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
+    vi.spyOn(storage, "getFileRenameMetadataEvent").mockResolvedValue({
+      ...event, getWireContent: () => ({ algorithm: "m.megolm.v1.aes-sha2", session_id: "renamed-session" }),
+    } as never);
+    await storage.waitForKeyBackup(treeId, fileId);
+    expect(client.http.authedRequest.mock.calls.map((call) => call[1])).toEqual([
+      `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
+      `/room_keys/keys/${encodeURIComponent(treeId)}/renamed-session`,
+    ]);
   });
 
   it("uses the original attachment session before any rename", async () => {

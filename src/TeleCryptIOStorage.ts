@@ -933,48 +933,54 @@ export class TeleCryptIOStorage {
     const signal = matrixRequestSignal(options);
     const crypto = this.client.getCrypto();
     if (!crypto) throw new StorageError("crypto is not initialized");
-    let sessionId: string | undefined;
+    let sessionIds: Set<string> | undefined;
     try {
       await waitForCondition(async (signal) => {
-        if (!sessionId) {
-          let event: MatrixEvent;
+        if (!sessionIds) {
+          const events: MatrixEvent[] = [];
           if (fileId === undefined) {
-            event = await this.getTreeMetadataEvent(treeId, { signal });
+            events.push(await this.getTreeMetadataEvent(treeId, { signal }));
           } else {
+            // The attachment contains the file key; a later rename may use a
+            // different session. Both must be recoverable.
+            events.push(await this.getOriginalFileEvent(treeId, fileId));
             const metadataId = await this.getFileMetadataEventId(treeId, fileId, { signal });
             if (!metadataId) throw new StorageError("encrypted file name is unavailable");
-            event = metadataId === fileId
-              ? await this.getOriginalFileEvent(treeId, fileId)
-              : await this.getFileRenameMetadataEvent(treeId, fileId, metadataId);
+            if (metadataId !== fileId) events.push(await this.getFileRenameMetadataEvent(treeId, fileId, metadataId));
           }
-          const wire = event.getWireContent();
-          if (event.isRedacted() || event.isDecryptionFailure() ||
-            wire.algorithm !== STORAGE_ROOM_ENCRYPTION_ALGORITHM || typeof wire.session_id !== "string" || !wire.session_id) {
-            throw new StorageError("encrypted storage session is unavailable");
+          sessionIds = new Set();
+          for (const event of events) {
+            const wire = event.getWireContent();
+            if (event.isRedacted() || event.isDecryptionFailure() ||
+              wire.algorithm !== STORAGE_ROOM_ENCRYPTION_ALGORITHM || typeof wire.session_id !== "string" || !wire.session_id) {
+              throw new StorageError("encrypted storage session is unavailable");
+            }
+            sessionIds.add(wire.session_id);
           }
-          sessionId = wire.session_id;
         }
         if (signal?.aborted) throw new StorageError("operation cancelled");
         const version = await crypto.getActiveSessionBackupVersion();
         if (!version) return null;
-        let backup: unknown;
-        try {
-          backup = await this.client.http.authedRequest<unknown>(
-            Method.Get,
-            `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
-            { version },
-            undefined,
-            { prefix: ClientPrefix.V3, abortSignal: signal },
-          );
-        } catch (error) {
-          if (error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND") return null;
-          throw error;
-        }
-        const sessionData = isRecord(backup) ? backup.session_data : undefined;
-        if (!isRecord(backup) || !Number.isSafeInteger(backup.first_message_index) ||
-          (backup.first_message_index as number) < 0 || !isRecord(sessionData) ||
-          ["ciphertext", "ephemeral", "mac"].some((key) => typeof sessionData[key] !== "string" || !sessionData[key])) {
-          throw new StorageError("server key backup session is invalid");
+        for (const sessionId of sessionIds) {
+          let backup: unknown;
+          try {
+            backup = await this.client.http.authedRequest<unknown>(
+              Method.Get,
+              `/room_keys/keys/${encodeURIComponent(treeId)}/${encodeURIComponent(sessionId)}`,
+              { version },
+              undefined,
+              { prefix: ClientPrefix.V3, abortSignal: signal },
+            );
+          } catch (error) {
+            if (error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND") return null;
+            throw error;
+          }
+          const sessionData = isRecord(backup) ? backup.session_data : undefined;
+          if (!isRecord(backup) || !Number.isSafeInteger(backup.first_message_index) ||
+            (backup.first_message_index as number) < 0 || !isRecord(sessionData) ||
+            ["ciphertext", "ephemeral", "mac"].some((key) => typeof sessionData[key] !== "string" || !sessionData[key])) {
+            throw new StorageError("server key backup session is invalid");
+          }
         }
         return true;
       }, { timeoutMs, signal });
@@ -1014,12 +1020,20 @@ export class TeleCryptIOStorage {
       body: name,
       file_event_id: fileId,
     });
-    await this.client.sendStateEvent(
+    const listing = await this.client.sendStateEvent(
       treeId,
       UNSTABLE_MSC3089_BRANCH.name,
       { active: true, metadata_event_id: metadataEventId } as never,
       fileId,
     );
+    // Another device can delete the attachment after the preflight check.
+    // Its redaction wins over this rename, including a late listing update.
+    if ((await this.getOriginalFileEvent(treeId, fileId, true)).isRedacted()) {
+      await this.client.redactEvent(treeId, listing.event_id);
+      await this.client.redactEvent(treeId, metadataEventId);
+      this.fileNames.delete(this.fileNameKey(treeId, fileId));
+      throw new StorageError("file was deleted while renaming; the rename was removed");
+    }
     this.fileNames.set(this.fileNameKey(treeId, fileId), name);
   }
 
