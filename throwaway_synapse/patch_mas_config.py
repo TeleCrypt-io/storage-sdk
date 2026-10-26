@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patches a `mas-cli config generate` output in place for the throwaway
 dev/test stack: points it at the throwaway Postgres + Synapse containers,
-sets its same-origin public_base, and relaxes the dynamic client
+sets its separate local auth public_base, and relaxes the dynamic client
 registration policy to allow http/localhost redirect URIs (this is a
 disposable dev instance we own, never production).
 
@@ -33,9 +33,9 @@ content = re.sub(
     flags=re.M,
 )
 
-# http: public_base matches the single homeserver origin. MAS derives issuer
-# from public_base when no separate issuer is configured.
-content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8008/", content, flags=re.M)
+# http: MAS uses a separate local auth origin. Synapse still serves the
+# Matrix auth-metadata endpoint on :8008 and advertises these endpoints.
+content = re.sub(r"^  public_base: .*$", "  public_base: http://localhost:8081/", content, flags=re.M)
 content = re.sub(r"^  issuer: .*\n", "", content, flags=re.M)
 
 # database: the default max_connections: 10 was observed to be too tight

@@ -140,7 +140,11 @@ describe("extractDeviceIdFromScope", () => {
   });
 });
 
-async function beginForCallback(storage: MemoryStorage): Promise<{ state: string; key: string }> {
+async function beginForCallback(
+  storage: MemoryStorage,
+  authMetadata = METADATA,
+  homeserverUrl = "https://mas.test",
+): Promise<{ state: string; key: string; authorizationUrl: string }> {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     writable: true,
@@ -155,9 +159,9 @@ async function beginForCallback(storage: MemoryStorage): Promise<{ state: string
     subtle: { digest: async () => new Uint8Array(32).fill(7) },
   });
   const url = await beginAuthorizationCodeFlow({
-    authMetadata: METADATA,
+    authMetadata,
     clientId: "test-client",
-    homeserverUrl: "https://mas.test",
+    homeserverUrl,
     redirectUri: "https://storage.test/",
     deviceId: "CALLBACK123",
   });
@@ -165,10 +169,44 @@ async function beginForCallback(storage: MemoryStorage): Promise<{ state: string
   if (!state) throw new Error("test authorization URL did not contain state");
   const key = storage.key(0);
   if (!key) throw new Error("test authorization context was not stored");
-  return { state, key };
+  return { state, key, authorizationUrl: url };
 }
 
 describe("authorization context replay and tamper protection", () => {
+  it("completes browser login through the separately advertised auth service", async () => {
+    const storage = new MemoryStorage();
+    const metadata = {
+      ...METADATA,
+      issuer: "https://mas.login.example.net/tenant",
+      authorization_endpoint: "https://login.example.net/authorize",
+      registration_endpoint: "https://login.example.net/register",
+      token_endpoint: "https://tokens.example.net/oauth/token",
+      revocation_endpoint: "https://tokens.example.net/oauth/revoke",
+    };
+    const { state, authorizationUrl } = await beginForCallback(
+      storage,
+      metadata,
+      "https://matrix.example.test",
+    );
+    expect(new URL(authorizationUrl).origin).toBe("https://login.example.net");
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      token_type: "Bearer",
+      access_token: "access-token",
+      refresh_token: "refresh-token",
+      scope: "urn:matrix:client:api:* urn:matrix:client:device:CALLBACK123",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).resolves.toMatchObject({
+      homeserverUrl: "https://matrix.example.test/",
+      oidcClientSettings: { issuer: metadata.issuer },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://tokens.example.net/oauth/token",
+      expect.objectContaining({ redirect: "manual" }),
+    );
+  });
+
   it("consumes a valid context before exchange and rejects replay", async () => {
     const storage = new MemoryStorage();
     const { state } = await beginForCallback(storage);
@@ -228,7 +266,7 @@ describe("authorization context replay and tamper protection", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(/origins/);
+    await expect(completeAuthorizationCodeFlow("authorization-code", state)).rejects.toThrow(/origin/);
     expect(storage.getItem(key)).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -279,7 +317,7 @@ describe("authorization context replay and tamper protection", () => {
     const storage = new MemoryStorage();
     const { state, key } = await beginForCallback(storage);
     const context = JSON.parse(storage.getItem(key)!);
-    context.authMetadata.token_endpoint = "https://evil.test/token";
+    context.authMetadata.token_endpoint = "http://evil.test/token";
     storage.setItem(key, JSON.stringify(context));
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

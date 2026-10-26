@@ -71,6 +71,8 @@ function fixture() {
   const room = {
     roomId: ROOM_ID,
     currentState: {
+      maySendRedactionForEvent: () => true,
+      mayClientSendStateEvent: () => true,
       getStateEvents: (type: string, stateKey: string) => {
         if (type === EventType.RoomCreate && stateKey === "") {
           return {

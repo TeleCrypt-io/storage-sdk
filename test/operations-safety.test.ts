@@ -21,6 +21,7 @@ import {
   deleteVault,
   createSubfolder,
   downloadFile as downloadCoreFile,
+  getMyVaultRole,
   getFileDetails,
   joinVault,
   listFiles,
@@ -36,12 +37,19 @@ import {
   UndecryptableFileError,
 } from "../src/core/errors.js";
 import { waitForCondition } from "../src/core/poll.js";
-import { isFileDeleted, isTreeDeleted, markTreeDeleted } from "../src/deletion-markers.js";
+import { isTreeDeleted, markTreeDeleted } from "../src/deletion-markers.js";
 
-type TestTree = TreeSpace & { setChildLinks(children: TreeSpace[]): void };
+type TestMember = { userId: string; role: string; membership: string };
+type TestTree = TreeSpace & {
+  setChildLinks(children: TreeSpace[]): void;
+  getTestMembers(): TestMember[];
+  setTestMembers(members: TestMember[]): void;
+  setTestMemberMembership(userId: string, membership: string): void;
+};
 
 function makeTree(id: string, name: string, isTopLevel: boolean): TestTree {
   let children: TreeSpace[] = [];
+  let members: TestMember[] = [];
   const currentState: { getStateEvents: (type: string, stateKey?: string) => unknown } = {
     getStateEvents: () => null,
   };
@@ -55,6 +63,32 @@ function makeTree(id: string, name: string, isTopLevel: boolean): TestTree {
     isTopLevel,
     getDirectories: () => children,
     setChildLinks: (next: TreeSpace[]) => { children = next; },
+    getTestMembers: () => members.map((member) => ({ ...member })),
+    setTestMembers: (next: TestMember[]) => { members = next.map((member) => ({ ...member })); },
+    setTestMemberMembership: (userId: string, membership: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.membership = membership;
+    },
+    invite: vi.fn(async (userId: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.membership = current.membership === "join" ? "join" : "invite";
+      else members.push({ userId, role: "viewer", membership: "invite" });
+    }),
+    setPermissions: vi.fn(async (userId: string, role: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.role = role;
+      else members.push({ userId, role, membership: "invite" });
+    }),
+    invite: vi.fn(async (userId: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.membership = current.membership === "join" ? "join" : "invite";
+      else members.push({ userId, role: "viewer", membership: "invite" });
+    }),
+    setPermissions: vi.fn(async (userId: string, role: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.role = role;
+      else members.push({ userId, role, membership: "invite" });
+    }),
     listFiles: () => [],
   } as unknown as TestTree;
   currentState.getStateEvents = (type: string) =>
@@ -70,6 +104,22 @@ function makeTree(id: string, name: string, isTopLevel: boolean): TestTree {
 function roomLookup(...trees: TreeSpace[]) {
   const rooms = new Map(trees.map((tree) => [tree.id, tree.room]));
   return (roomId: string) => rooms.get(roomId) ?? null;
+}
+
+function testMembers(space: TreeSpace): TestMember[] {
+  return (space as TestTree).getTestMembers();
+}
+
+function testMembership(trees: TreeSpace[]) {
+  return async (roomId: string, userId: string): Promise<string | null> =>
+    trees.find((tree) => tree.id === roomId)
+      ? testMembers(trees.find((tree) => tree.id === roomId)!).find((member) => member.userId === userId)?.membership ?? null
+      : null;
+}
+
+function setTestMembership(trees: TreeSpace[], roomId: string, userId: string, membership: string): void {
+  const tree = trees.find((candidate) => candidate.id === roomId);
+  if (tree) (tree as TestTree).setTestMemberMembership(userId, membership);
 }
 
 function encryptedStorageStateEvent(eventType: string, stateKey = ""): unknown {
@@ -90,6 +140,7 @@ function reviewedInviteRoom(
   encrypted = true,
 ): Record<string, unknown> {
   return {
+    getMyMembership: () => "invite",
     currentState: {
       getStateEvents: (type: string, stateKey: string) => {
         if (type === EventType.RoomCreate) return { getContent: () => ({ type: "m.space" }) };
@@ -128,8 +179,11 @@ describe("history sharing readiness", () => {
     };
     const storage = {
       keySafe: { requireReady: async () => undefined }, getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       getTree: () => tree, refreshRoomState: async () => undefined,
-      listMembers: vi.fn().mockResolvedValue([]),
+      listMembers: vi.fn(async (space: TestTree) => space.getTestMembers()),
+      getRoomMembership: vi.fn(async (_roomId: string, userId: string) =>
+        tree.getTestMembers().find((member) => member.userId === userId)?.membership ?? null),
     } as unknown as TeleCryptIOStorage;
     return { tree, verify, client, storage };
   }
@@ -148,6 +202,7 @@ describe("history sharing readiness", () => {
   });
   it("retries native history sharing for an already-pending invitation", async () => {
     const f = fixture();
+    f.tree.setTestMembers([{ userId: "@reader:example.test", membership: "invite", role: "viewer" }]);
     (f.storage.listMembers as ReturnType<typeof vi.fn>).mockResolvedValue([{ userId: "@reader:example.test", membership: "invite", role: "viewer" }]);
     await expect(shareVault(f.storage, f.tree.id, "@reader:example.test", "viewer")).resolves.toMatchObject({ role: "viewer" });
     expect(f.tree.invite).toHaveBeenCalledOnce();
@@ -174,11 +229,12 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({}),
       getTree: () => tree,
+      getOriginalFileEventState: vi.fn().mockRejectedValue(failure),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
     } as unknown as TeleCryptIOStorage;
 
     await expect(deleteFile(storage, tree.id, "$file:example.test")).rejects.toBe(failure);
-    expect(tree.getFile).toHaveBeenCalledTimes(1);
+    expect(tree.getFile).not.toHaveBeenCalled();
   });
 
   it("does not retry a typed incomplete-cleanup result", async () => {
@@ -196,7 +252,8 @@ describe("operation safety", () => {
     mediaId = "mxc://example.test/v1",
     renameId,
     owner = "@owner:example.test",
-  }: { id?: string; mediaId?: string; renameId?: string; owner?: string } = {}) {
+    userId = owner,
+  }: { id?: string; mediaId?: string; renameId?: string; owner?: string; userId?: string } = {}) {
     let listingRedacted = false;
     let originalRedacted = false;
     let renameRedacted = false;
@@ -208,6 +265,11 @@ describe("operation safety", () => {
       isRedacted: () => listingRedacted,
     };
     const originalEvent = {
+      getId: () => id,
+      getRoomId: () => "!delete-file:example.test",
+      getSender: () => owner,
+      getWireType: () => EventType.RoomMessageEncrypted,
+      getType: () => EventType.RoomMessage,
       getContent: () => ({ msgtype: "m.file", body: "secret.txt", file: { url: mediaId } }),
       isRedacted: () => originalRedacted,
     };
@@ -225,11 +287,10 @@ describe("operation safety", () => {
     const tree = makeTree("!delete-file:example.test", "Delete file", true);
     tree.getFile = vi.fn().mockReturnValue(branch);
     const client = {
-      getUserId: () => owner,
+      getUserId: () => userId,
       http: { authedRequest: vi.fn().mockResolvedValue({}) },
       sendStateEvent: vi.fn().mockResolvedValue({}),
       redactEvent: vi.fn(async (_roomId: string, eventId: string) => {
-        if (eventId === "$listing") listingRedacted = true;
         if (eventId === id) originalRedacted = true;
         if (eventId === renameId) renameRedacted = true;
         return {};
@@ -239,7 +300,9 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => tree,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState,
+      getOriginalFileEventState: vi.fn().mockImplementation(async () => ({ ownerUserId: owner, redacted: originalRedacted, canRedact: true })),
       getOriginalFileEvent: vi.fn().mockImplementation(async () => originalEvent),
       getFileMetadataEventId: vi.fn().mockImplementation(async () => listingRedacted ? null : metadataId),
       getFileRenameMetadataEvent: vi.fn().mockImplementation(async () => renameEvent),
@@ -253,7 +316,7 @@ describe("operation safety", () => {
       originalEvent,
       renameEvent,
       refreshRoomState,
-      markRedacted: () => { listingRedacted = true; originalRedacted = true; },
+      markRedacted: () => { originalRedacted = true; },
     };
   }
 
@@ -281,6 +344,7 @@ describe("operation safety", () => {
       getClient: () => client,
       getTree: () => root,
       refreshRoomState,
+      getOriginalFileEventState: vi.fn().mockResolvedValue({ ownerUserId: "@owner:example.test", redacted: false, canRedact: true }),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
     } as unknown as TeleCryptIOStorage;
     return { client, root, roomIds, storage };
@@ -298,6 +362,7 @@ describe("operation safety", () => {
     const rootRoom = {
       roomId: root.id,
       currentState: {
+        maySendRedactionForEvent: () => true,
         getStateEvents: (eventType: string, stateKey?: string) => {
           if (eventType !== EventType.SpaceParent || (stateKey !== undefined && stateKey !== externalId)) return [];
           const link = links.get("parent")!;
@@ -314,6 +379,7 @@ describe("operation safety", () => {
     const externalRoom = {
       roomId: externalId,
       currentState: {
+        maySendRedactionForEvent: () => true,
         getStateEvents: (eventType: string, stateKey?: string) => {
           if (eventType !== EventType.SpaceChild || (stateKey !== undefined && stateKey !== root.id)) return [];
           const link = links.get("child")!;
@@ -375,11 +441,17 @@ describe("operation safety", () => {
     expect(fixture.client.http.authedRequest.mock.invocationCallOrder[0]).toBeLessThan(
       fixture.client.redactEvent.mock.invocationCallOrder[0],
     );
-    expect(fixture.client.redactEvent.mock.calls).toEqual([
-      [fixture.tree.id, "$listing"],
-      [fixture.tree.id, "$v1"],
-    ]);
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(true);
+    expect(fixture.client.redactEvent.mock.calls).toEqual([[fixture.tree.id, "$v1"]]);
+    expect(fixture.listing.isRedacted()).toBe(false);
+  });
+
+  it("does not let another room member delete media they did not upload", async () => {
+    const fixture = deletionFixture({ userId: "@bob:example.test" });
+    await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).rejects.toThrow(
+      "only the file uploader may delete this file",
+    );
+    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
+    expect(fixture.client.redactEvent).not.toHaveBeenCalled();
   });
 
   it("deletes an acknowledged attachment whose upload listing was never committed", async () => {
@@ -467,7 +539,7 @@ describe("operation safety", () => {
     );
   });
 
-  it("accepts a redacted inactive branch as confirmed deletion", async () => {
+  it("accepts a redacted original message as deletion while its listing survives", async () => {
     const fixture = deletionFixture({ id: "$v1", mediaId: "mxc://example.test/v1" });
     fixture.markRedacted();
 
@@ -475,6 +547,9 @@ describe("operation safety", () => {
       id: "$v1",
       deleted: true,
     });
+    expect(fixture.branch.isActive).toBe(true);
+    expect(fixture.listing.isRedacted()).toBe(false);
+    expect(fixture.client.http.authedRequest).not.toHaveBeenCalled();
   });
 
   it("reports typed partial state when event cleanup fails after media deletion", async () => {
@@ -488,19 +563,14 @@ describe("operation safety", () => {
     });
     expect(fixture.client.http.authedRequest).toHaveBeenCalledTimes(1);
     expect(fixture.client.redactEvent).toHaveBeenCalledTimes(1);
-    expect(isFileDeleted(fixture.client as never, fixture.tree.id, "$v1")).toBe(false);
     await expect(deleteFile(fixture.storage, fixture.tree.id, "$v1")).resolves.toEqual({
       id: "$v1",
       deleted: true,
     });
-    expect(fixture.client.redactEvent.mock.calls).toEqual([
-      [fixture.tree.id, "$listing"],
-      [fixture.tree.id, "$listing"],
-      [fixture.tree.id, "$v1"],
-    ]);
+    expect(fixture.client.redactEvent.mock.calls).toEqual([[fixture.tree.id, "$v1"], [fixture.tree.id, "$v1"]]);
   });
 
-  it("redacts the current encrypted rename event before the listing and attachment", async () => {
+  it("deletes only the original uploader-authored event, leaving encrypted rename history intact", async () => {
     const fixture = deletionFixture({
       id: "$v1",
       mediaId: "mxc://example.test/v1",
@@ -511,11 +581,9 @@ describe("operation safety", () => {
       id: "$v1",
       deleted: true,
     });
-    expect(fixture.client.redactEvent.mock.calls).toEqual([
-      [fixture.tree.id, "$rename"],
-      [fixture.tree.id, "$listing"],
-      [fixture.tree.id, "$v1"],
-    ]);
+    expect(fixture.client.redactEvent.mock.calls).toEqual([[fixture.tree.id, "$v1"]]);
+    expect(fixture.renameEvent.isRedacted()).toBe(false);
+    expect(fixture.listing.isRedacted()).toBe(false);
   });
 
   it("refreshes the parent room before listing subfolders", async () => {
@@ -529,6 +597,7 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({
         getRoom: () => ({
+          getMyMembership: () => null,
           currentState: {
             getStateEvents: (eventType: string) =>
               eventType === EventType.SpaceChild
@@ -564,6 +633,7 @@ describe("operation safety", () => {
       keySafe: { requireReady: async () => undefined },
       getClient: () => ({
         getRoom: () => ({
+          getMyMembership: () => null,
           currentState: {
             getStateEvents: (eventType: string) =>
               eventType === EventType.SpaceChild
@@ -625,6 +695,7 @@ describe("operation safety", () => {
       visible = true;
     });
     const storage = { keySafe: { requireReady: async () => undefined },
+      getClient: () => ({ getUserId: () => "@owner:example.test" }),
       getTree: () => tree,
       uploadFile: vi.fn().mockResolvedValue(file.id),
       refreshRoomState,
@@ -632,7 +703,7 @@ describe("operation safety", () => {
 
     await expect(
       uploadFile(storage, tree.id, "nested.txt", new Uint8Array([1]), "text/plain"),
-    ).resolves.toEqual({ id: file.id, name: "nested.txt", mimetype: "text/plain" });
+    ).resolves.toEqual({ id: file.id, name: "nested.txt", mimetype: "text/plain", ownerUserId: "@owner:example.test" });
     expect(refreshRoomState).toHaveBeenCalledWith(
       tree.id,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
@@ -647,6 +718,7 @@ describe("operation safety", () => {
       tree.getFile = vi.fn().mockReturnValue(null) as never;
       const refreshRoomState = vi.fn().mockResolvedValue(undefined);
       const storage = { keySafe: { requireReady: async () => undefined },
+        getClient: () => ({ getUserId: () => "@owner:example.test" }),
         getTree: () => tree,
         uploadFile: vi.fn().mockResolvedValue("$unobserved"),
         refreshRoomState,
@@ -662,6 +734,7 @@ describe("operation safety", () => {
         code: "MUTATION_PARTIAL",
         operation: "upload file",
         completedIds: ["$unobserved"],
+        backupTargets: [{ treeId: tree.id, fileId: "$unobserved" }],
       });
 
       await vi.advanceTimersByTimeAsync(15_000);
@@ -708,6 +781,7 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({}),
       getTree: () => tree,
+      getOriginalFileEventState: vi.fn().mockResolvedValue({ ownerUserId: "@owner:example.test", redacted: false, canRedact: true }),
       downloadFile: vi.fn().mockRejectedValue(failure),
     } as unknown as TeleCryptIOStorage;
 
@@ -722,6 +796,7 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({}),
       getTree: () => tree,
+      getOriginalFileEventState: vi.fn().mockResolvedValue({ ownerUserId: "@owner:example.test", redacted: false, canRedact: true }),
       downloadFile: vi.fn().mockRejectedValue(failure),
     } as unknown as TeleCryptIOStorage;
 
@@ -743,6 +818,7 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getClient: () => ({}),
       getTree: () => tree,
+      getOriginalFileEventState: vi.fn().mockResolvedValue({ ownerUserId: "@owner:example.test", redacted: false, canRedact: true }),
       getFileName: vi.fn().mockResolvedValue("details.txt"),
       getOriginalFileEvent: vi.fn().mockRejectedValue(failure),
     } as unknown as TeleCryptIOStorage;
@@ -780,11 +856,7 @@ describe("operation safety", () => {
     expect(client.forget).toHaveBeenCalledWith("!invite:example.test");
     expect(unstableGetFileTreeSpace).not.toHaveBeenCalled();
     expect(removeRoom).toHaveBeenCalledWith("!invite:example.test");
-    expect(refreshRoomState).toHaveBeenCalledWith(
-      "!invite:example.test",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(refreshRoomState.mock.invocationCallOrder[0]).toBeLessThan(client.leave.mock.invocationCallOrder[0]);
+    expect(refreshRoomState).not.toHaveBeenCalled();
   });
 
   it("uses stripped invite state when Synapse forbids pre-join room reads", async () => {
@@ -932,7 +1004,10 @@ describe("operation safety", () => {
     } as unknown as TeleCryptIOStorage;
 
     await expect(renameFolder(storage, tree.id, "Renamed")).rejects.toMatchObject({
-      message: "rename failed",
+      code: "MUTATION_PARTIAL",
+      operation: "rename tree",
+      completedIds: [tree.id],
+      backupTargets: [{ treeId: tree.id }],
       cause: refreshFailure,
     });
     expect(refreshRoomState).toHaveBeenCalledTimes(1);
@@ -993,7 +1068,7 @@ describe("operation safety", () => {
       if (path.endsWith("/members")) return { chunk: [] };
       throw new Error("power unavailable");
     });
-    const storage = new TeleCryptIOStorage({ http: { authedRequest } } as never);
+    const storage = new TeleCryptIOStorage({ http: { authedRequest }, getRoom: () => null } as never);
 
     await expect(storage.listMembers(tree)).rejects.toThrow("power unavailable");
     expect(authedRequest).toHaveBeenCalledTimes(2);
@@ -1376,7 +1451,10 @@ describe("operation safety", () => {
     const room = {
       roomId: root.id,
       getMyMembership: () => "join",
-      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
+      currentState: {
+        getMember: () => null,
+        getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [],
+      },
     };
     const forget = vi.fn();
     const client = {
@@ -1384,6 +1462,7 @@ describe("operation safety", () => {
       getRoom: () => room,
       getRooms: () => [room],
       unstableGetFileTreeSpace: () => root,
+      http: { authedRequest: vi.fn().mockResolvedValue([]) },
       leave: vi.fn(),
       forget,
       http: {
@@ -1393,7 +1472,13 @@ describe("operation safety", () => {
       },
     };
 
-    await expect(deleteVault(new TeleCryptIOStorage(client as never), root.id)).rejects.toMatchObject({
+    const storage = new TeleCryptIOStorage(client as never);
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({
+      ownerUserId: "@owner:example.test",
+      redacted: false,
+      canRedact: true,
+    });
+    await expect(deleteVault(storage, root.id)).rejects.toMatchObject({
       code: "NON_EMPTY_TREE",
       treeId: root.id,
     });
@@ -1414,6 +1499,7 @@ describe("operation safety", () => {
       getRoom: () => room,
       getRooms: () => [room],
       unstableGetFileTreeSpace: () => folder,
+      http: { authedRequest: vi.fn().mockResolvedValue([]) },
       leave: vi.fn(),
       forget,
       http: {
@@ -1423,10 +1509,56 @@ describe("operation safety", () => {
       },
     };
 
-    await expect(deleteFolder(new TeleCryptIOStorage(client as never), folder.id)).rejects.toMatchObject({
+    const storage = new TeleCryptIOStorage(client as never);
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({
+      ownerUserId: "@owner:example.test",
+      redacted: false,
+      canRedact: true,
+    });
+    await expect(deleteFolder(storage, folder.id)).rejects.toMatchObject({
       code: "NON_EMPTY_TREE",
       treeId: folder.id,
     });
+    expect(forget).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an unavailable original event", new MatrixError({ errcode: "M_NOT_FOUND" }, 404)],
+    ["HTTP 500 M_UNKNOWN", new MatrixError({ errcode: "M_UNKNOWN" }, 500)],
+  ])("does not delete a folder when its active file has %s", async (_label, unavailable) => {
+    const folder = makeTree("!unresolved-file-folder:example.test", "With unresolved file", false);
+    folder.listFiles = () => [{ id: "$unresolved-file", getName: () => "payload.bin" }] as never;
+    const room = {
+      roomId: folder.id,
+      getMyMembership: () => "join",
+      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
+    };
+    const forget = vi.fn();
+    const client = {
+      getUserId: () => "@owner:example.test",
+      getRoom: () => room,
+      getRooms: () => [room],
+      unstableGetFileTreeSpace: () => folder,
+      leave: vi.fn(),
+      forget,
+      http: {
+        authedRequest: vi.fn(async (_method: string, path: string) =>
+          path.endsWith("/joined_rooms") ? { joined_rooms: [folder.id] } : path.endsWith("/members") ? { chunk: [] } : [],
+        ),
+      },
+    };
+    const storage = new TeleCryptIOStorage(client as never);
+    vi.spyOn(storage, "getOriginalFileEventState").mockRejectedValue(unavailable);
+
+    let failure: unknown;
+    try {
+      await deleteFolder(storage, folder.id);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ message: "could not enumerate storage files safely" });
+    expect((failure as Error & { cause?: unknown }).cause).toBe(unavailable);
+    expect(client.leave).not.toHaveBeenCalled();
     expect(forget).not.toHaveBeenCalled();
   });
 
@@ -1598,7 +1730,10 @@ describe("operation safety", () => {
       roomId: root.id,
       getMembers: vi.fn(() => [member]),
       getMyMembership: () => "join",
-      currentState: { getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [] },
+      currentState: {
+        getMember: () => null,
+        getStateEvents: (type: string, stateKey?: string) => encryptedStorageStateEvent(type, stateKey) ?? [],
+      },
     };
     const client = {
       getUserId: () => "@owner:example.test",
@@ -1692,8 +1827,9 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => tree,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      getRoomMembership: vi.fn().mockResolvedValue("invite"),
       listMembers: vi.fn()
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([
@@ -1714,8 +1850,10 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => tree,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
+      getRoomMembership: vi.fn().mockResolvedValue(null),
     } as unknown as TeleCryptIOStorage;
 
     await expect(shareVault(storage, tree.id, "@target:example.test", "viewer")).rejects.toThrow(
@@ -1727,33 +1865,39 @@ describe("operation safety", () => {
     const child = makeTree("!child-share:example.test", "Child", false);
     const root = makeTree("!root-share:example.test", "Root", true);
     root.setChildLinks([child]);
-    root.invite = vi.fn().mockResolvedValue(undefined);
+    const target = "@target:example.test";
+    root.setTestMembers([{ userId: target, role: "viewer", membership: "invite" }]);
+    child.setTestMembers([{ userId: target, role: "viewer", membership: "invite" }]);
+    const inviteRoot = vi.spyOn(root, "invite");
+    const kick = vi.fn(async (roomId: string) => setTestMembership([root, child], roomId, target, "leave"));
     const client = { ...sharingCrypto(),
       getUserId: () => "@owner:example.test",
       getRoom: roomLookup(root, child),
-      kick: vi.fn().mockResolvedValue(undefined),
+      kick,
     };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child])),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).resolves.toEqual({
+    await expect(shareVault(storage, root.id, target, "viewer")).resolves.toEqual({
       vaultId: root.id,
-      userId: "@target:example.test",
+      userId: target,
       role: "viewer",
+      rootMembership: "invite",
     });
-    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(inviteRoot).toHaveBeenCalledWith(target, false);
 
-    await expect(unshareVault(storage, root.id, "@target:example.test")).resolves.toEqual({
+    await expect(unshareVault(storage, root.id, target)).resolves.toEqual({
       vaultId: root.id,
-      userId: "@target:example.test",
+      userId: target,
       removed: true,
     });
-    expect(client.kick.mock.calls.map(([roomId]) => roomId).sort()).toEqual([child.id, root.id].sort());
+    expect(kick.mock.calls.map(([roomId]) => roomId).sort()).toEqual([child.id, root.id].sort());
   });
 
   it("discovers descendants from each room after refreshing its current state", async () => {
@@ -1761,9 +1905,13 @@ describe("operation safety", () => {
     const child = makeTree("!child-refresh-share:example.test", "Child", false);
     const root = makeTree("!root-refresh-share:example.test", "Root", true);
     root.setChildLinks([child]);
-    root.invite = vi.fn().mockResolvedValue(undefined);
-    child.invite = vi.fn().mockResolvedValue(undefined);
-    late.invite = vi.fn().mockResolvedValue(undefined);
+    const target = "@target:example.test";
+    for (const space of [root, child, late]) {
+      space.setTestMembers([{ userId: target, role: "viewer", membership: "invite" }]);
+    }
+    const inviteRoot = vi.spyOn(root, "invite");
+    const inviteChild = vi.spyOn(child, "invite");
+    const inviteLate = vi.spyOn(late, "invite");
     const trees = new Map([[root.id, root], [child.id, child], [late.id, late]]);
     const refreshRoomState = vi.fn(async (roomId: string) => {
       if (roomId === child.id) child.setChildLinks([late]);
@@ -1775,49 +1923,58 @@ describe("operation safety", () => {
     };
     const storage = {
       keySafe: { requireReady: async () => undefined },
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       getTree: (roomId: string) => trees.get(roomId) ?? null,
       getClient: () => client,
       refreshRoomState,
-      listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockResolvedValue(null),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child, late])),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).resolves.toMatchObject({
+    await expect(shareVault(storage, root.id, target, "viewer")).resolves.toMatchObject({
       role: "viewer",
     });
     expect(refreshRoomState.mock.calls.map(([roomId]) => roomId)).toEqual([
       root.id,
       child.id,
       late.id,
+      root.id,
+      child.id,
+      late.id,
     ]);
-    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
-    expect(child.invite).toHaveBeenCalledWith("@target:example.test", false);
-    expect(late.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(inviteRoot).toHaveBeenCalledWith(target, false);
+    expect(inviteChild).toHaveBeenCalledWith(target, false);
+    expect(inviteLate).toHaveBeenCalledWith(target, false);
   });
 
   it("invites a user separately when a nested room is not yet joined", async () => {
     const child = makeTree("!child-share-invite:example.test", "Child", false);
     const root = makeTree("!root-share-invite:example.test", "Root", true);
     root.setChildLinks([child]);
-    root.invite = vi.fn().mockResolvedValue(undefined);
-    child.invite = vi.fn().mockResolvedValue(undefined);
+    const target = "@target:example.test";
+    root.setTestMembers([{ userId: target, role: "editor", membership: "join" }]);
+    const rootInvite = vi.spyOn(root, "invite");
+    const childInvite = vi.spyOn(child, "invite");
+    const rootSetPermissions = vi.spyOn(root, "setPermissions");
     const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockImplementation(async (roomId: string) =>
-        roomId === child.id ? null : "join"),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child])),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).resolves.toEqual({
+    await expect(shareVault(storage, root.id, target, "viewer")).resolves.toEqual({
       vaultId: root.id,
-      userId: "@target:example.test",
+      userId: target,
       role: "viewer",
+      rootMembership: "join",
     });
-    expect(root.invite).toHaveBeenCalledWith("@target:example.test", false);
-    expect(child.invite).toHaveBeenCalledWith("@target:example.test", false);
+    expect(rootInvite).not.toHaveBeenCalled();
+    expect(rootSetPermissions).toHaveBeenCalledWith(target, "viewer");
+    expect(childInvite).toHaveBeenCalledWith(target, false);
   });
 
   it("rejects self-sharing and self-unsharing before a membership mutation", async () => {
@@ -1827,6 +1984,7 @@ describe("operation safety", () => {
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => root,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
       listMembers: vi.fn().mockResolvedValue([]),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
@@ -1841,60 +1999,82 @@ describe("operation safety", () => {
     expect(kick).not.toHaveBeenCalled();
   });
 
-  it("refuses to kick an existing owner during unshare", async () => {
+  it("lets Matrix reject an equal-power owner kick during unshare", async () => {
     const root = makeTree("!owner:example.test", "Root", true);
-    const kick = vi.fn();
+    const refusal = new MatrixError({ errcode: "M_FORBIDDEN" }, 403);
+    const kick = vi.fn().mockRejectedValue(refusal);
     const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root), kick };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => root,
       getClient: () => client,
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn().mockResolvedValue([
-        { userId: "@owner:example.test", role: "owner", membership: "join" },
-      ]),
       getRoomMembership: vi.fn().mockResolvedValue("join"),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(unshareVault(storage, root.id, "@owner:example.test")).rejects.toThrow(
-      "existing owner",
-    );
-    expect(kick).not.toHaveBeenCalled();
+    await expect(unshareVault(storage, root.id, "@owner:example.test")).rejects.toMatchObject({
+      message: "unshare failed",
+      cause: refusal,
+    });
+    expect(kick).toHaveBeenCalledWith(root.id, "@owner:example.test", "unshared");
   });
 
-  it("refuses to demote an owner discovered in a descendant during share", async () => {
+  it("reports partial share when Matrix denies a descendant owner demotion", async () => {
     const child = makeTree("!child-owner:example.test", "Child", false);
     const root = makeTree("!root-owner:example.test", "Root", true);
     root.setChildLinks([child]);
-    root.invite = vi.fn().mockResolvedValue(undefined);
+    root.setTestMembers([{ userId: "@target:example.test", role: "viewer", membership: "join" }]);
+    child.setTestMembers([{ userId: "@target:example.test", role: "owner", membership: "join" }]);
+    const refusal = new MatrixError({ errcode: "M_FORBIDDEN" }, 403);
+    const rootSetPermissions = vi.spyOn(root, "setPermissions");
+    const childSetPermissions = vi.spyOn(child, "setPermissions").mockRejectedValue(refusal);
     const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ userId: "@target:example.test", role: "owner", membership: "join" }]),
-      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child])),
     } as unknown as TeleCryptIOStorage;
 
-    await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).rejects.toThrow(
-      "existing owner",
-    );
+    await expect(shareVault(storage, root.id, "@target:example.test", "editor")).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL",
+      operation: "share",
+      completedIds: [root.id],
+    });
+    expect(rootSetPermissions).toHaveBeenCalledWith("@target:example.test", "editor");
+    expect(childSetPermissions).toHaveBeenCalledWith("@target:example.test", "editor");
+  });
+
+  it("reports an implicit v12 creator as Owner using Matrix RoomState power", () => {
+    const currentState = { getMember: vi.fn().mockReturnValue({ powerLevel: Number.POSITIVE_INFINITY }) };
+    const client = {
+      getUserId: () => "@creator:example.test",
+      getRoom: () => ({ currentState }),
+    };
+    const storage = {
+      getClient: () => client,
+      getTree: () => ({ getPermissions: () => "viewer" }),
+    };
+
+    expect(getMyVaultRole(storage as never, "!v12:example.test")).toBe("owner");
+    expect(currentState.getMember).toHaveBeenCalledWith("@creator:example.test");
   });
 
   it("reports share as partial after an earlier room invite commit", async () => {
     const child = makeTree("!child-share-partial:example.test", "Child", false);
     const root = makeTree("!root-share-partial:example.test", "Root", true);
     root.setChildLinks([child]);
-    root.invite = vi.fn().mockResolvedValue(undefined);
+    const rootInvite = vi.spyOn(root, "invite");
     child.invite = vi.fn().mockRejectedValue(new Error("child invite failed"));
     const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child) };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockResolvedValue(null),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child])),
     } as unknown as TeleCryptIOStorage;
 
     await expect(shareVault(storage, root.id, "@target:example.test", "viewer")).rejects.toMatchObject({
@@ -1902,23 +2082,28 @@ describe("operation safety", () => {
       operation: "share",
       completedIds: [root.id],
     });
+    expect(rootInvite).toHaveBeenCalledWith("@target:example.test", false);
   });
 
   it("reports unshare as partial after an earlier room membership commit", async () => {
     const child = makeTree("!child-unshare-partial:example.test", "Child", false);
     const root = makeTree("!root-unshare-partial:example.test", "Root", true);
     root.setChildLinks([child]);
-    const kick = vi
-      .fn()
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new Error("child kick failed"));
+    const target = "@target:example.test";
+    root.setTestMembers([{ userId: target, role: "viewer", membership: "join" }]);
+    child.setTestMembers([{ userId: target, role: "viewer", membership: "join" }]);
+    const kick = vi.fn(async (roomId: string) => {
+      if (roomId === child.id) throw new Error("child kick failed");
+      setTestMembership([root, child], roomId, target, "leave");
+    });
     const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child), kick };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,
+      prepareTreePermissionsForAccessChange: vi.fn().mockResolvedValue(undefined),
       refreshRoomState: vi.fn().mockResolvedValue(undefined),
-      listMembers: vi.fn().mockResolvedValue([]),
-      getRoomMembership: vi.fn().mockResolvedValue("join"),
+      listMembers: vi.fn(async (space: TreeSpace) => testMembers(space)),
+      getRoomMembership: vi.fn(testMembership([root, child])),
     } as unknown as TeleCryptIOStorage;
 
     let caught: unknown;

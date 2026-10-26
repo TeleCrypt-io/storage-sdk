@@ -44,6 +44,8 @@ async function runDeviceCodeLogin(
 ): Promise<{ authMetadata: oidc.OidcClientConfig; clientId: string; result: oidc.DeviceAccessTokenResponse }> {
   // Matrix 42 discovery is a plain metadata fetch and works under Node.
   const authMetadata = await oidc.discoverOidcIssuer(HOMESERVER);
+  expect(new URL(authMetadata.issuer).origin).not.toBe(new URL(HOMESERVER).origin);
+  expect(new URL(authMetadata.device_authorization_endpoint!).origin).toBe(new URL(authMetadata.issuer).origin);
   expect(authMetadata.device_authorization_endpoint).toBeTruthy();
 
   const clientId = await oidc.registerClient(authMetadata, {

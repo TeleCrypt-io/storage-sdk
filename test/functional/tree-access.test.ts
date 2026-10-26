@@ -14,7 +14,7 @@ async function storageUser(prefix: string) {
 }
 
 describe("Storage access regressions", () => {
-  it("blocks reader state changes and repairs an existing public vault without changing its members", async () => {
+  it("keeps default Viewer state changes denied and preserves custom permissions during reads", async () => {
     const owner = await storageUser("access_owner");
     const reader = await storageUser("access_reader");
     const outsider = await storageUser("access_outsider");
@@ -29,7 +29,9 @@ describe("Storage access regressions", () => {
       await expect(changeJoinRule()).rejects.toMatchObject({ errcode: "M_FORBIDDEN" });
       await expect(disablePurpose()).rejects.toMatchObject({ errcode: "M_FORBIDDEN" });
 
-      // Recreate the actual persisted permissions emitted by vulnerable SDKs.
+      const membersBeforeCustomState = await owner.storage.listMembers(owner.storage.getTree(vault.id)!);
+      // Preserve a valid custom configuration that explicitly opens these state
+      // operations. Reads must not canonicalize it back to the creation defaults.
       const ownerClient = owner.storage.getClient();
       const power = await ownerClient.getStateEvent(vault.id, EventType.RoomPowerLevels, "");
       await ownerClient.sendStateEvent(vault.id, EventType.RoomPowerLevels, {
@@ -39,15 +41,17 @@ describe("Storage access regressions", () => {
       await changeJoinRule();
       const writeState = vi.spyOn(ownerClient, "sendStateEvent");
       await core.listVaults(owner.storage);
-      expect(writeState.mock.calls.filter((call) => call[1] === EventType.RoomPowerLevels)).toHaveLength(1);
-      expect(writeState.mock.calls.filter((call) => call[1] === EventType.RoomJoinRules)).toHaveLength(1);
-      writeState.mockClear();
       await core.listVaults(owner.storage);
       expect(writeState).not.toHaveBeenCalled();
-      await expect(changeJoinRule()).rejects.toMatchObject({ errcode: "M_FORBIDDEN" });
-      await expect(disablePurpose()).rejects.toMatchObject({ errcode: "M_FORBIDDEN" });
-      await expect(outsider.storage.getClient().joinRoom(vault.id)).rejects.toMatchObject({ errcode: "M_FORBIDDEN" });
-      expect(await owner.storage.getRoomMembership(vault.id, reader.user.userId)).toBe("join");
+      const persistedPower = await ownerClient.getStateEvent(vault.id, EventType.RoomPowerLevels, "");
+      expect(persistedPower).toMatchObject({
+        state_default: 0,
+        events: { [EventType.RoomJoinRules]: 0, [UNSTABLE_MSC3088_PURPOSE.name]: 0 },
+      });
+      await expect(ownerClient.getStateEvent(vault.id, EventType.RoomJoinRules, ""))
+        .resolves.toMatchObject({ join_rule: JoinRule.Public });
+      const membersAfterReads = await owner.storage.listMembers(owner.storage.getTree(vault.id)!);
+      expect(membersAfterReads).toEqual(membersBeforeCustomState);
       const file = await core.uploadFile(owner.storage, vault.id, "private.txt", new TextEncoder().encode("still private"), "text/plain");
       const downloaded = await core.downloadFile(reader.storage, vault.id, file.id);
       expect(new TextDecoder().decode(downloaded.bytes)).toBe("still private");

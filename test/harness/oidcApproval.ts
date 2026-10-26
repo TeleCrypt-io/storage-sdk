@@ -3,11 +3,11 @@
  * browser forms. This is test infrastructure only: the password is used
  * solely to approve MAS OAuth, never by the SDK's production login flow.
  */
-const MAS_BASE = new URL("http://localhost:8008/");
+const HOMESERVER = "http://localhost:8008";
 
-function localMasUrl(location: string): URL {
-  const url = new URL(location, MAS_BASE);
-  if (url.origin !== MAS_BASE.origin || url.username || url.password) {
+function localMasUrl(location: string, masBase: URL): URL {
+  const url = new URL(location, masBase);
+  if (url.origin !== masBase.origin || url.username || url.password) {
     throw new Error(`approveDeviceCode: refusing non-local MAS URL ${location}`);
   }
   return url;
@@ -34,6 +34,8 @@ function extractFormAction(html: string, fallback: URL): string {
 class CookieJar {
   private readonly cookies = new Map<string, string>();
 
+  constructor(private readonly masBase: URL) {}
+
   private update(response: Response): void {
     for (const cookie of response.headers.getSetCookie?.() ?? []) {
       const [pair] = cookie.split(";");
@@ -50,7 +52,7 @@ class CookieJar {
   }
 
   async get(location: string): Promise<Response> {
-    const response = await fetch(localMasUrl(location), {
+    const response = await fetch(localMasUrl(location, this.masBase), {
       headers: { Cookie: this.header() },
       redirect: "manual",
     });
@@ -59,7 +61,7 @@ class CookieJar {
   }
 
   async post(location: string, fields: Record<string, string>): Promise<Response> {
-    const response = await fetch(localMasUrl(location), {
+    const response = await fetch(localMasUrl(location, this.masBase), {
       method: "POST",
       headers: {
         Cookie: this.header(),
@@ -93,17 +95,21 @@ export async function approveDeviceCodeViaHttp(
   password: string,
   userCode: string,
 ): Promise<void> {
-  const jar = new CookieJar();
+  const metadataResponse = await fetch(`${HOMESERVER}/_matrix/client/v1/auth_metadata`);
+  if (!metadataResponse.ok) throw new Error(`approveDeviceCode: auth metadata returned HTTP ${metadataResponse.status}`);
+  const metadata = await metadataResponse.json() as { issuer: string };
+  const masBase = new URL(metadata.issuer);
+  const jar = new CookieJar(masBase);
 
-  let response = await jar.get(new URL("login", MAS_BASE).toString());
+  let response = await jar.get(new URL("login", masBase).toString());
   let csrf = extractCsrf(await response.text());
-  response = await jar.post(new URL("login", MAS_BASE).toString(), { csrf, username, password });
+  response = await jar.post(new URL("login", masBase).toString(), { csrf, username, password });
   if (response.status !== 303) {
     throw new Error(`approveDeviceCode: login did not redirect (${response.status})`);
   }
   await jar.follow(response);
 
-  const linkUrl = new URL("link", MAS_BASE);
+  const linkUrl = new URL("link", masBase);
   response = await jar.get(linkUrl.toString());
   const linkHtml = await response.text();
   if (response.status !== 200) {

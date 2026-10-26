@@ -10,6 +10,10 @@ export async function createTestClient(
     userId: user.userId,
     accessToken: user.accessToken,
     deviceId: user.deviceId,
+    // Matrix SDK secret storage retains the callback object supplied at
+    // client construction. TeleCryptIOStorage temporarily installs the Safe
+    // key callback on this same object during setup and restore.
+    cryptoCallbacks: {},
   });
 
   await client.initRustCrypto({ useIndexedDB: opts.useIndexedDB ?? false });

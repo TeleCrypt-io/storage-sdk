@@ -28,12 +28,16 @@ export class MutationPartialError extends StorageError {
   readonly completedIds: readonly string[];
   /** Room containing the partial mutation, when the operation can target a nested folder. */
   readonly treeId?: string;
+  readonly backupTargets: readonly { treeId: string; fileId?: string }[];
 
   constructor(
     operation: string,
     completedIds: readonly string[],
     detail?: string,
-    options?: ErrorOptions & { treeId?: string },
+    options?: ErrorOptions & {
+      treeId?: string;
+      backupTargets?: readonly { treeId: string; fileId?: string }[];
+    },
   ) {
     super(
       `${operation} failed after partial completion${detail ? `: ${detail}` : ""}; retry to reconcile current state`,
@@ -43,6 +47,7 @@ export class MutationPartialError extends StorageError {
     this.operation = operation;
     this.completedIds = [...completedIds];
     this.treeId = options?.treeId;
+    this.backupTargets = (options?.backupTargets ?? []).map((target) => ({ ...target }));
   }
 }
 
@@ -104,7 +109,7 @@ export class UndecryptableFileError extends StorageError {
 
   constructor() {
     super(
-      "downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing megolm session; try restoring from a Recovery Key)",
+      "downloadFile: could not read file info from the event — it is likely undecryptable on this device (missing Megolm session; restore a Recovery Key if setup is incomplete. If it was already restored, Matrix may not have delivered this room key to this device; membership does not replay it)",
     );
     this.name = "UndecryptableFileError";
   }

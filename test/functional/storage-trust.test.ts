@@ -202,6 +202,9 @@ afterAll(async () => {
 describe("Matrix device trust and Storage metadata authorship", () => {
   it("rejects a substituted outer sender and preserves owner multi-device history", async () => {
     const tree = await vault("Authenticated metadata binding");
+    // This behavioral check sends ordinary Matrix message events as a reader;
+    // use Editor because the upstream template reserves those events to that role.
+    await core.shareVault(owner.storage, tree.id, reader.user.userId, "editor");
     const otherTree = await core.createVault(owner.storage, "Cross-room binding");
     rooms.push({ storage: owner.storage, id: otherTree.id });
     const before = await upload(owner.storage, tree.id, "before.txt", "historical owner content");
@@ -209,11 +212,17 @@ describe("Matrix device trust and Storage metadata authorship", () => {
     const ownerClient = owner.storage.getClient();
     const readerClient = reader.storage.getClient();
 
+    await reader.storage.refreshRoomState(tree.id);
+    const readerRoom = readerClient.getRoom(tree.id);
+    expect(readerRoom?.currentState.getMember(reader.user.userId)?.powerLevel).toBe(50);
+    expect(readerRoom?.currentState.maySendEvent("m.room.encrypted", reader.user.userId)).toBe(true);
+
     // The fixture creates a real second Matrix login and signs it with this
     // account's recovered cross-signing identity.
     const secondOwnerUser = await loginNewDevice(owner.user);
     const secondOwner = await openStorage(secondOwnerUser);
     await secondOwner.keySafe.restore(owner.recoveryKey);
+    await secondOwner.refreshRoomState(tree.id);
     await waitFor(async () => {
       const trust = await ownerClient.getCrypto()!.getDeviceVerificationStatus(owner.user.userId, secondOwnerUser.deviceId);
       return trust?.signedByOwner ?? false;
@@ -226,6 +235,13 @@ describe("Matrix device trust and Storage metadata authorship", () => {
     await save("recovered_history_encryption_info", { recoveredHistoryInfo, ownerHistoryInfo });
     expect(recoveredHistoryInfo.decrypted).toBe(true);
     expect(ownerHistoryInfo.decrypted).toBe(true);
+
+    const createEvent = ownerClient.getRoom(tree.id)?.currentState.getStateEvents("m.room.create", "");
+    if (!createEvent || Array.isArray(createEvent)) throw new Error("tree room version is unavailable");
+    const secondOwnerRoom = secondOwner.getClient().getRoom(tree.id);
+    expect(secondOwnerRoom?.currentState.getMember(owner.user.userId)?.powerLevel)
+      .toBe(createEvent.getContent().room_version === "12" ? Number.POSITIVE_INFINITY : 100);
+    expect(secondOwnerRoom?.currentState.maySendEvent("m.room.encrypted", owner.user.userId)).toBe(true);
 
     // A message from that legitimate owner device remains valid as the name
     // metadata event, including when the pointer is authored by the first.
@@ -503,7 +519,7 @@ describe("Matrix device trust and Storage metadata authorship", () => {
       const serverMembership = await owner.storage.getRoomMembership(tree.id, reader.user.userId);
       const localMembership = ownerClient.getRoom(tree.id)?.getMember(reader.user.userId)?.membership;
       expect(serverMembership).toBe("leave");
-      expect(localMembership).toBe("join");
+      expect(localMembership).toBe("leave");
 
       await retainedTree.setName("post-removal tree name");
       expect(await owner.storage.getTreeName(tree.id)).toBe("post-removal tree name");
@@ -562,6 +578,59 @@ describe("Matrix device trust and Storage metadata authorship", () => {
         remainingRecipientDownloadedUpload: new TextDecoder().decode(survivorDownload.bytes),
       };
       await save("revocation_retained_handles_before_sync", findings.revocation_retained_handles_before_sync);
+    } finally {
+      resumeOwnerSync();
+    }
+  }, 180000);
+
+  it("does not transfer queued history keys from an offline reader device to a newly signed device", async () => {
+    const tree = await core.createVault(owner.storage, "Offline reader history delivery");
+    rooms.push({ storage: owner.storage, id: tree.id });
+    const file = await upload(owner.storage, tree.id, "offline-reader.txt", "history key sent to the offline device");
+
+    reader.storage.getClient().stopClient();
+    const { result: share, requests } = await captureToDeviceRecipients(
+      owner.user.accessToken,
+      () => core.shareVault(owner.storage, tree.id, reader.user.userId, "viewer"),
+    );
+    expect(share.rootMembership).toBe("invite");
+    expect(recipientsFor(requests, reader.user.userId)).toContain(reader.user.deviceId);
+    expect(requests.some((request) => request.status === 200)).toBe(true);
+
+    await holdOwnerSync(tree.id);
+    try {
+      const secondReaderUser = await loginNewDevice(reader.user);
+      const secondReader = await openStorage(secondReaderUser);
+      await secondReader.keySafe.restore(reader.recoveryKey);
+      await waitFor(async () => {
+        const trust = await secondReader.getClient().getCrypto()!
+          .getDeviceVerificationStatus(reader.user.userId, secondReaderUser.deviceId);
+        return trust?.signedByOwner ?? false;
+      }, { label: "new reader device is signed by the reader's account", timeoutMs: 20000 });
+      await core.joinVault(secondReader, tree.id);
+      await waitFor(() => secondReader.getTree(tree.id), {
+        label: "new signed reader device joins the invited tree",
+        timeoutMs: 15000,
+      });
+
+      const { result: repeatedShare, requests: repeatedRequests } = await captureToDeviceRecipients(
+        owner.user.accessToken,
+        () => core.shareVault(owner.storage, tree.id, reader.user.userId, "viewer"),
+      );
+      expect(repeatedShare.rootMembership).toBe("join");
+      expect(recipientsFor(repeatedRequests, reader.user.userId)).not.toContain(secondReaderUser.deviceId);
+      await expect(core.downloadFile(secondReader, tree.id, file.id)).rejects.toMatchObject({
+        name: "UndecryptableFileError",
+        message: expect.stringContaining("Matrix may not have delivered this room key to this device"),
+      });
+      await save("offline_reader_history_delivery", {
+        invitationTargetDevice: reader.user.deviceId,
+        newSignedDevice: secondReaderUser.deviceId,
+        queuedKeyRequestAccepted: requests.some((request) => request.status === 200),
+        repeatedShareSentHistoryKeys: recipientsFor(repeatedRequests, reader.user.userId).has(secondReaderUser.deviceId),
+        newDeviceCouldDecryptHistory: false,
+        diagnostic: "UndecryptableFileError",
+      });
     } finally {
       resumeOwnerSync();
     }

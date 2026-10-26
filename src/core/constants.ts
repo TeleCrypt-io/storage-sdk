@@ -8,7 +8,6 @@ const MATRIX_SERVER_NAME_PATTERN = "(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9.-]+)(?::\
 const MATRIX_SERVER_NAME_REGEXP = new RegExp(`^${MATRIX_SERVER_NAME_PATTERN}$`);
 const MATRIX_USER_ID_PATTERN = new RegExp(`^@([A-Za-z0-9._=+\\-/]+):(${MATRIX_SERVER_NAME_PATTERN})$`);
 const MATRIX_DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]+$/;
-const MATRIX_ROOM_ID_PATTERN = new RegExp(`^![A-Za-z0-9._~+\\/-]+:${MATRIX_SERVER_NAME_PATTERN}$`);
 const MATRIX_EVENT_ID_PATTERN = /^\$[A-Za-z0-9._~:/+\-]+$/;
 
 /**
@@ -54,7 +53,8 @@ export function validateMatrixRoomId(value: unknown, name = "room ID"): string {
   if (
     typeof value !== "string" ||
     new TextEncoder().encode(value).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
-    !MATRIX_ROOM_ID_PATTERN.test(value)
+    !value.startsWith("!") ||
+    /[\s\u0000-\u001f\u007f]/u.test(value)
   ) {
     throw new Error(`invalid Matrix ${name}`);
   }

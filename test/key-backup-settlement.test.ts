@@ -35,6 +35,7 @@ function fixture() {
     fetchRoomEvent: vi.fn().mockResolvedValue(event),
     getEventMapper: () => () => event,
     decryptEventIfNeeded: vi.fn().mockResolvedValue(undefined),
+    getOriginalFileEventState: vi.fn().mockResolvedValue({ ownerUserId: owner, redacted: false, canRedact: true }),
     http: { authedRequest: vi.fn().mockResolvedValue(backup) },
   };
   const storage = new TeleCryptIOStorage(client as never);
@@ -63,6 +64,7 @@ describe("native key backup settlement", () => {
 
   it("uses the current encrypted file rename session", async () => {
     const { storage, event } = fixture();
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({ ownerUserId: owner, redacted: false, canRedact: true });
     vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(metadataId);
     vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
     const rename = vi.spyOn(storage, "getFileRenameMetadataEvent").mockResolvedValue(event as never);
@@ -72,6 +74,7 @@ describe("native key backup settlement", () => {
 
   it("also backs up the attachment when its rename uses a different session", async () => {
     const { storage, client, event } = fixture();
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({ ownerUserId: owner, redacted: false, canRedact: true });
     vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(metadataId);
     vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
     vi.spyOn(storage, "getFileRenameMetadataEvent").mockResolvedValue({
@@ -86,10 +89,30 @@ describe("native key backup settlement", () => {
 
   it("uses the original attachment session before any rename", async () => {
     const { storage, event } = fixture();
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({ ownerUserId: owner, redacted: false, canRedact: true });
     vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(fileId);
     const original = vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
     await storage.waitForKeyBackup(treeId, fileId);
     expect(original).toHaveBeenCalledWith(treeId, fileId);
+  });
+
+  it("backs up an accepted attachment even when it has no listing metadata pointer yet", async () => {
+    const { storage, event } = fixture();
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValue({ ownerUserId: owner, redacted: false, canRedact: true });
+    vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(null);
+    const original = vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
+    await expect(storage.waitForKeyBackup(treeId, fileId)).resolves.toBe("backed_up");
+    expect(original).toHaveBeenCalledWith(treeId, fileId);
+  });
+
+  it("clears backup work when another device redacts the original during settlement", async () => {
+    const { storage, client, event } = fixture();
+    vi.spyOn(storage, "getFileMetadataEventId").mockResolvedValue(fileId);
+    vi.spyOn(storage, "getOriginalFileEvent").mockResolvedValue(event as never);
+    vi.spyOn(storage, "getOriginalFileEventState").mockResolvedValueOnce({ ownerUserId: owner, redacted: false, canRedact: true })
+      .mockResolvedValueOnce({ ownerUserId: owner, redacted: true, canRedact: false });
+    client.http.authedRequest.mockRejectedValueOnce(new MatrixError({ errcode: "M_NOT_FOUND" }, 404));
+    await expect(storage.waitForKeyBackup(treeId, fileId, { timeoutMs: 1000 })).resolves.toBe("deleted");
   });
 
   it("rejects unreadable metadata before claiming backup is ready", async () => {

@@ -18,7 +18,7 @@ describe("listMembers power-level defaults", () => {
         users: {},
       };
     });
-    const storage = new TeleCryptIOStorage({ http: { authedRequest } } as never);
+    const storage = new TeleCryptIOStorage({ http: { authedRequest }, getRoom: () => null } as never);
     const tree = { id: roomId } as TreeSpace;
 
     await expect(storage.listMembers(tree)).resolves.toEqual([

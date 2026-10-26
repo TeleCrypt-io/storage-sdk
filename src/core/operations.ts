@@ -22,6 +22,8 @@ import {
   EventType,
   MatrixError,
   type MatrixClient,
+  type MatrixEvent,
+  UNSTABLE_MSC3089_BRANCH,
 } from "matrix-js-sdk";
 import { deleteOwnedMedia } from "../media.js";
 import { validateMatrixEventId } from "./constants.js";
@@ -38,9 +40,7 @@ import { ConditionTimeoutError, waitForCondition } from "./poll.js";
 import { hasStorageTreeMarkersRoom, isStorageTreeRoom, validateName } from "./validation.js";
 import { prepareReaderHistorySharing } from "../sharing.js";
 import {
-  isFileDeleted,
   isTreeDeleted,
-  markFileDeleted,
   markTreeDeleted,
 } from "../deletion-markers.js";
 import type {
@@ -53,9 +53,13 @@ import type {
   VaultInfo,
   DeleteResult,
   JoinResult,
+  ListedFileInfo,
   Member,
+  MemberActionCapabilities,
   RenameResult,
   ShareResult,
+  TreeActionCapabilities,
+  TreeRole,
   UnshareResult,
 } from "./types.js";
 
@@ -75,6 +79,7 @@ export interface OperationOptions {
  * `withRateLimitRetry`; must not mask non-rate-limit failures.
  */
 const RATE_LIMIT_DEFAULT_DELAY_MS = 15_000;
+const STORAGE_METADATA_EVENT_TYPE = "io.telecrypt.storage.metadata";
 // JavaScript timers cannot represent a longer delay reliably. The operation's
 // own deadline remains the authority that stops retrying.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -246,14 +251,6 @@ function isMarkedTreeDeleted(storage: TeleCryptIOStorage, treeId: string): boole
   return isTreeDeleted(storage.getClient(), treeId);
 }
 
-function isMarkedFileDeleted(
-  storage: TeleCryptIOStorage,
-  treeId: string,
-  fileId: string,
-): boolean {
-  return isFileDeleted(storage.getClient(), treeId, fileId);
-}
-
 /** As `resolveTree`, but for a specific file within an already-resolved
  * vault or folder — covers the same settling window for a file another
  * process/session just uploaded. */
@@ -264,17 +261,21 @@ async function resolveFile(
   signal?: AbortSignal,
 ): Promise<FileBranch> {
   if (signal?.aborted) throw new StorageError("operation cancelled");
-  if (isMarkedFileDeleted(storage, tree.id, fileId)) {
-    throw new StorageError("file not found");
-  }
   try {
     return await waitForCondition(
-      () => (isMarkedFileDeleted(storage, tree.id, fileId) ? null : tree.getFile(fileId)),
+      async () => {
+        const branch = tree.getFile(fileId);
+        if (!branch) return null;
+        const state = await storage.getOriginalFileEventState(tree.id, fileId);
+        if (state.redacted) throw new StorageError("file not found");
+        return branch;
+      },
       { timeoutMs: 15000, signal },
     );
   } catch (error) {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     if (error instanceof ConditionTimeoutError) throw new StorageError("file not found");
+    if (error instanceof StorageError && error.message === "file not found") throw error;
     throw new StorageError("file lookup failed", { cause: error });
   }
 }
@@ -285,17 +286,25 @@ async function resolveFile(
  * room. This also prevents a folder/vault delete from silently deleting a
  * nested shared tree.
  */
-function assertTreeEmptyForDeletion(
+async function assertTreeEmptyForDeletion(
   storage: TeleCryptIOStorage,
   tree: TreeSpace,
-): void {
+): Promise<void> {
   let files: FileBranch[];
   try {
-    files = tree.listFiles().filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
+    files = tree.listFiles();
   } catch (error) {
     throw new StorageError("could not enumerate storage files safely", { cause: error });
   }
-  if (files.length > 0) throw new NonEmptyTreeError(tree.id);
+  try {
+    for (const file of files) {
+      const state = await storage.getOriginalFileEventState(tree.id, file.id);
+      if (!state.redacted) throw new NonEmptyTreeError(tree.id);
+    }
+  } catch (error) {
+    if (error instanceof NonEmptyTreeError) throw error;
+    throw new StorageError("could not enumerate storage files safely", { cause: error });
+  }
 
   const childEvents = readRelationEvents(storage.getClient(), tree.id, EventType.SpaceChild);
   if (childEvents === null) throw new StorageError("could not enumerate storage folders safely");
@@ -357,12 +366,7 @@ async function refreshTreeSpaces(
   return spaces;
 }
 
-type RelationEvent = {
-  getStateKey?: () => string | undefined;
-  getId?: () => string | undefined;
-  getSender?: () => string | undefined;
-  getContent?: () => unknown;
-};
+type RelationEvent = Pick<MatrixEvent, "getStateKey" | "getId" | "getSender" | "getContent" | "isRedacted">;
 
 type RelationState = {
   getStateEvents?: (
@@ -426,7 +430,7 @@ async function activeTreeDirectories(
         async () => {
           const directory = storage.getTree(childId);
           if (directory?.id === childId) return directory;
-          if (!joined && client.getRoom?.(childId)?.getMyMembership?.() === "invite") {
+          if (!joined && client.getRoom(childId)?.getMyMembership() === "invite") {
             await joinTreeRoom(storage, childId, signal ?? new AbortController().signal);
             joined = true;
           }
@@ -465,10 +469,14 @@ async function unlinkExternalParents(
     const event = events[0];
     if (!event || !isActiveRelationEvent(event)) return;
     const currentUserId = client.getUserId();
-    if (!currentUserId || event.getSender?.() !== currentUserId) {
-      throw new StorageError("storage folder relation was not authored by the owner");
+    const room = client.getRoom(roomId);
+    if (
+      !currentUserId ||
+      !room?.currentState.maySendRedactionForEvent(event as MatrixEvent, currentUserId)
+    ) {
+      throw new StorageError("Matrix does not permit removing a storage folder link");
     }
-    const eventId = validateMatrixEventId(event.getId?.(), "storage folder relation event ID");
+    const eventId = validateMatrixEventId(event.getId(), "storage folder relation event ID");
     await withRateLimitRetry(
       () => withMatrixMutationAbort(() => client.redactEvent(roomId, eventId), signal),
       signal,
@@ -517,10 +525,7 @@ async function unlinkExternalParents(
 }
 
 function isGoneError(error: unknown): boolean {
-  return (
-    error instanceof MatrixError &&
-    (error.errcode === "M_NOT_FOUND" || error.errcode === "M_UNKNOWN")
-  );
+  return error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND";
 }
 
 async function deleteRoomDeterministically(
@@ -550,10 +555,6 @@ async function deleteRoomDeterministically(
     const tree = storage.getTree(roomId);
     if (!tree) throw new StorageError("storage room is unavailable for deletion");
     const members = await storage.listMembers(tree, { signal });
-    if (members.some((member) => member.userId !== self && member.role === "owner" &&
-        (member.membership === "join" || member.membership === "invite" || member.membership === "knock"))) {
-      throw new StorageError("delete will not kick another room owner");
-    }
     for (const member of members) {
       const membership = member.membership;
       if (
@@ -680,6 +681,12 @@ export function getMyVaultRole(storage: TeleCryptIOStorage, vaultId: string): st
   const userId = storage.getClient().getUserId();
   const tree = storage.getTree(vaultId);
   if (!userId || !tree) return null;
+  // RoomState computes v12 creators' effective power through the SDK's native
+  // powerLevelForUserId path. MSC3089TreeSpace.getPermissions reads only the
+  // power-level event, where an implicit creator has no explicit entry.
+  if (storage.getClient().getRoom(vaultId)?.currentState.getMember(userId)?.powerLevel === Number.POSITIVE_INFINITY) {
+    return "owner";
+  }
   return tree.getPermissions(userId);
 }
 
@@ -848,12 +855,9 @@ export async function declineInvite(
   return withOperationDeadline(options, async (signal) => {
     const client = storage.getClient();
     try {
-      const room = typeof client.getRoom === "function" ? client.getRoom(vaultId) : undefined;
+      const room = client.getRoom(vaultId);
       if (!room) throw new StorageError("decline failed");
-      const localMembership =
-        typeof (room as { getMyMembership?: unknown }).getMyMembership === "function"
-          ? (room as { getMyMembership: () => string | null }).getMyMembership()
-          : null;
+      const localMembership = room.getMyMembership();
       // Invites are destructive: refresh the exact room before validating its
       // space relation and local tree metadata. A stale sync snapshot could
       // otherwise make a now-nested or unrelated room look safe to forget.
@@ -863,7 +867,7 @@ export async function declineInvite(
       if (localMembership !== "invite" && localMembership !== "knock") {
         await storage.refreshRoomState(vaultId, { signal });
       }
-      const currentRoom = typeof client.getRoom === "function" ? client.getRoom(vaultId) : undefined;
+      const currentRoom = client.getRoom(vaultId);
       // Matrix 42's unstableGetFileTreeSpace() intentionally returns null for
       // invited rooms: it only constructs a tree after local membership is
       // `join`. A pending invite is nevertheless a reviewed top-level tree
@@ -938,17 +942,17 @@ export async function declineInvite(
   }, "mutation");
 }
 
-/** Invites `userId` to the vault as a reader. */
+/** Shares the vault and its existing folders with `userId` at the selected role. */
 export async function shareVault(
   storage: TeleCryptIOStorage,
   vaultId: string,
   userId: string,
-  role: string,
+  role: TreeRole,
   options?: OperationOptions,
 ): Promise<ShareResult> {
   await storage.keySafe.requireReady({ signal: options?.signal });
-  if (role !== "viewer") {
-    throw new StorageError("storage sharing supports viewers only");
+  if (role !== "viewer" && role !== "editor" && role !== "owner") {
+    throw new StorageError("invalid storage role");
   }
   const operation = createOperationDeadline(options);
   const completedRoomIds = new Set<string>();
@@ -963,48 +967,59 @@ export async function shareVault(
         if (currentUser && userId === currentUser) {
           throw new StorageError("share target is the current user");
         }
-        const currentMembers = await withRateLimitRetry(
-          () => storage.listMembers(tree, { signal: operation.signal }),
-          operation.signal,
-        );
-        if (currentMembers.some((member) => member.userId === userId && member.role === "owner")) {
-          throw new StorageError("share will not demote an existing owner");
-        }
         const client = storage.getClient();
-        const verifyHistorySharing = await prepareReaderHistorySharing(client, userId);
-        for (const [index, space] of spaces.entries()) {
+        for (const space of spaces) {
           ensureOperationActive(operation.signal);
-          const members =
-            index === 0
-              ? currentMembers
-              : await withRateLimitRetry(
-                  () => storage.listMembers(space, { signal: operation.signal }),
-                  operation.signal,
-                );
-          if (members.some((member) => member.userId === userId && member.role === "owner")) {
-            throw new StorageError("share will not demote an existing owner");
-          }
-          const currentMembership =
-            index === 0
-              ? currentMembers.find((member) => member.userId === userId)?.membership
-              : await storage.getRoomMembership(space.id, userId, {
-                  signal: operation.signal,
-                });
-          if (currentMembership === "join") continue;
-          // Native invite shares the encrypted history before inviting. Retry
-          // pending invitations too: an earlier attempt may have sent only an
-          // invitation. In particular, never swallow a media-upload 403 merely
-          // because an invitation already exists.
-          await withRateLimitRetry(
-            () => withMatrixMutationAbort(() => space.invite(userId, false), operation.signal),
+          await storage.refreshRoomState(space.id, { signal: operation.signal });
+          await storage.prepareTreePermissionsForAccessChange(space.id, { signal: operation.signal });
+          const members = await withRateLimitRetry(
+            () => storage.listMembers(space, { signal: operation.signal }),
             operation.signal,
           );
-          completedRoomIds.add(space.id);
-          await verifyHistorySharing();
+          let memberRole = members.find((candidate) => candidate.userId === userId)?.role;
+          const membership = await storage.getRoomMembership(space.id, userId, {
+            signal: operation.signal,
+          });
+          if (membership !== "join") {
+            // Only new or pending memberships run Matrix's native history-share
+            // path. Updating a joined member's role does not reinvite them.
+            const verifyHistorySharing = await prepareReaderHistorySharing(client, userId);
+            await withRateLimitRetry(
+              () => withMatrixMutationAbort(() => space.invite(userId, false), operation.signal),
+              operation.signal,
+            );
+            completedRoomIds.add(space.id);
+            await verifyHistorySharing();
+            // The pre-invite snapshot has no role for a new member. Read the
+            // server's current membership and power levels after the invite
+            // so a default Viewer does not require a redundant power-level
+            // write (which may be forbidden to an invite-only actor).
+            memberRole = (await storage.listMembers(space, { signal: operation.signal }))
+              .find((candidate) => candidate.userId === userId)?.role;
+          }
+          if (memberRole === undefined) {
+            throw new StorageError("requested member role could not be read");
+          }
+          if (memberRole !== role) {
+            await withRateLimitRetry(
+              () => withMatrixMutationAbort(() => space.setPermissions(userId, role), operation.signal),
+              operation.signal,
+            );
+            completedRoomIds.add(space.id);
+            await storage.refreshRoomState(space.id, { signal: operation.signal });
+          }
+          const actual = await storage.listMembers(space, { signal: operation.signal });
+          if (actual.find((candidate) => candidate.userId === userId)?.role !== role) {
+            throw new StorageError("requested storage role could not be verified");
+          }
         }
-        // Storage rooms have one immutable owner power level and readers use
-        // the room's default user level. Changing per-user power levels would create editors and
-        // let metadata authorship drift away from the owner.
+        const rootMembership = await storage.getRoomMembership(tree.id, userId, {
+          signal: operation.signal,
+        });
+        if (rootMembership !== "join" && rootMembership !== "invite") {
+          throw new StorageError("root membership could not be verified");
+        }
+        return { vaultId, userId, role, rootMembership };
       } catch (error) {
         if (error instanceof MutationOutcomeUnknownError) throw error;
         if (completedRoomIds.size > 0) {
@@ -1027,7 +1042,6 @@ export async function shareVault(
         }
         throw new StorageError("share failed", { cause: error });
       }
-      return { vaultId, userId, role: "viewer" };
     }, operation.signal);
     return await raceOperationDeadline(operation, pending, "mutation");
   } finally {
@@ -1053,26 +1067,18 @@ export async function unshareVault(
         if (currentUser && userId === currentUser) {
           throw new StorageError("unshare target is the current user");
         }
-        const spaces = await refreshTreeSpaces(storage, tree, operation.signal);
-        for (const space of spaces) {
+        const revokeFromSpace = async (space: TreeSpace): Promise<void> => {
           ensureOperationActive(operation.signal);
-          const members = await withRateLimitRetry(
-            () => storage.listMembers(space, { signal: operation.signal }),
-            operation.signal,
-          );
-          if (members.some((member) => member.userId === userId && member.role === "owner")) {
-            throw new StorageError("unshare will not remove an existing owner");
-          }
           let membership: string | null;
           try {
             membership = await storage.getRoomMembership(space.id, userId, {
               signal: operation.signal,
             });
           } catch (error) {
-            if (isGoneError(error)) continue;
+            if (isGoneError(error)) return;
             throw error;
           }
-          if (!isRevocableMembership(membership)) continue;
+          if (!isRevocableMembership(membership)) return;
           try {
             await withRateLimitRetry(
               () =>
@@ -1082,17 +1088,33 @@ export async function unshareVault(
                 ),
               operation.signal,
             );
+            const afterKick = await storage.getRoomMembership(space.id, userId, {
+              signal: operation.signal,
+            });
+            if (isRevocableMembership(afterKick)) {
+              throw new StorageError("room membership removal could not be verified");
+            }
             completedRoomIds.add(space.id);
           } catch (error) {
-            if (isGoneError(error)) continue;
+            if (isGoneError(error)) return;
             if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
               const afterForbidden = await storage.getRoomMembership(space.id, userId, {
                 signal: operation.signal,
               });
-              if (!isRevocableMembership(afterForbidden)) continue;
+              if (!isRevocableMembership(afterForbidden)) return;
             }
             throw error;
           }
+        };
+        // Revoke the root first. A concurrently created child linked after
+        // this point will observe the changed parent membership; children
+        // already linked are collected only after the root revoke is visible.
+        await revokeFromSpace(tree);
+        await storage.refreshRoomState(tree.id, { signal: operation.signal });
+        const spaces = await refreshTreeSpaces(storage, tree, operation.signal);
+        for (const space of spaces) {
+          if (space.id === tree.id) continue;
+          await revokeFromSpace(space);
         }
       } catch (error) {
         if (error instanceof MutationOutcomeUnknownError) throw error;
@@ -1143,26 +1165,255 @@ export async function listFiles(
   storage: TeleCryptIOStorage,
   treeId: string,
   options?: OperationOptions,
-): Promise<FileInfo[]> {
+): Promise<ListedFileInfo[]> {
   await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     try {
       await storage.refreshRoomState(treeId, { signal });
       ensureOperationActive(signal);
-      const files = tree
-        .listFiles()
-        .filter((file) => !isMarkedFileDeleted(storage, tree.id, file.id));
-      return await Promise.all(
-        files.map(async (file) => ({
+      const client = storage.getClient();
+      const room = client.getRoom(tree.id);
+      if (!room) throw new StorageError("storage room is unavailable");
+      const userId = client.getUserId();
+      const canRename = Boolean(
+        userId &&
+        room.currentState.maySendEvent(EventType.RoomMessageEncrypted, userId) &&
+        room.currentState.mayClientSendStateEvent(UNSTABLE_MSC3089_BRANCH.name, client) &&
+        room.currentState.mayClientSendStateEvent(STORAGE_METADATA_EVENT_TYPE, client)
+      );
+      const files = tree.listFiles();
+      const result = await Promise.all(files.map(async (file) => {
+        const state = await storage.getOriginalFileEventState(tree.id, file.id);
+        if (state.redacted) return null;
+        return {
           id: file.id,
           name: await storage.getFileName(tree.id, file.id, { signal, refreshState: false }),
-        })),
-      );
+          ownerUserId: state.ownerUserId,
+          canRename,
+          canDelete: state.ownerUserId === client.getUserId() && state.canRedact,
+        };
+      }));
+      return result.filter((file): file is ListedFileInfo => file !== null);
     } catch (error) {
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("list files failed", { cause: error });
     }
+  });
+}
+
+function powerLevelContent(room: NonNullable<ReturnType<MatrixClient["getRoom"]>>): Record<string, unknown> {
+  const event = room.currentState.getStateEvents(EventType.RoomPowerLevels, "");
+  const content = Array.isArray(event) ? undefined : event?.getContent();
+  return typeof content === "object" && content !== null && !Array.isArray(content)
+    ? content as Record<string, unknown>
+    : {};
+}
+
+function numericPower(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function configuredUserPower(content: Record<string, unknown>, userId: string): number {
+  const users = content.users;
+  const usersMap = typeof users === "object" && users !== null && !Array.isArray(users)
+    ? users as Record<string, unknown>
+    : {};
+  return numericPower(usersMap[userId], numericPower(content.users_default, 0));
+}
+
+function configuredRolePower(content: Record<string, unknown>, role: TreeRole): number {
+  const events = content.events;
+  const eventLevels = typeof events === "object" && events !== null && !Array.isArray(events)
+    ? events as Record<string, unknown>
+    : {};
+  if (role === "viewer") return numericPower(content.users_default, 0);
+  if (role === "editor") return numericPower(content.events_default, 50) || 50;
+  return numericPower(eventLevels[EventType.RoomPowerLevels], 100) || 100;
+}
+
+function mayInviteMember(
+  room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
+  client: MatrixClient,
+  actorPower: number,
+): boolean {
+  if (client.isGuest()) return false;
+  const userId = client.getUserId();
+  const member = userId ? room.currentState.getMember(userId) : null;
+  if (member?.membership !== "join") return false;
+  const content = powerLevelContent(room);
+  // Matrix defaults invite to zero, while this SDK helper's generic default is
+  // 50. Use its native threshold check when explicitly configured and apply
+  // the Matrix protocol default when the event omits it.
+  return typeof content.invite === "number"
+    ? room.currentState.hasSufficientPowerLevelFor("invite", actorPower)
+    : actorPower >= 0;
+}
+
+function mayAssignTreeRole(
+  room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
+  client: MatrixClient,
+  targetUserId: string,
+  role: TreeRole,
+): boolean {
+  const actorUserId = client.getUserId();
+  if (!actorUserId || actorUserId === targetUserId) return false;
+  const state = room.currentState;
+  const actor = state.getMember(actorUserId);
+  if (!actor || actor.membership !== "join") return false;
+  if (
+    !state.mayClientSendStateEvent(EventType.RoomPowerLevels, client)
+  ) {
+    return false;
+  }
+  const content = powerLevelContent(room);
+  const targetPower = state.getMember(targetUserId)?.powerLevel ?? configuredUserPower(content, targetUserId);
+  const desiredPower = configuredRolePower(content, role);
+  return actor.powerLevel > targetPower && desiredPower <= actor.powerLevel;
+}
+
+function mayKickMember(
+  room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
+  client: MatrixClient,
+  targetUserId: string,
+): boolean {
+  const actorUserId = client.getUserId();
+  if (!actorUserId || actorUserId === targetUserId) return false;
+  const state = room.currentState;
+  const actor = state.getMember(actorUserId);
+  const target = state.getMember(targetUserId);
+  return Boolean(
+    actor?.membership === "join" &&
+    target &&
+    (target.membership === "join" || target.membership === "invite" || target.membership === "knock") &&
+    actor.powerLevel > target.powerLevel &&
+    state.hasSufficientPowerLevelFor("kick", actor.powerLevel)
+  );
+}
+
+function mayDeleteTreeRoom(
+  client: MatrixClient,
+  room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
+): boolean {
+  const userId = client.getUserId();
+  if (!userId) return false;
+  const ownMember = room.currentState.getMember(userId);
+  if (!ownMember) return false;
+  if (ownMember.membership === "leave" || ownMember.membership === "ban") return true;
+  if (ownMember.membership !== "join") return false;
+  for (const member of room.getMembers()) {
+    if (
+      member.userId !== userId &&
+      (member.membership === "join" || member.membership === "invite" || member.membership === "knock") &&
+      !mayKickMember(room, client, member.userId)
+    ) {
+      return false;
+    }
+  }
+  const parents = readRelationEvents(client, room.roomId, EventType.SpaceParent);
+  if (parents === null) return false;
+  for (const parentEvent of parents) {
+    if (!isActiveRelationEvent(parentEvent)) continue;
+    const parentId = relationStateKey(parentEvent);
+    if (!parentId || parentId === room.roomId) continue;
+    const parentRoom = client.getRoom(parentId);
+    if (!parentRoom) return false;
+    const childEvents = readRelationEvents(client, parentId, EventType.SpaceChild, room.roomId);
+    if (childEvents === null) return false;
+    const activeChild = childEvents.find(isActiveRelationEvent);
+    if (
+      !room.currentState.maySendRedactionForEvent(parentEvent as MatrixEvent, userId) ||
+      (activeChild && !parentRoom.currentState.maySendRedactionForEvent(activeChild as MatrixEvent, userId))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Reads current native Matrix capabilities for the operations offered in a tree room. */
+export async function getTreeActionCapabilities(
+  storage: TeleCryptIOStorage,
+  treeId: string,
+  options?: OperationOptions,
+): Promise<TreeActionCapabilities> {
+  await storage.keySafe.requireReady({ signal: options?.signal });
+  return withOperationDeadline(options, async (signal) => {
+    const tree = await resolveTree(storage, treeId, signal);
+    await storage.refreshRoomState(tree.id, { signal });
+    const client = storage.getClient();
+    const room = client.getRoom(tree.id);
+    const userId = client.getUserId();
+    const noActions: TreeActionCapabilities = {
+      renameTree: false,
+      uploadFile: false,
+      renameFile: false,
+      createSubfolder: false,
+      deleteTree: false,
+      inviteMembers: false,
+    };
+    if (!room || !userId) return noActions;
+    const state = room.currentState;
+    const actor = state.getMember(userId);
+    const canWriteState = (eventType: string): boolean =>
+      state.mayClientSendStateEvent(eventType, client);
+    const canSendEncryptedMetadata = state.maySendEvent(EventType.RoomMessageEncrypted, userId) &&
+      canWriteState(STORAGE_METADATA_EVENT_TYPE);
+    return {
+      renameTree: canSendEncryptedMetadata,
+      uploadFile:
+        state.maySendEvent(EventType.RoomMessageEncrypted, userId) &&
+        canWriteState(UNSTABLE_MSC3089_BRANCH.name),
+      renameFile:
+        canSendEncryptedMetadata && canWriteState(UNSTABLE_MSC3089_BRANCH.name),
+      createSubfolder: canWriteState(EventType.SpaceChild),
+      deleteTree: mayDeleteTreeRoom(client, room),
+      inviteMembers: Boolean(actor && mayInviteMember(room, client, actor.powerLevel)),
+    };
+  });
+}
+
+/** Reads native permissions for sharing, changing, or removing the supplied members. */
+export async function getMemberActionCapabilities(
+  storage: TeleCryptIOStorage,
+  vaultId: string,
+  targetUserIds: string[],
+  options?: OperationOptions,
+): Promise<Record<string, MemberActionCapabilities>> {
+  await storage.keySafe.requireReady({ signal: options?.signal });
+  return withOperationDeadline(options, async (signal) => {
+    const tree = await resolveTree(storage, vaultId, signal);
+    await storage.refreshRoomState(tree.id, { signal });
+    const client = storage.getClient();
+    const room = client.getRoom(tree.id);
+    const userId = client.getUserId();
+    const result: Record<string, MemberActionCapabilities> = {};
+    const roles: TreeRole[] = ["viewer", "editor", "owner"];
+    for (const targetUserId of targetUserIds) {
+      const member = room?.currentState.getMember(targetUserId);
+      const joined = member?.membership === "join";
+      const canInvite = Boolean(room && userId && userId !== targetUserId && (
+        joined || mayInviteMember(room, client, room.currentState.getMember(userId)?.powerLevel ?? -Infinity)
+      ));
+      const canChangeRole = Object.fromEntries(roles.map((role) => [
+        role,
+        Boolean(room && mayAssignTreeRole(room, client, targetUserId, role)),
+      ])) as Record<TreeRole, boolean>;
+      const targetMember = room?.currentState.getMember(targetUserId);
+      const currentRole = targetMember?.powerLevel === Number.POSITIVE_INFINITY
+        ? "owner"
+        : tree.getPermissions(targetUserId);
+      const roleForShare = Object.fromEntries(roles.map((role) => [
+        role,
+        canInvite && (currentRole === role || canChangeRole[role]),
+      ])) as Record<TreeRole, boolean>;
+      result[targetUserId] = {
+        canShare: roleForShare,
+        canChangeRole,
+        canUnshare: Boolean(room && mayKickMember(room, client, targetUserId)),
+      };
+    }
+    return result;
   });
 }
 
@@ -1222,11 +1473,13 @@ async function renameTree(
   validateName(name, "name");
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
+    let mutationAccepted = false;
     try {
       await withRateLimitRetry(
         () => withMatrixMutationAbort(() => tree.setName(name), signal),
         signal,
       );
+      mutationAccepted = true;
       await waitForCondition(
         async () => {
           ensureOperationActive(signal);
@@ -1239,6 +1492,14 @@ async function renameTree(
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
+      if (mutationAccepted) {
+        throw new MutationPartialError(
+          "rename tree",
+          [treeId],
+          "the encrypted name write was accepted but could not be read back",
+          { cause: error, treeId, backupTargets: [{ treeId }] },
+        );
+      }
       throw new StorageError("rename failed", { cause: error });
     }
     return { id: treeId, name };
@@ -1298,7 +1559,7 @@ async function deleteTree(
         // Deletion owns one room. Refresh its current state and its one
         // supported parent before checking files/folders or changing links.
         externalParents = await refreshDeletionRooms(storage, tree.id, operation.signal);
-        assertTreeEmptyForDeletion(storage, tree);
+        await assertTreeEmptyForDeletion(storage, tree);
       } catch (error) {
         if (error instanceof StorageError) throw error;
         throw new StorageError("delete failed", { cause: error });
@@ -1356,11 +1617,13 @@ export async function renameFile(
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
+    let mutationAccepted = false;
     try {
       await withRateLimitRetry(
         () => withMatrixMutationAbort(() => branch.setName(name), signal),
         signal,
       );
+      mutationAccepted = true;
       // `setName` resolves when the homeserver accepts the state event, but a
       // fresh CLI/UI process can still read the previous local room state for a
       // short time. Do not report success until this client has observed the new
@@ -1376,6 +1639,14 @@ export async function renameFile(
     } catch (error) {
       if (error instanceof MutationOutcomeUnknownError) throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
+      if (mutationAccepted) {
+        throw new MutationPartialError(
+          "rename file",
+          [fileId],
+          "the encrypted name write was accepted but could not be read back",
+          { cause: error, treeId, backupTargets: [{ treeId, fileId }] },
+        );
+      }
       throw new StorageError("rename file failed", { cause: error });
     }
     return { id: fileId, name };
@@ -1415,104 +1686,69 @@ export async function deleteFile(
   return withOperationDeadline(options, async (signal) => {
     const tree = await resolveTree(storage, treeId, signal);
     await storage.refreshRoomState(treeId, { signal });
-    const branch = tree.getFile(fileId);
-
-    let originalEvent;
-    try {
-      originalEvent = await storage.getOriginalFileEvent(tree.id, fileId, true);
-    } catch (error) {
-      throw new StorageError("could not resolve encrypted file safely", { cause: error });
+    const state = await storage.getOriginalFileEventState(tree.id, fileId);
+    if (state.redacted) return { id: fileId, deleted: true };
+    if (state.ownerUserId !== storage.getClient().getUserId()) {
+      throw new StorageError("only the file uploader may delete this file");
     }
-    if (originalEvent.isRedacted()) {
-      if (!branch || branch.isActive === false) {
-        markFileDeleted(storage.getClient(), tree.id, fileId);
+    if (!state.canRedact) {
+      throw new StorageError("Matrix does not permit redacting the original file message");
+    }
+    const originalEvent = await storage.getOriginalFileEvent(tree.id, fileId, true);
+    if (originalEvent.isRedacted()) return { id: fileId, deleted: true };
+    const originalContent = originalEvent.getContent();
+    const fileDescriptor =
+      typeof originalContent === "object" &&
+      originalContent !== null &&
+      !Array.isArray(originalContent) &&
+      "file" in originalContent &&
+      typeof originalContent.file === "object" &&
+      originalContent.file !== null &&
+      !Array.isArray(originalContent.file)
+        ? originalContent.file as Record<string, unknown>
+        : undefined;
+    const mediaId = fileDescriptor?.url;
+    if (typeof mediaId !== "string" || mediaId.length === 0) {
+      throw new StorageError("encrypted file has no media identifier");
+    }
+    try {
+      await deleteFileMedia(storage, [mediaId], signal);
+    } catch (error) {
+      if ((await storage.getOriginalFileEventState(tree.id, fileId)).redacted) {
         return { id: fileId, deleted: true };
       }
+      throw error;
     }
-    const completedIds: string[] = [];
-    if (originalEvent.isRedacted()) {
-      // A concurrent rename can publish its listing after deletion completed.
-      // Reconcile that owner-authored state without needing the deleted media URL.
-      completedIds.push(fileId);
-    } else {
-      const originalContent = originalEvent.getContent();
-      const fileDescriptor =
-        typeof originalContent === "object" &&
-        originalContent !== null &&
-        !Array.isArray(originalContent) &&
-        "file" in originalContent &&
-        typeof originalContent.file === "object" &&
-        originalContent.file !== null &&
-        !Array.isArray(originalContent.file)
-          ? originalContent.file as Record<string, unknown>
-          : undefined;
-      const mediaId = fileDescriptor?.url;
-      if (typeof mediaId !== "string" || mediaId.length === 0) {
-        throw new StorageError("encrypted file has no media identifier");
-      }
-      await deleteFileMedia(storage, [mediaId], signal);
-      completedIds.push(mediaId);
-    }
+    const completedIds = [mediaId];
     try {
-      const client = storage.getClient();
-      const metadataEventId = branch
-        ? await storage.getFileMetadataEventId(tree.id, fileId, { signal })
-        : null;
-      if (metadataEventId && metadataEventId !== fileId) {
-        const metadataEvent = await storage.getFileRenameMetadataEvent(
-          tree.id,
-          fileId,
-          metadataEventId,
-        );
-        if (!metadataEvent.isRedacted()) {
-          await withRateLimitRetry(
-            () => withMatrixMutationAbort(
-              () => client.redactEvent(tree.id, metadataEventId),
-              signal,
-              "delete file rename metadata",
-            ),
-            signal,
-          );
-        }
-        completedIds.push(metadataEventId);
-      }
-
-      const currentBranch = tree.getFile(fileId);
-      const indexEvent = currentBranch?.indexEvent;
-      const listingEventId = indexEvent?.getId();
-      if (currentBranch && (!indexEvent || typeof listingEventId !== "string" || listingEventId.length === 0)) {
-        throw new StorageError("encrypted file has no listing event identifier");
-      }
-      if (indexEvent && !indexEvent.isRedacted()) {
-        if (indexEvent.getSender() !== client.getUserId()) {
-          throw new StorageError("file listing was not authored by the owner");
-        }
-        await withRateLimitRetry(
-          () => withMatrixMutationAbort(
-            () => client.redactEvent(tree.id, listingEventId!),
-            signal,
-            "delete file listing",
-          ),
-          signal,
-        );
-      }
-      if (listingEventId) completedIds.push(listingEventId);
-
-      if (!originalEvent.isRedacted()) await withRateLimitRetry(
+      await withRateLimitRetry(
         () => withMatrixMutationAbort(
-          () => client.redactEvent(tree.id, fileId),
+          () => storage.getClient().redactEvent(tree.id, fileId),
           signal,
-          "delete file attachment event",
+          "delete original file message",
         ),
         signal,
       );
-      if (!completedIds.includes(fileId)) completedIds.push(fileId);
+      completedIds.push(fileId);
     } catch (error) {
+      let redacted = false;
+      let readbackError: unknown;
+      try {
+        redacted = (await storage.getOriginalFileEventState(tree.id, fileId)).redacted;
+      } catch (failure) {
+        readbackError = failure;
+      }
+      if (redacted) {
+        return { id: fileId, deleted: true };
+      }
+      const cause = readbackError === undefined
+        ? error
+        : new AggregateError([error, readbackError], "redaction failed and file state could not be verified");
       throw new MutationPartialError(
         "delete file",
         completedIds,
-        "file media and the listed completed steps were deleted; retry with the original file ID to finish Matrix cleanup",
-        { cause: error },
+        "file media was deleted; retry with the original file ID to redact its message",
+        { cause },
       );
     }
     try {
@@ -1520,10 +1756,8 @@ export async function deleteFile(
         async () => {
           await storage.refreshRoomState(tree.id, { signal });
           ensureOperationActive(signal);
-          const current = tree.getFile(fileId);
-          if (current && current.isActive !== false) return null;
-          const attachment = await storage.getOriginalFileEvent(tree.id, fileId, true);
-          return attachment.isRedacted() ? true : null;
+          const current = await storage.getOriginalFileEventState(tree.id, fileId);
+          return current.redacted ? true : null;
         },
         { timeoutMs: 15000, signal },
       );
@@ -1532,7 +1766,6 @@ export async function deleteFile(
       const detail = "Matrix deletion completed but the file state could not be verified";
       throw new MutationPartialError("delete file", completedIds, detail, { cause: error });
     }
-    markFileDeleted(storage.getClient(), tree.id, fileId);
     ensureOperationActive(signal);
     return { id: fileId, deleted: true };
   }, "mutation");
@@ -1552,8 +1785,8 @@ export async function uploadFile(
     const signal = deadline.signal;
     ensureOperationActive(signal);
     // Unlike a read, an upload must retain a receipt returned by an in-flight
-    // mutation after cancellation. Native HTTP requests remain time-bounded;
-    // the uploader stops before starting another write when this signal aborts.
+    // mutation after cancellation. The uploader stops before another write
+    // when this operation's signal aborts.
     const tree = await resolveTree(storage, treeId, signal);
     const fileId = await withRateLimitRetry(
       () => storage.uploadFile(tree, name, toArrayBuffer(bytes), mimetype, signal),
@@ -1586,11 +1819,11 @@ export async function uploadFile(
         "upload file",
         [fileId],
         "upload completed but the file could not be observed locally",
-        { cause: error, treeId },
+        { cause: error, treeId, backupTargets: [{ treeId, fileId }] },
       );
     }
     ensureOperationActive(signal);
-    return { id: fileId, name, mimetype };
+    return { id: fileId, name, mimetype, ownerUserId: storage.getClient().getUserId()! };
   } finally {
     deadline.close();
   }
@@ -1673,7 +1906,8 @@ export async function getFileDetails(
     }
 
     ensureOperationActive(signal);
-    return { name, mimetype, size, createdAt, updatedAt };
+    const { ownerUserId } = await storage.getOriginalFileEventState(tree.id, fileId);
+    return { ownerUserId, name, mimetype, size, createdAt, updatedAt };
   });
 }
 

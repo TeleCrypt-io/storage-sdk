@@ -1,10 +1,15 @@
 # Front door for the throwaway MAS-delegated Synapse stack. The homeserver
-# origin serves Matrix and MAS native endpoints from one origin.
+# origin serves Matrix. MAS is published on a separate local auth origin.
 # See https://element-hq.github.io/matrix-authentication-service/setup/homeserver.html
 {
 	servers :8008 {
 		protocols h1
 	}
+}
+
+# Exercise clients with an auth issuer separate from the homeserver origin.
+:8081 {
+	reverse_proxy throwaway-mas:8080
 }
 
 :8008 {

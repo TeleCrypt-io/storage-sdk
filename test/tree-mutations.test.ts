@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   EventType,
+  MatrixError,
   UNSTABLE_MSC3088_ENABLED,
   UNSTABLE_MSC3088_PURPOSE,
   UNSTABLE_MSC3089_TREE_SUBTYPE,
@@ -37,13 +38,32 @@ function treeRoom(name: string) {
   return { name, currentState: storageRoomState() };
 }
 
-function tree(id: string, name: string, isTopLevel: boolean): TreeSpace {
+type TestMember = { userId: string; role: string; membership: string };
+type TestTree = TreeSpace & {
+  getTestMembers(): TestMember[];
+  setTestMembers(members: TestMember[]): void;
+};
+
+function tree(id: string, name: string, isTopLevel: boolean): TestTree {
+  let members: TestMember[] = [];
   return {
     id,
     room: treeRoom(name),
     isTopLevel,
     getDirectories: () => [],
-  } as unknown as TreeSpace;
+    getTestMembers: () => members.map((member) => ({ ...member })),
+    setTestMembers: (next: TestMember[]) => { members = next.map((member) => ({ ...member })); },
+    invite: vi.fn(async (userId: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.membership = "invite";
+      else members.push({ userId, role: "viewer", membership: "invite" });
+    }),
+    setPermissions: vi.fn(async (userId: string, role: string) => {
+      const current = members.find((member) => member.userId === userId);
+      if (current) current.role = role;
+      else members.push({ userId, role, membership: "invite" });
+    }),
+  } as unknown as TestTree;
 }
 
 function storageForTest(rawClient: unknown): TeleCryptIOStorage {
@@ -65,7 +85,13 @@ function storageForTest(rawClient: unknown): TeleCryptIOStorage {
       : Promise.resolve({});
   });
   const storage = new TeleCryptIOStorage(client as never);
-  vi.spyOn(storage, "listMembers").mockResolvedValue([]);
+  vi.spyOn(storage, "listMembers").mockImplementation(async (space) =>
+    (space as TestTree).getTestMembers(),
+  );
+  vi.spyOn(storage, "getRoomMembership").mockImplementation(async (roomId, userId) => {
+    const space = (client.unstableGetFileTreeSpace as (id: string) => TestTree | null)(roomId);
+    return space?.getTestMembers().find((member) => member.userId === userId)?.membership ?? null;
+  });
   return storage;
 }
 
@@ -88,11 +114,14 @@ describe("tree mutations", () => {
       leave: vi.fn(), forget: vi.fn(),
     };
     const storage = storageForTest(client);
-    vi.mocked(storage.listMembers).mockResolvedValue([
+    (parent as TestTree).setTestMembers([
       { userId: "@owner:example.test", role: "owner", membership: "join" },
       { userId: "@reader:example.test", role: "viewer", membership: "join" },
       { userId: "@invited:example.test", role: "viewer", membership: "invite" },
       { userId: "@knocking:example.test", role: "viewer", membership: "knock" },
+    ]);
+    (child as TestTree).setTestMembers([
+      { userId: "@owner:example.test", role: "owner", membership: "join" },
     ]);
     return { client, storage, parent, child };
   }
@@ -101,7 +130,7 @@ describe("tree mutations", () => {
     const f = sharedParent();
     await expect(f.storage.createSubtree(f.parent, "Child")).resolves.toBe(f.child);
     expect(vi.mocked(f.child.invite).mock.calls).toEqual([
-      ["@reader:example.test"], ["@invited:example.test"],
+      ["@reader:example.test", false], ["@invited:example.test", false],
     ]);
     expect(f.client.downloadKeysForUsers).toHaveBeenCalledTimes(2);
   });
@@ -421,6 +450,40 @@ describe("tree mutations", () => {
     expect(cause.errors[0]).toMatchObject({ message: "parent link failed" });
     expect(cause.errors[1]).toMatchObject({ message: "child link rollback could not be verified" });
     expect(client.redactEvent).toHaveBeenCalledWith(parent.id, "$parent-link");
+    expect(client.leave).toHaveBeenCalledWith(child.id);
+    expect(client.forget).toHaveBeenCalledWith(child.id);
+  });
+
+  it("cleans up a new room after native authorization rejects its parent link", async () => {
+    const childRoom = { currentState: storageRoomState() };
+    const child = { ...tree("!child-forbidden:example.test", "Child", false), room: childRoom } as unknown as TreeSpace;
+    const parentRoom = { currentState: storageRoomState() };
+    const parent = {
+      ...tree("!parent-forbidden:example.test", "Parent", true),
+      getDirectories: () => [],
+      room: parentRoom,
+    } as unknown as TreeSpace;
+    const trees = new Map([[parent.id, parent], [child.id, child]]);
+    const client = {
+      getUserId: () => "@viewer:example.test",
+      getDomain: () => "example.test",
+      getRooms: () => [{ roomId: parent.id }, { roomId: child.id }],
+      getRoom: (roomId: string) => (roomId === parent.id ? parentRoom : roomId === child.id ? childRoom : null),
+      createRoom: vi.fn(async () => ({ room_id: child.id })),
+      unstableGetFileTreeSpace: vi.fn((roomId: string) => trees.get(roomId) ?? null),
+      sendStateEvent: vi.fn().mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN" }, 403)),
+      redactEvent: vi.fn().mockResolvedValue(undefined),
+      leave: vi.fn().mockResolvedValue(undefined),
+      forget: vi.fn().mockResolvedValue(undefined),
+      http: { authedRequest: vi.fn(async () => []) },
+    };
+    const storage = storageForTest(client);
+
+    await expect(storage.createSubtree(parent, "Child")).rejects.toMatchObject({
+      errcode: "M_FORBIDDEN",
+      httpStatus: 403,
+    });
+    expect(client.redactEvent).not.toHaveBeenCalled();
     expect(client.leave).toHaveBeenCalledWith(child.id);
     expect(client.forget).toHaveBeenCalledWith(child.id);
   });

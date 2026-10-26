@@ -108,7 +108,12 @@ describe("core operations", () => {
       const vault = await core.createVault(storageA, "CoreShared");
 
       const share = await core.shareVault(storageA, vault.id, userB.userId, "viewer");
-      expect(share).toEqual({ vaultId: vault.id, userId: userB.userId, role: "viewer" });
+      expect(share).toEqual({
+        vaultId: vault.id,
+        userId: userB.userId,
+        role: "viewer",
+        rootMembership: "invite",
+      });
 
       const joined = await core.joinVault(storageB, vault.id);
       expect(joined).toEqual({ vaultId: vault.id, joined: true });
@@ -166,7 +171,7 @@ describe("core operations", () => {
         },
         { label: "listFiles sees the upload" },
       );
-      expect(files).toEqual([{ id: uploaded.id, name: "bytes.bin" }]);
+      expect(files).toMatchObject([{ id: uploaded.id, name: "bytes.bin", ownerUserId: user.userId }]);
 
       const downloaded = await core.downloadFile(storage, vault.id, uploaded.id);
       expect(downloaded.bytes).toEqual(bytes);
@@ -210,7 +215,11 @@ describe("core operations", () => {
         },
         { label: "renamed file visible locally" },
       );
-      expect(filesAfter).toContainEqual({ id: uploaded.id, name: "after.txt" });
+      expect(filesAfter).toContainEqual(expect.objectContaining({
+        id: uploaded.id,
+        name: "after.txt",
+        ownerUserId: user.userId,
+      }));
     } finally {
       stopTestClient(storage.getClient());
     }

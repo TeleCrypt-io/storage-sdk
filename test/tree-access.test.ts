@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { EventType, MatrixEvent, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
+import { EventType, MatrixEvent, RoomCreateTypeField, RoomType, UNSTABLE_MSC3088_PURPOSE, UNSTABLE_MSC3088_ENABLED, UNSTABLE_MSC3089_BRANCH, UNSTABLE_MSC3089_TREE_SUBTYPE } from "matrix-js-sdk";
+import { DEFAULT_TREE_POWER_LEVELS_TEMPLATE } from "matrix-js-sdk/lib/models/MSC3089TreeSpace.js";
 import { TeleCryptIOStorage, type TreeSpace } from "../src/TeleCryptIOStorage.js";
 import { joinVault, listSubfolders } from "../src/core/operations.js";
 import { markTreeDeleted } from "../src/deletion-markers.js";
@@ -7,6 +8,7 @@ import { markTreeDeleted } from "../src/deletion-markers.js";
 const owner = "@owner:example.test";
 const reader = "@reader:example.test";
 const roomId = "!tree:example.test";
+const storageMetadataEventType = "io.telecrypt.storage.metadata";
 
 function permissionFixture(userId = owner) {
   const state = [
@@ -38,26 +40,74 @@ function permissionFixture(userId = owner) {
   return { client, state, storage: new TeleCryptIOStorage(client as never) };
 }
 
+function legacyPermissionFixture() {
+  const fixture = permissionFixture();
+  const power = fixture.state.find((event) => event.type === EventType.RoomPowerLevels)!;
+  power.content = {
+    invite: 100, kick: 100, ban: 100, redact: 100,
+    state_default: 100, events_default: 0, users_default: 0,
+    users: { [owner]: 100, [reader]: 0 },
+    events: {
+      [EventType.RoomPowerLevels]: 100,
+      [EventType.RoomHistoryVisibility]: 100,
+      [EventType.RoomTombstone]: 100,
+      [EventType.RoomEncryption]: 100,
+      [EventType.RoomName]: 100,
+      [EventType.RoomMessage]: 0,
+      [EventType.RoomMessageEncrypted]: 0,
+      [EventType.Sticker]: 0,
+      [EventType.SpaceChild]: 100,
+      [EventType.SpaceParent]: 100,
+      [UNSTABLE_MSC3089_BRANCH.name]: 100,
+      [storageMetadataEventType]: 100,
+    },
+    notifications: { room: 100 },
+  };
+  return fixture;
+}
+
 describe("existing Storage permissions", () => {
-  it("repairs the owner's existing public vault and preserves unrelated permissions", async () => {
-    const f = permissionFixture();
+  it("leaves existing permissions and join rules unchanged during reads", async () => {
+    const f = legacyPermissionFixture();
+    const before = structuredClone(f.state);
     await f.storage.refreshRoomState(roomId);
-    const power = f.state.find((event) => event.type === EventType.RoomPowerLevels)!.content;
-    expect(power).toMatchObject({
-      state_default: 100, events_default: 0, invite: 100,
-      users: { [owner]: 100, [reader]: 0 },
-      events: { [EventType.RoomJoinRules]: 100, [UNSTABLE_MSC3088_PURPOSE.name]: 100, "io.example.other": 75 },
-    });
-    expect(f.state.find((event) => event.type === EventType.RoomJoinRules)?.content).toEqual({ join_rule: "invite" });
-    expect(f.client.sendStateEvent).toHaveBeenCalledTimes(2);
-    await f.storage.refreshRoomState(roomId);
-    expect(f.client.sendStateEvent).toHaveBeenCalledTimes(2);
+    expect(f.state).toEqual(before);
+    expect(f.client.sendStateEvent).not.toHaveBeenCalled();
+    expect(f.state.find((event) => event.type === EventType.RoomJoinRules)?.content).toEqual({ join_rule: "public" });
   });
 
-  it("does not write permissions as a reader", async () => {
-    const f = permissionFixture(reader);
-    await f.storage.refreshRoomState(roomId);
+  it("converts the exact legacy template during an explicit access change", async () => {
+    const f = legacyPermissionFixture();
+    await f.storage.prepareTreePermissionsForAccessChange(roomId);
+    const power = f.state.find((event) => event.type === EventType.RoomPowerLevels)!.content;
+    expect(power).toMatchObject({
+      invite: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.invite,
+      kick: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.kick,
+      ban: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.ban,
+      redact: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.redact,
+      state_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.state_default,
+      events_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+      users_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.users_default,
+      users: { [owner]: 100, [reader]: 0 },
+      notifications: { room: 100 },
+      events: {
+        [EventType.SpaceChild]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+        [EventType.SpaceParent]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+        [UNSTABLE_MSC3089_BRANCH.name]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+        [storageMetadataEventType]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+      },
+    });
+    expect(f.state.find((event) => event.type === EventType.RoomJoinRules)?.content).toEqual({ join_rule: "public" });
+    expect(f.client.sendStateEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves custom permission configurations during an explicit access change", async () => {
+    const f = legacyPermissionFixture();
+    const power = f.state.find((event) => event.type === EventType.RoomPowerLevels)!;
+    (power.content.events as Record<string, unknown>)[EventType.RoomName] = 75;
+    await f.storage.prepareTreePermissionsForAccessChange(roomId);
     expect(f.client.sendStateEvent).not.toHaveBeenCalled();
+    expect((power.content.events as Record<string, unknown>)[EventType.RoomName]).toBe(75);
   });
 
   it.each(["missing", "unsupported"])("does not repair owner permissions when encryption is %s", async (encryption) => {
@@ -85,16 +135,6 @@ describe("existing Storage permissions", () => {
     expect(f.client.sendStateEvent).not.toHaveBeenCalled();
   });
 
-  it("finishes a repair interrupted after the power-level write", async () => {
-    const f = permissionFixture();
-    const send = f.client.sendStateEvent.getMockImplementation()!;
-    f.client.sendStateEvent.mockImplementationOnce(send).mockRejectedValueOnce(new Error("disconnected"));
-    await expect(f.storage.refreshRoomState(roomId)).rejects.toThrow("disconnected");
-    f.client.sendStateEvent.mockImplementation(send);
-    await f.storage.refreshRoomState(roomId);
-    expect(f.client.sendStateEvent.mock.calls.filter((call) => call[1] === EventType.RoomPowerLevels)).toHaveLength(1);
-    expect(f.state.find((event) => event.type === EventType.RoomJoinRules)?.content).toEqual({ join_rule: "invite" });
-  });
 });
 
 function storageRoom(roomId: string, algorithm?: string) {

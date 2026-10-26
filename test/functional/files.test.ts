@@ -5,6 +5,7 @@ import { createTestClient, stopTestClient } from "../harness/clients";
 import { waitFor } from "../harness/waitFor";
 import { EventType, UNSTABLE_MSC3089_BRANCH } from "matrix-js-sdk";
 import { TeleCryptIOStorage, MSC3089Branch } from "../../src/TeleCryptIOStorage";
+import { deleteFile as deleteStoredFile, listFiles as listStoredFiles } from "../../src/core/operations.js";
 
 function randomBuffer(size: number): ArrayBuffer {
   const buf = new Uint8Array(size);
@@ -237,7 +238,7 @@ describe("encrypted files", () => {
     }
   });
 
-  it("2.8 delete a file removes it from listFiles", async () => {
+  it("2.8 confirmed original redaction removes a file from the public listing", async () => {
     const user = await registerTestUser("file");
     const storage = await TeleCryptIOStorage.create({
       baseUrl: "http://localhost:8008",
@@ -271,18 +272,20 @@ describe("encrypted files", () => {
         .getStateEvents(UNSTABLE_MSC3089_BRANCH.name, eventId)
         ?.getContent().metadata_event_id as string;
       expect(renameId).not.toBe(eventId);
-      await branch.delete();
+      await deleteStoredFile(storage, tree.id, eventId);
 
       await waitFor(
-        () => !tree.listFiles().some((f) => f.id === eventId),
-        { label: "file removed from listFiles", timeoutMs: 10000 },
+        async () => !(await listStoredFiles(storage, tree.id)).some((f) => f.id === eventId),
+        { label: "redacted original removed from public listFiles", timeoutMs: 10000 },
       );
 
-      const after = tree.listFiles();
-      expect(after.some((f) => f.id === eventId)).toBe(false);
+      expect(await listStoredFiles(storage, tree.id)).toEqual([]);
+      // MSC3089 may retain an active index event after deletion. The original
+      // uploader message remains authoritative for public file visibility.
+      expect(tree.listFiles().some((f) => f.id === eventId)).toBe(true);
       expect(tree.room.currentState
         .getStateEvents(UNSTABLE_MSC3089_BRANCH.name, eventId)
-        ?.getContent()).toEqual({});
+        ?.getContent().active).toBe(true);
       const redactedRename = await storage.getClient().fetchRoomEvent(tree.id, renameId);
       const redactedAttachment = await storage.getClient().fetchRoomEvent(tree.id, eventId);
       expect(JSON.stringify(redactedRename)).not.toContain("renamed-gone.txt");

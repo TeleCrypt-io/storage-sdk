@@ -409,23 +409,30 @@ describe("OIDC token refresh response validation", () => {
     ).toThrow("invalid token endpoint");
   });
 
-  it("binds refresh and revocation endpoints to the issuer", () => {
-    expect(() =>
-      buildTokenRefreshFunction(
-        { ...REFRESH_METADATA, token_endpoint: "https://evil.example.test/token" },
-        "client",
-        async () => {},
-        "DEVICE123",
-      ),
-    ).toThrow("outside the validated issuer");
-    expect(() =>
-      buildTokenRefreshFunction(
-        { ...REFRESH_METADATA, revocation_endpoint: "https://evil.example.test/revoke" },
-        "client",
-        async () => {},
-        "DEVICE123",
-      ),
-    ).toThrow("outside the validated issuer");
+  it("refreshes through a separately hosted endpoint advertised by Matrix auth metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      access_token: "next-access",
+      token_type: "Bearer",
+      scope: "urn:matrix:client:api:* urn:matrix:client:device:DEVICE123",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const refresh = buildTokenRefreshFunction(
+      {
+        ...REFRESH_METADATA,
+        issuer: "https://mas.example.test/issuer",
+        token_endpoint: "https://oauth.example.net/v2/token",
+        revocation_endpoint: "https://oauth.example.net/v2/revoke",
+      },
+      "client",
+      async () => {},
+      "DEVICE123",
+    );
+
+    await expect(refresh("refresh")).resolves.toMatchObject({ accessToken: "next-access" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://oauth.example.net/v2/token",
+      expect.objectContaining({ redirect: "manual" }),
+    );
   });
 
   it("revokes rotated tokens when persistence fails", async () => {
@@ -535,6 +542,48 @@ describe("Matrix 42 OAuth migration", () => {
     );
   });
 
+  it("accepts auth endpoints hosted on a separate service advertised by the homeserver", async () => {
+    const advertised: OidcClientConfig = {
+      ...OAUTH_METADATA,
+      issuer: "https://mas.example.test/issuer",
+      authorization_endpoint: "https://login.example.net/authorize",
+      registration_endpoint: "https://login.example.net/register",
+      token_endpoint: "https://tokens.example.net/token",
+      revocation_endpoint: "https://tokens.example.net/revoke",
+      device_authorization_endpoint: "https://login.example.net/device",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(advertised)));
+
+    await expect(discoverOidcIssuer("https://homeserver.example.test")).resolves.toMatchObject({
+      issuer: advertised.issuer,
+      authorization_endpoint: advertised.authorization_endpoint,
+      token_endpoint: advertised.token_endpoint,
+    });
+  });
+
+  it("starts CLI device login at the separately advertised device endpoint", async () => {
+    const advertised: OidcClientConfig = {
+      ...OAUTH_METADATA,
+      issuer: "https://mas.example.test/issuer",
+      device_authorization_endpoint: "https://login.example.net/device",
+      token_endpoint: "https://tokens.example.net/token",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      device_code: "device-code",
+      user_code: "ABCD",
+      verification_uri: "https://login.example.net/device",
+      expires_in: 300,
+      interval: 5,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startDeviceCodeLogin(advertised, "client-id", "DEVICE123");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://login.example.net/device",
+      expect.objectContaining({ redirect: "manual" }),
+    );
+  });
+
   it("appends discovery to a homeserver path without replacing that path", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response(OAUTH_METADATA));
     vi.stubGlobal("fetch", fetchMock);
@@ -611,7 +660,7 @@ describe("Matrix 42 OAuth migration", () => {
     const secret = "discovery-access-secret";
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({
       ...OAUTH_METADATA,
-      token_endpoint: "https://other.example.test/token",
+      token_endpoint: "http://other.example.test/token",
       access_token: secret,
     })));
 

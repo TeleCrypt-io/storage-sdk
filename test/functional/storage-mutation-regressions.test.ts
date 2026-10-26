@@ -133,8 +133,15 @@ it.each([false, true])("reconciles rename after another device deletes the file 
     await storage.refreshRoomState(vault.id);
     expect(await core.listFiles(storage, vault.id)).toEqual([]);
     const listing = client.getRoom(vault.id)?.currentState.getStateEvents(UNSTABLE_MSC3089_BRANCH.name, file.id);
-    expect(listing?.isRedacted()).toBe(true);
-    await save(`concurrentRenameDelete-${interruptCleanup}`, { renameRejected: true, deleteRetryCompleted: true, listingRedacted: true });
+    // The original encrypted file message is the deletion authority. The
+    // Whether the server also redacts the MSC3089 branch is incidental to
+    // listing; only the original encrypted message is deletion authority.
+    await save(`concurrentRenameDelete-${interruptCleanup}`, {
+      renameRejected: true,
+      deleteRetryCompleted: true,
+      listingRedacted: listing?.isRedacted() ?? false,
+      fileRemainsHiddenByOriginalRedaction: true,
+    });
   } finally {
     release();
     await renamed;
@@ -269,10 +276,10 @@ it("rejects rename through retained handles after listing or original attachment
   await owner.storage.refreshRoomState(vault.id);
   const deletedBranch = owner.storage.getTree(vault.id)?.getFile(deleted.id);
   const deletedAttachment = await owner.storage.getOriginalFileEvent(vault.id, deleted.id, true);
-  expect(deletedBranch?.isActive).toBe(false);
+  expect(deletedBranch?.isActive).toBe(true);
   expect(deletedAttachment.isRedacted()).toBe(true);
   await expect(core.renameFile(owner.storage, vault.id, deleted.id, "resurrected.txt")).rejects.toThrow(
-    "rename file failed",
+    "file not found",
   );
   await expect(deletedHandle.setName("resurrected through retained handle.txt")).rejects.toThrow(
     "file not found",
@@ -303,7 +310,7 @@ it("rejects rename through retained handles after listing or original attachment
 
   await save("renameDeletedFiles", {
     completedDeletion: {
-      listingInactive: deletedBranch?.isActive === false,
+      listingStillPresent: deletedBranch?.isActive === true,
       originalAttachmentRedacted: deletedAttachment.isRedacted(),
       coreRenameRejected: true,
       retainedHandleRenameRejected: true,
@@ -316,4 +323,129 @@ it("rejects rename through retained handles after listing or original attachment
       ghostListingCreated: false,
     },
   });
+}, 120000);
+
+it("lets an editor rename Alice's file while only Alice can delete its media", async () => {
+  const vault = await core.createVault(owner.storage, "Uploader deletion authority");
+  const vaultRef = { storage: owner.storage, id: vault.id };
+  rooms.push(vaultRef);
+  const folder = await core.createSubfolder(owner.storage, vault.id, "Shared folder");
+  const folderRef = { storage: owner.storage, id: folder.id };
+  rooms.push(folderRef);
+  const file = await core.uploadFile(
+    owner.storage,
+    folder.id,
+    "alice-name.txt",
+    new TextEncoder().encode("bytes owned by Alice"),
+    "text/plain",
+  );
+  const fileRef = { storage: owner.storage, room: folder.id, id: file.id };
+  files.push(fileRef);
+  const mediaId = (await owner.storage.getOriginalFileEvent(folder.id, file.id)).getContent().file.url as string;
+  await owner.storage.waitForKeyBackup(folder.id, file.id);
+
+  await core.shareVault(owner.storage, vault.id, reader.user.userId, "editor");
+  await core.joinVault(reader.storage, vault.id);
+  await waitFor(() => reader.storage.getTree(folder.id), {
+    label: "editor joins the existing shared folder",
+    timeoutMs: 15000,
+  });
+  await core.renameFile(reader.storage, folder.id, file.id, "bob-name.txt");
+  expect((await core.listFiles(reader.storage, folder.id)).map((entry) => entry.name)).toContain("bob-name.txt");
+  await expect(core.deleteFile(reader.storage, folder.id, file.id)).rejects.toThrow(
+    "only the file uploader may delete this file",
+  );
+
+  await core.deleteFile(owner.storage, folder.id, file.id);
+  await owner.storage.refreshRoomState(folder.id);
+  await reader.storage.refreshRoomState(folder.id);
+  await ownerB.refreshRoomState(folder.id);
+  expect(await core.listFiles(owner.storage, folder.id)).toEqual([]);
+  expect(await core.listFiles(reader.storage, folder.id)).toEqual([]);
+  expect(await core.listFiles(ownerB, folder.id)).toEqual([]);
+  await expect(core.downloadFile(reader.storage, folder.id, file.id)).rejects.toThrow("file not found");
+
+  const mediaUrl = owner.storage.getClient().mxcUrlToHttp(mediaId, undefined, undefined, undefined, false, true, true)!;
+  const mediaResponse = await fetch(mediaUrl, {
+    headers: { Authorization: `Bearer ${owner.storage.getClient().getAccessToken()}` },
+  });
+  expect(mediaResponse.status).toBe(404);
+  await mediaResponse.text();
+
+  const fresh = await openStorage(await loginNewDevice(owner.user));
+  await fresh.keySafe.restore(owner.recoveryKey);
+  await waitFor(() => fresh.getTree(folder.id), { label: "fresh owner device sees the shared folder", timeoutMs: 15000 });
+  expect(await core.listFiles(fresh, folder.id)).toEqual([]);
+
+  await core.deleteFolder(owner.storage, folder.id);
+  files.splice(files.indexOf(fileRef), 1);
+  rooms.splice(rooms.indexOf(folderRef), 1);
+  await core.deleteVault(owner.storage, vault.id);
+  rooms.splice(rooms.indexOf(vaultRef), 1);
+  await save("uploaderDeletionAuthority", {
+    editorRenameSucceeded: true,
+    editorDeleteRejected: true,
+    ownerAndFreshDeviceOmitFile: true,
+    editorOmitsFile: true,
+    mxcMediaStatus: mediaResponse.status,
+    emptyFolderDeletionSucceeded: true,
+  });
+}, 120000);
+
+it("reconciles an editor invite when a second owner unshares during folder creation", async () => {
+  const vault = await core.createVault(owner.storage, "Concurrent create and unshare");
+  const vaultRef = { storage: owner.storage, id: vault.id };
+  rooms.push(vaultRef);
+  await core.shareVault(owner.storage, vault.id, reader.user.userId, "viewer");
+  await core.joinVault(reader.storage, vault.id);
+
+  let childReads = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const listMembers = ownerB.listMembers.bind(ownerB);
+  const pause = vi.spyOn(ownerB, "listMembers").mockImplementation(async (space, options) => {
+    const members = await listMembers(space, options);
+    if (space.id !== vault.id && ++childReads === 2) {
+      await gate;
+    }
+    return members;
+  });
+  let created: Awaited<ReturnType<typeof core.createSubfolder>> | undefined;
+  try {
+    const creating = core.createSubfolder(ownerB, vault.id, "Raced folder");
+    await waitFor(() => childReads >= 2, { label: "new folder invite is visible before access reconciliation", timeoutMs: 15000 });
+    const firstRemoval = await core.unshareVault(owner.storage, vault.id, reader.user.userId).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    release();
+    created = await creating;
+    const childRef = { storage: ownerB, id: created.id };
+    rooms.push(childRef);
+
+    if (firstRemoval.error) {
+      await core.unshareVault(ownerB, vault.id, reader.user.userId);
+    }
+    const memberships = {
+      root: await ownerB.getRoomMembership(vault.id, reader.user.userId),
+      child: await ownerB.getRoomMembership(created.id, reader.user.userId),
+    };
+    expect(memberships.root).toBe("leave");
+    expect(["leave", null]).toContain(memberships.child);
+    expect(["leave", null]).toContain(await reader.storage.getRoomMembership(created.id, reader.user.userId));
+    await core.deleteFolder(ownerB, created.id);
+    rooms.splice(rooms.indexOf(childRef), 1);
+    await core.deleteVault(ownerB, vault.id);
+    rooms.splice(rooms.indexOf(vaultRef), 1);
+    await save("createUnshareRace", {
+      firstUnshare: firstRemoval.error ? String(firstRemoval.error) : "completed",
+      folderCreated: true,
+      childMembershipAfterReconciliation: memberships.child,
+      rootMembershipAfterUnshare: memberships.root,
+      staleReaderAccessRemains: false,
+    });
+  } finally {
+    release();
+    pause.mockRestore();
+  }
 }, 120000);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch a throwaway MAS-delegated Synapse stack for functional tests, via
 # podman: Postgres (MAS's database) + MAS + Synapse (delegating authentication
-# to MAS) + a Caddy front door on :8008. The local fixture routes MAS-owned
+# to MAS) + Caddy front doors on :8008 and :8081. The local fixture routes MAS-owned
 # logout/refresh endpoints directly to MAS because Synapse delegates
 # authentication to it.
 #
@@ -143,7 +143,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. MAS config (generated once, then patched: db uri, matrix.* secret/
-#    endpoint, same-origin public_base, permissive dev DCR policy).
+#    endpoint, separate auth public_base, permissive dev DCR policy).
 # ---------------------------------------------------------------------------
 if [[ ! -f "$DATA/mas/config.yaml" ]]; then
   echo "==> generating MAS config"
@@ -182,8 +182,8 @@ podman run -d --name "$SYN" --network "$NET" \
   "$SYN_IMG" -m synapse.app.homeserver -c /data/homeserver.yaml
 
 # ---------------------------------------------------------------------------
-# 6. (Re)start the Caddy front door on :8008 — the public "homeserver" URL
-#    every test/CLI/UI default already points at.
+# 6. (Re)start Caddy on :8008 for Matrix and :8081 for the separately
+#    advertised local MAS issuer.
 # ---------------------------------------------------------------------------
 echo "==> validating front-door configuration"
 podman run --rm \
@@ -193,7 +193,7 @@ podman run --rm \
 podman_remove_container_if_present "$PROXY"
 echo "==> starting front door ($PROXY) on :8008"
 podman run -d --name "$PROXY" --network "$NET" \
-  -p 8008:8008 \
+  -p 8008:8008 -p 8081:8081 \
   -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro,Z" \
   "$PROXY_IMG"
 
@@ -253,7 +253,9 @@ echo -n "==> waiting for the front door (Synapse + MAS)"
 for i in $(seq 1 60); do
   printf 'Front-door readiness probe %s\n' "$i" >> "$probe_diagnostics"
   if curl --silent --show-error --fail-with-body --max-time 2 \
-    "http://localhost:8008/_matrix/client/versions" >> "$probe_diagnostics" 2>&1; then
+    "http://localhost:8008/_matrix/client/versions" >> "$probe_diagnostics" 2>&1 && \
+    curl --silent --show-error --fail-with-body --max-time 2 \
+    "http://localhost:8081/.well-known/openid-configuration" >> "$probe_diagnostics" 2>&1; then
     printf 'Front-door readiness probe %s succeeded\n' "$i" >> "$probe_diagnostics"
     echo " — ready"
     echo "Homeserver (via front door) is up at http://localhost:8008"

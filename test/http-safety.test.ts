@@ -1,4 +1,10 @@
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { FetchHttpApi } from "matrix-js-sdk/lib/http-api/fetch.js";
+import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
+import { Method } from "matrix-js-sdk/lib/http-api/method.js";
+import { boundedMatrixFetch } from "../src/TeleCryptIOStorage.js";
 import { listVaults } from "../src/core/operations.js";
 import {
   cancelResponseBody,
@@ -20,6 +26,57 @@ function responseWithReader(reader: {
 }
 
 describe("HTTP cancellation", () => {
+  it("reads a valid Matrix sync response after the 30-second long poll", async () => {
+    const syncResponse = {
+      next_batch: "s31",
+      rooms: { join: {}, invite: {}, leave: {} },
+      presence: { events: [] },
+      account_data: { events: [] },
+      to_device: { events: [] },
+      device_lists: { changed: [], left: [] },
+      device_one_time_keys_count: { curve25519: 0 },
+    };
+    let requestUrl = "";
+    const server = createServer((request, response) => {
+      requestUrl = request.url ?? "";
+      if (!requestUrl.startsWith("/_matrix/client/v3/sync?")) {
+        response.writeHead(404).end();
+        return;
+      }
+      const timer = setTimeout(() => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(syncResponse));
+      }, 31_000);
+      response.once("close", () => clearTimeout(timer));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("local sync server did not bind a port");
+    const api = new FetchHttpApi({ emit: vi.fn() } as never, {
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      prefix: ClientPrefix.V3,
+      onlyData: true,
+      accessToken: "local-sync-test",
+      localTimeoutMs: 110_000,
+      fetchFn: boundedMatrixFetch(globalThis.fetch.bind(globalThis)),
+    });
+    try {
+      const started = Date.now();
+      const result = await api.authedRequest<typeof syncResponse>(
+        Method.Get,
+        "/sync",
+        { timeout: 30_000 },
+      );
+      expect(Date.now() - started).toBeGreaterThanOrEqual(30_000);
+      expect(requestUrl).toContain("timeout=30000");
+      expect(result).toEqual(syncResponse);
+    } finally {
+      api.abort();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }, 45_000);
+
   it("starts cancelling a rejected response without waiting for its stream", async () => {
     const cancel = vi.fn(() => new Promise<void>(() => undefined));
     cancelResponseBody({ body: { cancel } } as unknown as Response);

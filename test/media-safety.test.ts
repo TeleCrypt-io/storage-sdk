@@ -27,17 +27,21 @@ function encryptedFileEvent(
     info: { mimetype: "text/plain", size: 1 },
   },
   decryptionFailure = false,
+  mappedType = "m.room.message",
+  redacted = false,
 ) {
+  let eventType = mappedType;
   return {
     getId: () => "$media-file",
     getRoomId: () => "!media-room:example.test",
     getSender: () => "@owner:example.test",
-    getType: () => "m.room.message",
+    getType: () => eventType,
     getWireType: () => "m.room.encrypted",
     getContent: () => content,
     getTs: () => 0,
-    isRedacted: () => false,
+    isRedacted: () => redacted,
     isDecryptionFailure: () => decryptionFailure,
+    setType: (type: string) => { eventType = type; },
   };
 }
 
@@ -53,13 +57,16 @@ function mediaClient(
     }),
     getRoom: () => ({
       currentState: {
+        maySendRedactionForEvent: (candidate: ReturnType<typeof encryptedFileEvent>) => !candidate.isRedacted(),
         getStateEvents: (type: string, stateKey: string) =>
           type === "m.room.create" && stateKey === "" ? ownerEvent : null,
       },
     }),
     fetchRoomEvent: vi.fn().mockResolvedValue({}),
     getEventMapper: () => () => event,
-    decryptEventIfNeeded: vi.fn().mockResolvedValue(undefined),
+    decryptEventIfNeeded: vi.fn(async (candidate: ReturnType<typeof encryptedFileEvent>) => {
+      if (!candidate.isDecryptionFailure()) candidate.setType("m.room.message");
+    }),
     getAccessToken: () => "access-token",
     getHomeserverUrl: () => "https://matrix.example.test",
     mxcUrlToHttp: () => "https://matrix.example.test/_matrix/media/download/example.test/media",
@@ -189,6 +196,31 @@ describe("media safety bounds", () => {
     await expect(new TeleCryptIOStorage(client as never).downloadFile(branch())).rejects.toBeInstanceOf(
       UndecryptableFileError,
     );
+  });
+
+  it("accepts a mapped m.room.encrypted event before SDK decryption", async () => {
+    const event = encryptedFileEvent(undefined, false, "m.room.encrypted");
+    const client = mediaClient(event);
+
+    await expect(
+      new TeleCryptIOStorage(client as never).getOriginalFileEvent("!media-room:example.test", "$media-file"),
+    ).resolves.toBe(event);
+    expect(client.decryptEventIfNeeded).toHaveBeenCalledWith(event);
+    expect(event.getType()).toBe("m.room.message");
+  });
+
+  it.each([false, true])("reads the encrypted original envelope and redaction without a key (redacted: %s)", async (redacted) => {
+    const event = encryptedFileEvent(undefined, false, "m.room.encrypted", redacted);
+    const client = mediaClient(event);
+    const storage = new TeleCryptIOStorage(client as never);
+
+    await expect(storage.getOriginalFileEventState("!media-room:example.test", "$media-file")).resolves.toEqual({
+      ownerUserId: "@owner:example.test",
+      redacted,
+      canRedact: !redacted,
+    });
+    expect(event.getType()).toBe("m.room.encrypted");
+    expect(client.decryptEventIfNeeded).not.toHaveBeenCalled();
   });
 
   it("fails closed on a malformed plaintext file event when decryption succeeded", async () => {

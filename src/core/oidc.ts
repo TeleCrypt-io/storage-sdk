@@ -61,7 +61,7 @@ export interface OidcRegistrationClientMetadata {
   policyUri?: string;
 }
 
-/** The issuer-bound endpoints accepted by the token refresh adapter. */
+/** The endpoints accepted from Matrix auth metadata for the token refresh adapter. */
 export type OidcTokenEndpointMetadata = Pick<
   OidcClientConfig,
   "issuer" | "token_endpoint" | "revocation_endpoint"
@@ -572,26 +572,9 @@ function parseHttpUrl(value: unknown, name: string, allowQuery = false): URL {
   return parsed;
 }
 
-function isWithinIssuerPath(issuer: URL, endpoint: URL): boolean {
-  if (issuer.pathname === "/") return true;
-  const prefix = issuer.pathname.endsWith("/") ? issuer.pathname : `${issuer.pathname}/`;
-  return endpoint.pathname === issuer.pathname || endpoint.pathname.startsWith(prefix);
-}
-
-/** Validates an endpoint against the configured homeserver and optional issuer path. */
-export function assertOidcEndpoint(
-  value: unknown,
-  trustedHomeserver: string,
-  name: string,
-  issuer?: URL,
-  allowQuery = false,
-): string {
-  const homeserver = parseHttpUrl(trustedHomeserver, "homeserver URL");
-  const endpoint = parseHttpUrl(value, name, allowQuery);
-  if (endpoint.origin !== homeserver.origin || (issuer && !isWithinIssuerPath(issuer, endpoint))) {
-    throw new StorageError(`${name} must remain on the configured OIDC origin and issuer path`);
-  }
-  return endpoint.toString();
+/** Validates a Matrix-advertised OIDC URL without constraining it to the homeserver origin. */
+export function validateOidcEndpoint(value: unknown, name: string): string {
+  return parseHttpUrl(value, name).toString();
 }
 
 function matrixAuthMetadataEndpoint(homeserver: URL): string {
@@ -608,17 +591,11 @@ function validateTokenEndpointMetadata(metadata: OidcTokenEndpointMetadata): {
   tokenEndpoint: string;
   revocationEndpoint?: string;
 } {
-  const issuer = parseHttpUrl(metadata.issuer, "issuer");
+  parseHttpUrl(metadata.issuer, "issuer");
   const tokenEndpoint = parseHttpUrl(metadata.token_endpoint, "token endpoint");
-  if (tokenEndpoint.origin !== issuer.origin || !isWithinIssuerPath(issuer, tokenEndpoint)) {
-    throw new StorageError("OIDC token endpoint is outside the validated issuer");
-  }
   let revocationEndpoint: string | undefined;
   if (metadata.revocation_endpoint !== undefined) {
     const parsed = parseHttpUrl(metadata.revocation_endpoint, "revocation endpoint");
-    if (parsed.origin !== issuer.origin || !isWithinIssuerPath(issuer, parsed)) {
-      throw new StorageError("OIDC revocation endpoint is outside the validated issuer");
-    }
     revocationEndpoint = parsed.toString();
   }
   return { tokenEndpoint: tokenEndpoint.toString(), revocationEndpoint };
@@ -701,7 +678,7 @@ function validateAuthMetadata(value: unknown): OidcClientConfig {
 /** TeleCrypt's extra trust boundary for browser state rehydration. */
 function validateTrustedAuthMetadata(value: unknown): OidcClientConfig {
   const metadata = validateAuthMetadata(value);
-  const issuer = parseHttpUrl(metadata.issuer, "issuer");
+  parseHttpUrl(metadata.issuer, "issuer");
   const endpoints: Array<[string, unknown]> = [
     ["authorization endpoint", metadata.authorization_endpoint],
     ["registration endpoint", metadata.registration_endpoint],
@@ -714,10 +691,7 @@ function validateTrustedAuthMetadata(value: unknown): OidcClientConfig {
     endpoints.push(["device authorization endpoint", metadata.device_authorization_endpoint]);
   }
   for (const [name, value] of endpoints) {
-    const endpoint = parseHttpUrl(value, name);
-    if (endpoint.origin !== issuer.origin || !isWithinIssuerPath(issuer, endpoint)) {
-      throw new StorageError(`OIDC authorization context has an invalid ${name}`);
-    }
+    parseHttpUrl(value, name);
   }
   return metadata;
 }
@@ -799,11 +773,10 @@ function validateAuthorizationInputs(opts: {
   deviceId?: string;
 }): { authMetadata: OidcClientConfig; homeserver: URL; redirect: URL; deviceId: string } {
   const authMetadata = validateTrustedAuthMetadata(opts.authMetadata);
-  const issuer = new URL(authMetadata.issuer);
   const homeserver = parseHttpUrl(opts.homeserverUrl, "homeserver URL");
   const redirect = parseHttpUrl(opts.redirectUri, "redirect URI");
-  if (homeserver.origin !== issuer.origin || redirect.origin !== window.location.origin) {
-    throw new StorageError("OIDC authorization context origins are not trusted");
+  if (redirect.origin !== window.location.origin) {
+    throw new StorageError("OIDC callback origin is not trusted");
   }
   requireClientId(opts.clientId);
   const deviceId = opts.deviceId ?? randomHex(5).toUpperCase();
@@ -821,8 +794,8 @@ function parseAuthorizationContext(value: unknown, expectedState: string): Autho
   const authMetadata = validateTrustedAuthMetadata(value.authMetadata);
   const homeserver = parseHttpUrl(value.homeserverUrl, "homeserver URL");
   const redirect = parseHttpUrl(value.redirectUri, "redirect URI");
-  if (homeserver.origin !== new URL(authMetadata.issuer).origin || redirect.origin !== window.location.origin) {
-    throw new StorageError("OIDC authorization context origins are not trusted");
+  if (redirect.origin !== window.location.origin) {
+    throw new StorageError("OIDC callback origin is not trusted");
   }
   return {
     state: expectedState,

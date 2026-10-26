@@ -63,6 +63,7 @@ function makeFixture(
     roomId: ROOM_ID,
     getMyMembership: () => "join",
     currentState: {
+      maySendRedactionForEvent: () => true,
       getStateEvents: (eventType: string, stateKey?: string) => {
         if (eventType !== UNSTABLE_MSC3089_BRANCH.name) return [];
         if (stateKey !== undefined) {
@@ -105,7 +106,6 @@ function makeFixture(
       }
     }),
     redactEvent: vi.fn(async (_roomId: string, eventId: string) => {
-      if (eventId === "$listing") shared.branchContent = {};
       if (eventId === FILE_ID) shared.redacted = true;
     }),
     leave: vi.fn().mockResolvedValue(undefined),
@@ -116,6 +116,11 @@ function makeFixture(
   const storage = { keySafe: { requireReady: async () => undefined },
     getClient: () => client,
     getTree: () => tree,
+    getOriginalFileEventState: vi.fn(async () => ({
+      ownerUserId: "@cross-client:example.test",
+      redacted: shared.redacted,
+      canRedact: true,
+    })),
     getOriginalFileEvent: vi.fn(async () => ({
       getContent: () => ({ msgtype: "m.file", body: "cross-client.txt", file: { url: "mxc://example.test/cross-client-media" } }),
       isRedacted: () => shared.redacted,
@@ -136,7 +141,7 @@ function makeFixture(
 }
 
 describe("cross-client deletion reconciliation", () => {
-  it("allows client A to delete a vault after client B leaves an authoritative tombstone", async () => {
+  it("allows client A to delete a vault after client B redacts the original file message", async () => {
     const shared: SharedState = {
       branchPresent: true,
       branchContent: { active: true, metadata_event_id: FILE_ID },
@@ -149,10 +154,10 @@ describe("cross-client deletion reconciliation", () => {
       id: FILE_ID,
       deleted: true,
     });
-    expect(fixtureB.shared.branchContent).toEqual({});
+    expect(fixtureB.shared.branchContent).toEqual({ active: true, metadata_event_id: FILE_ID });
     expect(fixtureB.shared.redacted).toBe(true);
 
-    // Refresh A from the shared authoritative branch state, without copying B's process-local marker.
+    // Refresh A and observe the same Matrix event state without process-local file markers.
     await fixtureA.storage.refreshRoomState(ROOM_ID);
 
     await expect(deleteVault(fixtureA.storage, ROOM_ID)).resolves.toEqual({

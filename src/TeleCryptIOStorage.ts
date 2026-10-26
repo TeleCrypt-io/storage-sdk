@@ -2,7 +2,6 @@ import {
   ClientEvent,
   createClient,
   EventType,
-  JoinRule,
   MatrixClient,
   MatrixEvent,
   MatrixError,
@@ -23,6 +22,7 @@ import {
 } from "matrix-js-sdk/lib/crypto-api/index.js";
 import { Method } from "matrix-js-sdk/lib/http-api/method.js";
 import { ClientPrefix } from "matrix-js-sdk/lib/http-api/prefix.js";
+import { DEFAULT_TREE_POWER_LEVELS_TEMPLATE } from "matrix-js-sdk/lib/models/MSC3089TreeSpace.js";
 import { encryptAttachment, decryptAttachment } from "matrix-encrypt-attachment";
 import type { CryptoCallbacks } from "matrix-js-sdk/lib/crypto-api/index.js";
 import type { TokenRefreshFunction } from "matrix-js-sdk/lib/http-api/index.js";
@@ -53,7 +53,6 @@ import {
 import { sanitizeDiagnosticText } from "./core/oidc.js";
 import {
   isStorageTreeRoom,
-  isStorageTreeState,
   STORAGE_ROOM_ENCRYPTION_ALGORITHM,
   validateName,
 } from "./core/validation.js";
@@ -289,44 +288,10 @@ async function readMatrixResponse(
 }
 
 export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
-  const wrapped = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const pending = (async (): Promise<Response> => {
-      const controller = new AbortController();
-      const externalSignal = init?.signal;
-      const abortExternal = (): void => controller.abort(externalSignal?.reason);
-      let timedOut = false;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort(new Error("Matrix request timed out"));
-      }, MATRIX_HTTP_TIMEOUT_MS);
-      if (externalSignal?.aborted) abortExternal();
-      else externalSignal?.addEventListener("abort", abortExternal, { once: true });
-      try {
-        const response = await raceWithAbort(
-          fetchFn(input, { ...init, redirect: "manual", signal: controller.signal }),
-          controller.signal,
-          () => (timedOut ? new Error("Matrix request timed out") : new DOMException("The operation was aborted", "AbortError")),
-        );
-        if (
-          response.redirected ||
-          response.type === "opaqueredirect" ||
-          (response.status >= 300 && response.status < 400)
-        ) {
-          const failure = new Error("Matrix redirect rejected");
-          cancelResponseBody(response);
-          throw failure;
-        }
-        return await readMatrixResponse(
-          response,
-          controller.signal,
-          () => (timedOut ? new Error("Matrix request timed out") : new DOMException("The operation was aborted", "AbortError")),
-        );
-      } finally {
-        clearTimeout(timeout);
-        externalSignal?.removeEventListener("abort", abortExternal);
-      }
-    })();
-    return pending;
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const response = await fetchFn(input, init);
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    return readMatrixResponse(response, signal);
   }) as typeof fetch;
   return wrapped;
 }
@@ -350,8 +315,9 @@ interface MatrixHttpTransport {
   ) => Promise<T>;
 }
 
-function matrixRequestTimeout(options?: MatrixRequestOptions): number {
-  const value = options?.timeoutMs ?? options?.localTimeoutMs ?? MATRIX_HTTP_TIMEOUT_MS;
+function matrixRequestTimeout(options?: MatrixRequestOptions): number | undefined {
+  const value = options?.timeoutMs ?? options?.localTimeoutMs;
+  if (value === undefined) return undefined;
   if (!Number.isFinite(value) || value <= 0) throw new Error("invalid Matrix request timeout");
   return value;
 }
@@ -485,6 +451,10 @@ interface MatrixMemberEntry {
 }
 
 interface MatrixPowerLevels {
+  invite?: number;
+  kick?: number;
+  ban?: number;
+  redact?: number;
   state_default?: number;
   users_default?: number;
   events_default?: number;
@@ -590,10 +560,7 @@ function parseMatrixStateResponse(value: unknown): Record<string, unknown>[] {
       throw new Error("invalid Matrix room state response");
     }
     validateMatrixIdentifier(event.type, "state event type");
-    if (
-      new TextEncoder().encode(event.state_key).byteLength > MAX_MATRIX_IDENTIFIER_BYTES ||
-      /[\s\u0000-\u001f\u007f]/.test(event.state_key)
-    ) {
+    if (new TextEncoder().encode(event.state_key).byteLength > MAX_MATRIX_IDENTIFIER_BYTES) {
       throw new Error("invalid Matrix state event key");
     }
     return event;
@@ -602,7 +569,7 @@ function parseMatrixStateResponse(value: unknown): Record<string, unknown>[] {
 
 function parseMatrixPowerLevels(value: unknown): MatrixPowerLevels {
   if (!isRecord(value)) throw new Error("invalid Matrix power-level response");
-  for (const name of ["users_default", "events_default", "state_default"]) {
+  for (const name of ["invite", "kick", "ban", "redact", "users_default", "events_default", "state_default"]) {
     const field = value[name];
     if (field !== undefined && (typeof field !== "number" || !Number.isFinite(field))) {
       throw new Error("invalid Matrix power-level response");
@@ -622,11 +589,70 @@ function parseMatrixPowerLevels(value: unknown): MatrixPowerLevels {
   return value as MatrixPowerLevels;
 }
 
+function convertKnownLegacyTreePowerLevels(value: unknown): MatrixPowerLevels | null {
+  const levels = parseMatrixPowerLevels(value);
+  if (!levels.users || !levels.events) return null;
+  const oldDefaults: Record<string, number> = {
+    invite: 100,
+    kick: 100,
+    ban: 100,
+    redact: 100,
+    state_default: 100,
+    events_default: 0,
+    users_default: 0,
+  };
+  if (Object.entries(oldDefaults).some(([key, expected]) => (levels as Record<string, unknown>)[key] !== expected)) {
+    return null;
+  }
+  const oldEvents: Record<string, number> = {
+    [EventType.RoomPowerLevels]: 100,
+    [EventType.RoomHistoryVisibility]: 100,
+    [EventType.RoomTombstone]: 100,
+    [EventType.RoomEncryption]: 100,
+    [EventType.RoomName]: 100,
+    [EventType.RoomMessage]: 0,
+    [EventType.RoomMessageEncrypted]: 0,
+    [EventType.Sticker]: 0,
+    [EventType.SpaceChild]: 100,
+    [EventType.SpaceParent]: 100,
+    [UNSTABLE_MSC3089_BRANCH.name]: 100,
+    [STORAGE_METADATA_EVENT_TYPE]: 100,
+  };
+  const repairedEvents = new Set<string>([EventType.RoomJoinRules, UNSTABLE_MSC3088_PURPOSE.name]);
+  if (
+    Object.entries(oldEvents).some(([key, expected]) => levels.events?.[key] !== expected) ||
+    Object.entries(levels.events).some(([key, level]) =>
+      !Object.hasOwn(oldEvents, key) && !(repairedEvents.has(key) && level === 100),
+    )
+  ) {
+    return null;
+  }
+
+  const events: Record<string, number> = {
+    ...levels.events,
+    ...DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events,
+    [EventType.SpaceChild]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+    [EventType.SpaceParent]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+    [UNSTABLE_MSC3089_BRANCH.name]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+    [STORAGE_METADATA_EVENT_TYPE]: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+  };
+  delete events[EventType.RoomJoinRules];
+  delete events[UNSTABLE_MSC3088_PURPOSE.name];
+  return {
+    ...levels,
+    invite: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.invite,
+    kick: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.kick,
+    ban: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.ban,
+    redact: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.redact,
+    state_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.state_default,
+    events_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.events_default,
+    users_default: DEFAULT_TREE_POWER_LEVELS_TEMPLATE.users_default,
+    events,
+  };
+}
+
 function isGoneRoomError(error: unknown): boolean {
-  return (
-    error instanceof MatrixError &&
-    (error.errcode === "M_NOT_FOUND" || error.errcode === "M_UNKNOWN")
-  );
+  return error instanceof MatrixError && error.httpStatus === 404 && error.errcode === "M_NOT_FOUND";
 }
 
 function throwWithCleanupDetail(error: unknown, roomId: string, cleanupError: unknown): never {
@@ -684,9 +710,8 @@ export class TeleCryptIOStorage {
       options,
       (signal) => this.startSync(signal),
     );
-    // Advanced callers may construct a MatrixClient themselves. The SDK does
-    // not mutate matrix-js-sdk internals: configure that client with the
-    // supported createClient({ fetchFn, localTimeoutMs }) options, or use
+    // Advanced callers may construct a MatrixClient themselves. Configure it
+    // with the supported createClient({ fetchFn }) option, or use
     // TeleCryptIOStorage.create()/createFromOidc().
   }
 
@@ -744,11 +769,20 @@ export class TeleCryptIOStorage {
     return raw ?? null;
   }
 
-  private getTreeOwnerId(roomId: string): string {
-    const create = this.getStateEvent(roomId, EventType.RoomCreate, "");
-    const ownerId = create?.getSender();
-    if (!ownerId) throw new StorageError("storage owner is unavailable");
-    return ownerId;
+  /** Converts the former fixed-owner template only when an explicit role change targets the room. */
+  async prepareTreePermissionsForAccessChange(
+    roomId: string,
+    options?: MatrixRequestOptions,
+  ): Promise<void> {
+    const current = this.getStateEvent(roomId, EventType.RoomPowerLevels, "")?.getContent();
+    if (!current) return;
+    const converted = convertKnownLegacyTreePowerLevels(current);
+    if (!converted) return;
+    await withMatrixMutationAbort(
+      () => this.client.sendStateEvent(roomId, EventType.RoomPowerLevels, converted as never, ""),
+      matrixRequestSignal(options),
+    );
+    await this.refreshRoomState(roomId, options);
   }
 
   private async sendEncryptedMetadataMessage(
@@ -777,25 +811,18 @@ export class TeleCryptIOStorage {
   ): Promise<MatrixEvent> {
     const rawEvent = await this.client.fetchRoomEvent(roomId, eventId);
     const event = this.client.getEventMapper()(rawEvent);
-    await this.client.decryptEventIfNeeded(event);
-
-    if (event.isDecryptionFailure()) throw new UndecryptableFileError();
-    if (
-      allowRedacted &&
-      event.getId() === eventId &&
-      event.getRoomId() === roomId &&
-      event.getSender() === this.getTreeOwnerId(roomId) &&
-      event.isRedacted()
-    ) {
-      return event;
-    }
     if (
       event.getId() !== eventId ||
       event.getRoomId() !== roomId ||
-      event.getSender() !== this.getTreeOwnerId(roomId) ||
-      event.getWireType() !== EventType.RoomMessageEncrypted ||
-      event.getType() !== EventType.RoomMessage
+      !event.getSender() ||
+      event.getWireType() !== EventType.RoomMessageEncrypted
     ) {
+      throw new StorageError("encrypted storage metadata is invalid or unavailable");
+    }
+    if (allowRedacted && event.isRedacted()) return event;
+    await this.client.decryptEventIfNeeded(event);
+    if (event.isDecryptionFailure()) throw new UndecryptableFileError();
+    if (event.getType() !== EventType.RoomMessage) {
       throw new StorageError("encrypted storage metadata is invalid or unavailable");
     }
 
@@ -830,7 +857,7 @@ export class TeleCryptIOStorage {
     const pointerContent = pointer?.getContent();
     if (
       !pointer ||
-      pointer.getSender() !== this.getTreeOwnerId(roomId) ||
+      !pointer.getSender() ||
       !isRecord(pointerContent) ||
       typeof pointerContent.event_id !== "string"
     ) {
@@ -838,6 +865,9 @@ export class TeleCryptIOStorage {
     }
     const metadataEventId = validateMatrixEventId(pointerContent.event_id, "storage metadata event ID");
     const event = await this.readEncryptedMetadataMessage(roomId, metadataEventId);
+    if (event.getSender() !== pointer.getSender()) {
+      throw new StorageError("encrypted storage name author does not match its pointer");
+    }
     const content = event.getContent();
     if (
       !isRecord(content) ||
@@ -876,7 +906,7 @@ export class TeleCryptIOStorage {
     treeId: string,
     fileId?: string,
     options?: MatrixRequestOptions,
-  ): Promise<void> {
+  ): Promise<"backed_up" | "deleted"> {
     validateMatrixRoomId(treeId);
     if (fileId !== undefined) validateMatrixEventId(fileId, "file event ID");
     const timeoutMs = matrixRequestTimeout({ timeoutMs: options?.timeoutMs ?? options?.localTimeoutMs ?? 20_000 });
@@ -884,8 +914,16 @@ export class TeleCryptIOStorage {
     const crypto = this.client.getCrypto();
     if (!crypto) throw new StorageError("crypto is not initialized");
     let sessionIds: Set<string> | undefined;
+    let deleted = false;
     try {
       await waitForCondition(async (signal) => {
+        if (fileId !== undefined) {
+          const state = await this.getOriginalFileEventState(treeId, fileId);
+          if (state.redacted) {
+            deleted = true;
+            return true;
+          }
+        }
         if (!sessionIds) {
           const events: MatrixEvent[] = [];
           if (fileId === undefined) {
@@ -895,8 +933,9 @@ export class TeleCryptIOStorage {
             // different session. Both must be recoverable.
             events.push(await this.getOriginalFileEvent(treeId, fileId));
             const metadataId = await this.getFileMetadataEventId(treeId, fileId, { signal });
-            if (!metadataId) throw new StorageError("encrypted file name is unavailable");
-            if (metadataId !== fileId) events.push(await this.getFileRenameMetadataEvent(treeId, fileId, metadataId));
+            if (metadataId && metadataId !== fileId) {
+              events.push(await this.getFileRenameMetadataEvent(treeId, fileId, metadataId));
+            }
           }
           sessionIds = new Set();
           for (const event of events) {
@@ -941,6 +980,10 @@ export class TeleCryptIOStorage {
       }
       throw error;
     }
+    if (fileId !== undefined && !deleted) {
+      deleted = (await this.getOriginalFileEventState(treeId, fileId)).redacted;
+    }
+    return deleted ? "deleted" : "backed_up";
   }
 
   private async writeFileName(treeId: string, fileId: string, name: string): Promise<void> {
@@ -956,7 +999,7 @@ export class TeleCryptIOStorage {
       branch.isActive === false ||
       !indexEvent ||
       indexEvent.isRedacted() ||
-      indexEvent.getSender() !== this.getTreeOwnerId(treeId) ||
+      !indexEvent.getSender() ||
       !isRecord(indexContent) ||
       indexContent.active !== true
     ) {
@@ -995,6 +1038,9 @@ export class TeleCryptIOStorage {
   ): Promise<string> {
     if (options?.signal?.aborted) throw new StorageError("operation cancelled");
     if (options?.refreshState !== false) await this.refreshRoomState(treeId, options);
+    if ((await this.getOriginalFileEventState(treeId, fileId)).redacted) {
+      throw new StorageError("file not found");
+    }
     const tree = this.getTree(treeId);
     const branch = tree?.getFile(fileId);
     if (!branch || branch.isActive === false) throw new StorageError("file not found");
@@ -1002,7 +1048,7 @@ export class TeleCryptIOStorage {
     const indexContent = indexEvent?.getContent();
     if (
       !indexEvent ||
-      indexEvent.getSender() !== this.getTreeOwnerId(treeId) ||
+      !indexEvent.getSender() ||
       !isRecord(indexContent) ||
       indexContent.active !== true ||
       typeof indexContent.metadata_event_id !== "string"
@@ -1021,6 +1067,9 @@ export class TeleCryptIOStorage {
       // being restored. The caller can resolve the private name on retry.
       if (error instanceof UndecryptableFileError) return GENERIC_FILE_NAME;
       throw error;
+    }
+    if (event.getSender() !== indexEvent.getSender()) {
+      throw new StorageError("encrypted file metadata author does not match its listing");
     }
     const content = event.getContent();
     if (!isRecord(content) || typeof content.body !== "string") {
@@ -1053,15 +1102,14 @@ export class TeleCryptIOStorage {
     if (!branch) throw new StorageError("file not found");
     const indexEvent = branch.indexEvent;
     const content = indexEvent?.getContent();
-    if (!indexEvent || indexEvent.getSender() !== this.getTreeOwnerId(treeId)) {
+    if (!indexEvent) {
       throw new StorageError("encrypted file listing is unavailable");
     }
     if (
       !isRecord(content) ||
       typeof content.metadata_event_id !== "string"
     ) {
-      if (branch.isActive === false || indexEvent.isRedacted()) return null;
-      throw new StorageError("encrypted file name is unavailable");
+      return null;
     }
     return validateMatrixEventId(content.metadata_event_id, "file metadata event ID");
   }
@@ -1072,8 +1120,14 @@ export class TeleCryptIOStorage {
     fileId: string,
     metadataEventId: string,
   ): Promise<MatrixEvent> {
+    const branch = this.getTree(treeId)?.getFile(fileId);
+    const indexSender = branch?.indexEvent?.getSender();
+    if (!indexSender) throw new StorageError("encrypted file listing is unavailable");
     const event = await this.readEncryptedMetadataMessage(treeId, metadataEventId, true);
     if (event.isRedacted()) return event;
+    if (event.getSender() !== indexSender) {
+      throw new StorageError("encrypted file metadata author does not match its listing");
+    }
     const content = event.getContent();
     if (
       !isRecord(content) ||
@@ -1108,6 +1162,30 @@ export class TeleCryptIOStorage {
     return event;
   }
 
+  /** Reads the server-authored file message envelope without requiring its Megolm key. */
+  async getOriginalFileEventState(
+    treeId: string,
+    fileId: string,
+  ): Promise<{ ownerUserId: string; redacted: boolean; canRedact: boolean }> {
+    const rawEvent = await this.client.fetchRoomEvent(treeId, fileId);
+    const event = this.client.getEventMapper()(rawEvent);
+    const ownerUserId = event.getSender();
+    if (
+      event.getId() !== fileId ||
+      event.getRoomId() !== treeId ||
+      !ownerUserId ||
+      event.getWireType() !== EventType.RoomMessageEncrypted
+    ) {
+      throw new StorageError("encrypted file message is invalid or unavailable");
+    }
+    const userId = this.client.getUserId();
+    const room = this.client.getRoom(treeId);
+    const canRedact = Boolean(
+      userId && room?.currentState.maySendRedactionForEvent(event, userId),
+    );
+    return { ownerUserId, redacted: event.isRedacted(), canRedact };
+  }
+
   private async createEncryptedFile(
     treeId: string,
     name: string,
@@ -1117,8 +1195,8 @@ export class TeleCryptIOStorage {
     signal?: AbortSignal,
   ): Promise<{ event_id: string }> {
     validateFileName(name);
-    // Authoritative room refresh also repairs legacy owner permissions before
-    // publishing new encrypted content to an existing vault.
+    // Refresh authoritative room state before publishing new encrypted
+    // content; ordinary reads never rewrite room permissions.
     await this.refreshRoomState(treeId, { signal });
     if (signal?.aborted) throw new StorageError("operation cancelled");
     this.requireEncryptedStorageRoom(treeId);
@@ -1180,7 +1258,11 @@ export class TeleCryptIOStorage {
         "file upload",
         fileId ? [mediaId, fileId] : [mediaId],
         `upload outcome needs reconciliation in ${treeId}; keep these media and attachment IDs and use cleanupFileUpload before uploading again`,
-        { cause, treeId },
+        {
+          cause,
+          treeId,
+          backupTargets: fileId ? [{ treeId, fileId }] : [],
+        },
       );
     }
   }
@@ -1200,7 +1282,7 @@ export class TeleCryptIOStorage {
     if (!/^mxc:\/\/[^/]+\/[^/?#]+$/u.test(mediaId)) throw new StorageError("invalid media identifier");
     if (fileId !== undefined) validateMatrixEventId(fileId, "file upload event ID");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), matrixRequestTimeout(options));
+    const timeout = setTimeout(() => controller.abort(), matrixRequestTimeout(options) ?? MATRIX_HTTP_TIMEOUT_MS);
     const abort = (): void => controller.abort(options?.signal?.reason);
     if (options?.signal?.aborted) abort();
     else options?.signal?.addEventListener("abort", abort, { once: true });
@@ -1266,11 +1348,6 @@ export class TeleCryptIOStorage {
       },
     );
     const parsedStateEvents = parseMatrixStateResponse(stateEvents);
-    if (await this.repairOwnedTreePermissions(roomId, parsedStateEvents, options)) {
-      // Read the accepted native state back instead of fabricating a local
-      // permission snapshot. An interrupted repair retries on the next load.
-      return this.refreshRoomState(roomId, options);
-    }
     if (typeof room.currentState.setStateEvents === "function") {
       const refreshed = parsedStateEvents.map((event) => new MatrixEvent(event as never));
       // RoomState.setStateEvents overwrites matching tuples, but deliberately
@@ -1304,51 +1381,6 @@ export class TeleCryptIOStorage {
     }
   }
 
-  private async repairOwnedTreePermissions(
-    roomId: string,
-    state: Array<Record<string, unknown>>,
-    options?: MatrixRequestOptions,
-  ): Promise<boolean> {
-    if (isTreeDeleted(this.client, roomId)) return false;
-    const event = (type: string, key = "") => state.find((item) => item.type === type && item.state_key === key);
-    const create = event(EventType.RoomCreate);
-    const purpose = event(UNSTABLE_MSC3088_PURPOSE.name, UNSTABLE_MSC3089_TREE_SUBTYPE.name);
-    const encryption = event(EventType.RoomEncryption);
-    if (!isStorageTreeState(create?.content, purpose?.content, encryption?.content)) return false;
-    const userId = this.client.getUserId();
-    if (!userId || create?.sender !== userId ||
-        (event(EventType.RoomMember, userId)?.content as Record<string, unknown>)?.membership !== "join") {
-      return false;
-    }
-    const rawPower = event(EventType.RoomPowerLevels)?.content;
-    const power = parseMatrixPowerLevels(rawPower);
-    const ownerLevel = power.events?.[EventType.RoomPowerLevels] ?? 100;
-    if ((power.users?.[userId] ?? power.users_default ?? 0) < ownerLevel) return false;
-    const events = { ...power.events };
-    let changed = (power.state_default ?? 50) < 100;
-    for (const type of [EventType.RoomJoinRules, UNSTABLE_MSC3088_PURPOSE.name]) {
-      if (events[type] !== undefined && events[type] < 100) {
-        events[type] = 100;
-        changed = true;
-      }
-    }
-    if (changed) {
-      await withMatrixMutationAbort(() => this.client.sendStateEvent(roomId, EventType.RoomPowerLevels, {
-        ...(rawPower as Record<string, unknown>),
-        state_default: Math.max(power.state_default ?? 50, 100),
-        events,
-      }, ""), matrixRequestSignal(options));
-    }
-    const joinRules = event(EventType.RoomJoinRules)?.content as Record<string, unknown> | undefined;
-    if (joinRules?.join_rule !== "invite") {
-      await withMatrixMutationAbort(() => this.client.sendStateEvent(roomId, EventType.RoomJoinRules, {
-        join_rule: JoinRule.Invite,
-      }, ""), matrixRequestSignal(options));
-      changed = true;
-    }
-    return changed;
-  }
-
   /**
    * Recommended entry point: builds the MatrixClient with a persistent crypto
    * store and the secret-storage callback wiring `keySafe` needs, starts the
@@ -1373,7 +1405,6 @@ export class TeleCryptIOStorage {
       accessToken: opts.accessToken,
       deviceId: opts.deviceId,
       fetchFn: boundedMatrixFetch(globalThis.fetch.bind(globalThis)),
-      localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS,
       cryptoCallbacks: cloneCryptoCallbacks(opts.cryptoCallbacks),
     });
 
@@ -1404,7 +1435,6 @@ export class TeleCryptIOStorage {
       tokenRefreshFunction:
         opts.refreshToken && opts.tokenRefreshFunction ? opts.tokenRefreshFunction : undefined,
       fetchFn: boundedMatrixFetch(globalThis.fetch.bind(globalThis)),
-      localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS,
       cryptoCallbacks: cloneCryptoCallbacks(opts.cryptoCallbacks),
     });
 
@@ -1666,32 +1696,23 @@ export class TeleCryptIOStorage {
     const userId = this.client.getUserId();
     if (!userId) throw new Error("createTree: Matrix client has no user ID");
 
+    const defaults = DEFAULT_TREE_POWER_LEVELS_TEMPLATE;
     return {
       name: GENERIC_TREE_NAME,
       preset: Preset.PrivateChat,
       power_level_content_override: {
-        invite: 100,
-        kick: 100,
-        ban: 100,
-        redact: 100,
-        state_default: 100,
-        events_default: 0,
-        users_default: 0,
+        invite: defaults.invite,
+        kick: defaults.kick,
+        ban: defaults.ban,
+        redact: defaults.redact,
+        state_default: defaults.state_default,
+        events_default: defaults.events_default,
+        users_default: defaults.users_default,
         events: {
-          [EventType.RoomPowerLevels]: 100,
-          [EventType.RoomHistoryVisibility]: 100,
-          [EventType.RoomTombstone]: 100,
-          [EventType.RoomEncryption]: 100,
-          [EventType.RoomName]: 100,
-          [EventType.RoomMessage]: 0,
-          [EventType.RoomMessageEncrypted]: 0,
-          [EventType.Sticker]: 0,
-          [EventType.SpaceChild]: 100,
-          [EventType.SpaceParent]: 100,
-          [UNSTABLE_MSC3089_BRANCH.name]: 100,
-          [STORAGE_METADATA_EVENT_TYPE]: 100,
+          ...defaults.events,
+          [UNSTABLE_MSC3089_BRANCH.name]: 50,
+          [STORAGE_METADATA_EVENT_TYPE]: 50,
         },
-        users: { [userId]: 100 },
       },
       creation_content: { [RoomCreateTypeField]: RoomType.Space },
       initial_state: [
@@ -1979,16 +2000,8 @@ export class TeleCryptIOStorage {
     for (const room of rooms) {
       if (signal?.aborted) throw new StorageError("operation cancelled");
       if (isTreeDeleted(this.client, room.roomId)) continue;
-      let tree = this.getTree(room.roomId);
-      if (tree) {
-        // Existing owner sessions repair the persisted permissions on load;
-        // readers never attempt this owner-only mutation.
-        if (this.getStateEvent(room.roomId, EventType.RoomCreate, "")?.getSender() === this.client.getUserId()) {
-          await this.refreshRoomState(room.roomId, { signal });
-          tree = this.getTree(room.roomId);
-        }
-        if (tree) trees.push(tree);
-      }
+      const tree = this.getTree(room.roomId);
+      if (tree) trees.push(tree);
     }
     return trees;
   }
@@ -2004,20 +2017,19 @@ export class TeleCryptIOStorage {
       await this.refreshRoomState(parent.id, { signal: effectiveSignal });
       const currentParent = this.getTree(parent.id);
       if (!currentParent) throw new Error("createSubtree: parent is unavailable");
-      const readers = (await this.listMembers(currentParent, { signal: effectiveSignal }))
-        .filter((member) => member.role === "viewer" &&
-          (member.membership === "join" || member.membership === "invite"));
 
       const tree = await this.createTreeSpace(name, "createSubtree", effectiveSignal);
       let parentLinkAttempted = false;
       let parentLinkEventId: string | undefined;
       let childLinkAttempted = false;
       let childLinkEventId: string | undefined;
+      let pendingLink: "parent" | "child" | undefined;
       try {
         const via = this.client.getDomain();
         if (!via) throw new Error("createSubtree: Matrix client has no server domain");
 
         parentLinkAttempted = true;
+        pendingLink = "parent";
         const parentLink = await TeleCryptIOStorage.withMutationTimeout(
           withMatrixMutationAbort(
             () =>
@@ -2032,6 +2044,7 @@ export class TeleCryptIOStorage {
           MATRIX_HTTP_TIMEOUT_MS,
           "parent link",
         );
+        pendingLink = undefined;
         if ((parentLink as { event_id?: unknown } | undefined)?.event_id !== undefined) {
           parentLinkEventId = validateMatrixEventId(
             (parentLink as { event_id?: unknown }).event_id,
@@ -2039,6 +2052,7 @@ export class TeleCryptIOStorage {
           );
         }
         childLinkAttempted = true;
+        pendingLink = "child";
         const childLink = await TeleCryptIOStorage.withMutationTimeout(
           withMatrixMutationAbort(
             () =>
@@ -2053,6 +2067,7 @@ export class TeleCryptIOStorage {
           MATRIX_HTTP_TIMEOUT_MS,
           "child link",
         );
+        pendingLink = undefined;
         if ((childLink as { event_id?: unknown } | undefined)?.event_id !== undefined) {
           childLinkEventId = validateMatrixEventId(
             (childLink as { event_id?: unknown }).event_id,
@@ -2067,6 +2082,14 @@ export class TeleCryptIOStorage {
           await this.refreshRoomState(tree.id, { signal: effectiveSignal });
         }
       } catch (error) {
+        // A Matrix authorization response is definitive: the currently
+        // rejected state event was not committed. Keep rollback for links
+        // that were already accepted, but don't classify an absent rejected
+        // link as an ambiguous write that needs compensation.
+        if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
+          if (pendingLink === "parent") parentLinkAttempted = false;
+          if (pendingLink === "child") childLinkAttempted = false;
+        }
         // Compensation is independent of the caller's cancelled deadline.
         // Reconcile and retry these idempotent relation updates with a fresh
         // signal, then report incomplete cleanup if they cannot be verified.
@@ -2175,22 +2198,74 @@ export class TeleCryptIOStorage {
         }
         throw error;
       }
-      // The folder and both links now exist. A failed invitation must leave
-      // that known folder available for reconciliation instead of deleting a
-      // room to which another reader may already have received access.
-      try {
-        for (const reader of readers) {
+      // Reconcile only after the child link is visible. A stale pre-creation
+      // membership snapshot could re-invite someone removed while the room was
+      // being created on another owner device.
+      const reconcileInheritedAccess = async (): Promise<void> => {
+        await this.refreshRoomState(currentParent.id, { signal: effectiveSignal });
+        await this.refreshRoomState(tree.id, { signal: effectiveSignal });
+        const parentMembers = await this.listMembers(currentParent, { signal: effectiveSignal });
+        const childMembers = await this.listMembers(tree, { signal: effectiveSignal });
+        const currentUser = this.client.getUserId();
+        const desired = new Map(
+          parentMembers
+            .filter((member) => member.userId !== currentUser &&
+              (member.membership === "join" || member.membership === "invite"))
+            .map((member) => [member.userId, member]),
+        );
+        const childByUser = new Map(childMembers.map((member) => [member.userId, member]));
+        for (const member of desired.values()) {
           if (effectiveSignal?.aborted) throw new StorageError("operation cancelled");
-          const verifyHistorySharing = await prepareReaderHistorySharing(this.client, reader.userId);
-          await withMatrixMutationAbort(() => tree.invite(reader.userId), effectiveSignal);
-          await verifyHistorySharing();
+          const childMember = childByUser.get(member.userId);
+          if (!childMember || (childMember.membership !== "join" && childMember.membership !== "invite")) {
+            const verifyHistorySharing = await prepareReaderHistorySharing(this.client, member.userId);
+            await withMatrixMutationAbort(() => tree.invite(member.userId, false), effectiveSignal);
+            await verifyHistorySharing();
+          }
+          await this.refreshRoomState(tree.id, { signal: effectiveSignal });
+          if (childMember?.role !== member.role) {
+            await withMatrixMutationAbort(() => tree.setPermissions(member.userId, member.role), effectiveSignal);
+            await this.refreshRoomState(tree.id, { signal: effectiveSignal });
+          }
+          const actual = await this.listMembers(tree, { signal: effectiveSignal });
+          const granted = actual.find((candidate) => candidate.userId === member.userId);
+          if (!granted || granted.role !== member.role ||
+              (granted.membership !== "join" && granted.membership !== "invite")) {
+            throw new Error("inherited folder access could not be verified");
+          }
         }
+        for (const member of childMembers) {
+          if (member.userId === currentUser || desired.has(member.userId) ||
+              (member.membership !== "join" && member.membership !== "invite" && member.membership !== "knock")) {
+            continue;
+          }
+          try {
+            await withMatrixMutationAbort(
+              () => this.client.kick(tree.id, member.userId, "parent access was removed"),
+              effectiveSignal,
+            );
+          } catch (error) {
+            if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
+              const after = await this.getRoomMembership(tree.id, member.userId, { signal: effectiveSignal });
+              if (after === "leave" || after === "ban" || after === null) continue;
+            }
+            throw error;
+          }
+          const after = await this.getRoomMembership(tree.id, member.userId, { signal: effectiveSignal });
+          if (after === "join" || after === "invite" || after === "knock") {
+            throw new Error("removed parent access still has folder membership");
+          }
+        }
+      };
+      try {
+        await reconcileInheritedAccess();
+        await reconcileInheritedAccess();
       } catch (error) {
         throw new MutationPartialError(
           "create folder",
           [tree.id],
-          "the folder was created, but reader access is incomplete; retry sharing the parent vault with its readers",
-          { cause: error },
+          "the folder was created, but inherited access could not be verified",
+          { cause: error, treeId: tree.id, backupTargets: [{ treeId: tree.id }] },
         );
       }
       return tree;
@@ -2257,7 +2332,13 @@ export class TeleCryptIOStorage {
     // explicit zero still means regular users lack the editor threshold.
     const editLevel = pls.events_default || 50;
     const adminLevel = pls.events?.["m.room.power_levels"] ?? 100;
+    const room = this.client.getRoom(tree.id);
     const roleFor = (userId: string): string => {
+      // RoomState applies Matrix's v12 creator power before the MSC3089
+      // power-level event is converted into Storage's displayed roles.
+      if (room?.currentState.getMember(userId)?.powerLevel === Number.POSITIVE_INFINITY) {
+        return "owner";
+      }
       const userLevel = pls.users?.[userId] ?? viewLevel;
       if (userLevel >= adminLevel) return "owner";
       if (userLevel >= editLevel) return "editor";

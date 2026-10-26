@@ -136,27 +136,45 @@ its snapshot before resolving that callback. Key Safe methods accept an optional
 The safe, signing keys, and saved-key acknowledgement are shared SDK behavior rather than separate
 Web/CLI implementations.
 
-Sharing uses Matrix's native encrypted-history bundle exchange. Both users must have completed
-their account signing setup. An invitation alone does not establish successful history sharing:
-the SDK checks native recipient-device eligibility afterward and reports partial completion if
-keys could not be shared. An upload restriction can reject the encrypted history bundle upload;
-the error is preserved, including when retrying an existing invitation.
+Sharing uses Matrix's native encrypted-history bundle exchange. `shareVault` assigns Viewer,
+Editor, or Owner to the vault and its existing folders; callers default new shares to Viewer. Both
+users must have completed their account signing setup. An invitation alone does not establish
+successful history sharing: the SDK checks native recipient-device eligibility afterward and
+reports partial completion if keys could not be shared. An upload restriction can reject the
+encrypted history bundle upload; the error is preserved, including when retrying an existing
+invitation. Changing the role of a joined member does not reinvite them or claim history-key
+delivery. Matrix authorizes every permission and membership change, so a higher-powered member can
+demote or remove an Owner while Matrix can deny an equal-power change. Partial outcomes retain the
+rooms already changed.
+
+Signing in on another device does not transfer key delivery queued for an offline device. A
+Recovery Key restores only keys already backed up for the account; it cannot recover a room key
+that was never received and backed up. If a download raises `UndecryptableFileError` after Safe
+restoration, the room key may not have been delivered to that device; membership does not replay it.
 
 `joinVault` accepts the vault and its linked folder invitations, including their history keys.
 New folders inherit the parent's joined and invited readers; browsing accepts their folder
 invitations. If reader access fails after folder creation, the partial-completion error retains
 the created folder ID. Retry sharing the parent vault to complete access to that folder.
 
-Storage spaces are private and only their creator changes room state. Loading owned trees or
-refreshing their state repairs the permissive defaults emitted by older SDKs and restores
-invite-only joining. The repair preserves membership, unrelated power settings and encryption
-keys; readers do not write it. Owners must use an updated client for their existing trees to be
-repaired. Disabled Storage markers and deleted trees are not restored automatically.
+New Storage spaces use the upstream file-tree power-level template with the Storage file index and
+encrypted metadata events writable by Editors. Room reads leave permissions and join rules
+unchanged. An explicit role change converts only the known legacy owner-only template and preserves
+member assignments; custom permission settings stay as configured. Roles are reported from native
+effective power, including a room-v12 creator who has no explicit power-level entry. Matrix remains
+the authority for each attempted change. Disabled Storage markers and deleted trees are not restored
+automatically. Keep SDK, Web, and CLI clients current together once Editors have created file
+metadata; older releases assume owner-only authorship.
 
-Deletion has strict ordering. Delete files before their folders or vaults because folders and
-vaults must be empty. File deletion removes the encrypted media object before redacting its Matrix
-event and requires TeleCrypt's Synapse storage extension; stock Synapse cannot provide that
-deletion contract.
+Only the member who uploaded a file can delete its encrypted media, even when another Editor
+renamed it. Completing deletion also requires native Matrix permission to redact the original file
+message. Upstream defaults do not give Viewers that permission; a preserved custom power-level
+configuration may. Storage uses the current Matrix capability to show the action, while Matrix
+remains authoritative when it is attempted. Confirmed redaction of the original file message
+removes it from Storage views and backup settlement. Deletion removes the encrypted media object
+before redacting that message and requires TeleCrypt's Synapse storage extension; stock Synapse
+cannot provide that deletion contract. Delete files before their folders or vaults because folders
+and vaults must be empty.
 
 ## Source repositories
 
