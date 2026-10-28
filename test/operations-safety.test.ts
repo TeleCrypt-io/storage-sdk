@@ -1869,11 +1869,11 @@ describe("operation safety", () => {
     root.setTestMembers([{ userId: target, role: "viewer", membership: "invite" }]);
     child.setTestMembers([{ userId: target, role: "viewer", membership: "invite" }]);
     const inviteRoot = vi.spyOn(root, "invite");
-    const kick = vi.fn(async (roomId: string) => setTestMembership([root, child], roomId, target, "leave"));
+    const ban = vi.fn(async (roomId: string) => setTestMembership([root, child], roomId, target, "ban"));
     const client = { ...sharingCrypto(),
       getUserId: () => "@owner:example.test",
       getRoom: roomLookup(root, child),
-      kick,
+      ban,
     };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
@@ -1897,7 +1897,7 @@ describe("operation safety", () => {
       userId: target,
       removed: true,
     });
-    expect(kick.mock.calls.map(([roomId]) => roomId).sort()).toEqual([child.id, root.id].sort());
+    expect(ban.mock.calls.map(([roomId]) => roomId).sort()).toEqual([child.id, root.id].sort());
   });
 
   it("discovers descendants from each room after refreshing its current state", async () => {
@@ -1999,11 +1999,11 @@ describe("operation safety", () => {
     expect(kick).not.toHaveBeenCalled();
   });
 
-  it("lets Matrix reject an equal-power owner kick during unshare", async () => {
+  it("lets Matrix reject an equal-power owner ban during unshare", async () => {
     const root = makeTree("!owner:example.test", "Root", true);
     const refusal = new MatrixError({ errcode: "M_FORBIDDEN" }, 403);
-    const kick = vi.fn().mockRejectedValue(refusal);
-    const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root), kick };
+    const ban = vi.fn().mockRejectedValue(refusal);
+    const client = { ...sharingCrypto(), getUserId: () => "@admin:example.test", getRoom: roomLookup(root), ban };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: () => root,
       getClient: () => client,
@@ -2015,7 +2015,7 @@ describe("operation safety", () => {
       message: "unshare failed",
       cause: refusal,
     });
-    expect(kick).toHaveBeenCalledWith(root.id, "@owner:example.test", "unshared");
+    expect(ban).toHaveBeenCalledWith(root.id, "@owner:example.test", "unshared");
   });
 
   it("reports partial share when Matrix denies a descendant owner demotion", async () => {
@@ -2092,11 +2092,11 @@ describe("operation safety", () => {
     const target = "@target:example.test";
     root.setTestMembers([{ userId: target, role: "viewer", membership: "join" }]);
     child.setTestMembers([{ userId: target, role: "viewer", membership: "join" }]);
-    const kick = vi.fn(async (roomId: string) => {
-      if (roomId === child.id) throw new Error("child kick failed");
-      setTestMembership([root, child], roomId, target, "leave");
+    const ban = vi.fn(async (roomId: string) => {
+      if (roomId === child.id) throw new Error("child ban failed");
+      setTestMembership([root, child], roomId, target, "ban");
     });
-    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child), kick };
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child), ban };
     const storage = { keySafe: { requireReady: async () => undefined },
       getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
       getClient: () => client,

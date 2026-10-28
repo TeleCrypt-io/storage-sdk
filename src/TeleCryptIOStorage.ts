@@ -1472,6 +1472,7 @@ export class TeleCryptIOStorage {
     const progress = opts.onProgress ?? (() => {});
     const persistent = opts.persistentCryptoStore ?? true;
     let storage: TeleCryptIOStorage | undefined;
+    let syncOwnsCleanup = false;
     try {
       progress("Loading encryption engine (WASM)…");
       await TeleCryptIOStorage.withTimeout(
@@ -1505,6 +1506,7 @@ export class TeleCryptIOStorage {
           );
         }
       } else {
+        syncOwnsCleanup = true;
         await storage.startSync(opts.signal);
       }
       return storage;
@@ -1512,12 +1514,14 @@ export class TeleCryptIOStorage {
       // stopClient is idempotent in matrix-js-sdk and is also required after
       // init/timeout failures: crypto startup can have installed listeners or
       // a sync task before the awaited operation rejects.
-      try {
-        client.stopClient();
-      } catch (cleanupError) {
-        throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
-          cause: error,
-        });
+      if (!syncOwnsCleanup) {
+        try {
+          client.stopClient();
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
+            cause: error,
+          });
+        }
       }
       throw error;
     }

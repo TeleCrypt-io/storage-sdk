@@ -1669,6 +1669,7 @@ export async function renameFile(
           { cause: error, treeId, backupTargets: [{ treeId, fileId }] },
         );
       }
+      if (error instanceof StorageError && error.message === "file was deleted while renaming; the rename was removed") throw error;
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("rename file failed", { cause: error });
     }
