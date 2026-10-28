@@ -2036,6 +2036,7 @@ export class TeleCryptIOStorage {
     name: string,
     operation: string,
     signal?: AbortSignal,
+    onMetadata?: (eventId: string) => void,
   ): Promise<TreeSpace> {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     const response = await requireMatrixHttpTransport(this.client).authedRequest<{ room_id: string }>(
@@ -2060,23 +2061,27 @@ export class TeleCryptIOStorage {
     }
     try {
       const tree = await this.waitForTreeSpace(roomId, operation, signal);
+      let metadataEventId: string | undefined;
       try {
-        await this.writeTreeName(roomId, name, signal);
+        await this.writeTreeName(roomId, name, signal, (eventId) => {
+          metadataEventId = eventId;
+          onMetadata?.(eventId);
+        });
         if (signal?.aborted) throw new StorageError("operation cancelled");
       } catch (error) {
         try {
           await this.cleanupCreatedRoom(roomId);
         } catch (cleanupError) {
-          if (error instanceof MutationPartialError) {
-            throw new MutationPartialError(operation, [roomId, ...error.completedIds],
+          if (metadataEventId) {
+            throw new MutationPartialError(operation, [roomId, metadataEventId],
               "the encrypted name was accepted and room cleanup failed",
               { cause: new AggregateError([error, cleanupError], "creation and cleanup failed"),
-                treeId: roomId, backupTargets: error.backupTargets });
+                treeId: roomId, backupTargets: [{ treeId: roomId, metadataEventId }] });
           }
           throwWithCleanupDetail(error, roomId, cleanupError);
         }
-        if (error instanceof MutationPartialError) {
-          throw new MutationPartialError(operation, [roomId, ...error.completedIds],
+        if (metadataEventId) {
+          throw new MutationPartialError(operation, [roomId, metadataEventId],
             "the encrypted name was accepted and the created room was cleaned up",
             { cause: error, treeId: roomId });
         }
@@ -2140,7 +2145,8 @@ export class TeleCryptIOStorage {
       const currentParent = this.getTree(parent.id);
       if (!currentParent) throw new Error("createSubtree: parent is unavailable");
 
-      const tree = await this.createTreeSpace(name, "createSubtree", effectiveSignal);
+      let metadataEventId: string | undefined;
+      const tree = await this.createTreeSpace(name, "createSubtree", effectiveSignal, (eventId) => { metadataEventId = eventId; });
       let parentLinkAttempted = false;
       let parentLinkEventId: string | undefined;
       let childLinkAttempted = false;
@@ -2277,15 +2283,23 @@ export class TeleCryptIOStorage {
             cleanupFailures.push(cleanupError);
           }
         }
+        let roomCleanupFailed = false;
         try {
           await this.cleanupCreatedRoom(tree.id);
         } catch (cleanupError) {
+          roomCleanupFailed = true;
           cleanupFailures.push(cleanupError);
         }
         if (cleanupFailures.length > 0) {
           const cleanupCause = cleanupFailures.length === 1
             ? cleanupFailures[0]
             : new AggregateError(cleanupFailures, "tree creation cleanup failed");
+          if (roomCleanupFailed && metadataEventId) {
+            throw new MutationPartialError("createSubtree", [tree.id, metadataEventId],
+              "the encrypted name was accepted and room cleanup failed",
+              { cause: new AggregateError([error, cleanupCause], "creation and cleanup failed"),
+                treeId: tree.id, backupTargets: [{ treeId: tree.id, metadataEventId }] });
+          }
           throwWithCleanupDetail(error, tree.id, cleanupCause);
         }
         throw error;

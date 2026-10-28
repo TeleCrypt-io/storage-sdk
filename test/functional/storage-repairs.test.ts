@@ -151,6 +151,65 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
+ it.each(["failure", "success"])("retains a post-pointer creation receipt when cleanup is %s", async (cleanup) => {
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   const controller = new AbortController();
+   let roomId: string | undefined;
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     const result = await sendState(...args);
+     if (args[1] === "io.telecrypt.storage.metadata") {
+       roomId = args[0];
+       if (cleanup === "failure") failCleanupRoom = roomId;
+       controller.abort();
+     }
+     return result;
+   });
+   try {
+     if (cleanup === "failure") blockedBackupToken = owner.user.accessToken;
+     const error = await core.createVault(owner.storage, "post-pointer", { signal: controller.signal }).then(() => null, (e: unknown) => e);
+     expect(error).toBeInstanceOf(MutationPartialError);
+     const partial = error as MutationPartialError;
+     expect(partial.completedIds).toContain(roomId);
+     if (cleanup === "failure") {
+       const target = partial.backupTargets[0]!;
+       expect(target).toMatchObject({ treeId: roomId, metadataEventId: expect.any(String) });
+       await expect(owner.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId, timeoutMs: 2000 })).rejects.toThrow();
+       blockedBackupToken = undefined;
+       expect(await owner.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+     } else expect(partial.backupTargets).toEqual([]);
+   } finally {
+     spy.mockRestore(); failCleanupRoom = undefined;
+     if (roomId && cleanup === "failure") { await client.leave(roomId); await client.forget(roomId); }
+   }
+ }, 120000);
+ it("retains a folder name receipt when link creation and room cleanup fail", async () => {
+   const parent = await vault("Folder receipt parent", []);
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   let roomId: string | undefined;
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     if (args[0] === parent.id && args[1] === "m.space.child") {
+       roomId = args[3] as string;
+       failCleanupRoom = roomId;
+       throw new Error("controlled link failure");
+     }
+     return await sendState(...args);
+   });
+   try {
+     blockedBackupToken = owner.user.accessToken;
+     const error = await core.createSubfolder(owner.storage, parent.id, "folder receipt").then(() => null, (e: unknown) => e);
+     expect(error).toBeInstanceOf(MutationPartialError);
+     const target = (error as MutationPartialError).backupTargets[0]!;
+     expect(target).toMatchObject({ treeId: roomId, metadataEventId: expect.any(String) });
+     await expect(owner.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId, timeoutMs: 2000 })).rejects.toThrow();
+     blockedBackupToken = undefined;
+     expect(await owner.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+   } finally {
+     spy.mockRestore(); failCleanupRoom = undefined;
+     if (roomId) { await client.leave(roomId); await client.forget(roomId); }
+   }
+ }, 120000);
  it.each(["failure", "success"])("retains a late creation acknowledgement through cleanup %s", async (cleanup) => {
    const client = owner.storage.getClient();
    const send = client.sendMessage.bind(client);
