@@ -1014,21 +1014,21 @@ export class TeleCryptIOStorage {
       file_event_id: fileId,
     });
     try {
-    const listing = await this.client.sendStateEvent(
-      treeId,
-      UNSTABLE_MSC3089_BRANCH.name,
-      { active: true, metadata_event_id: metadataEventId } as never,
-      fileId,
-    );
-    // Another device can delete the attachment after the preflight check.
-    // Its redaction wins over this rename, including a late listing update.
-    if ((await this.getOriginalFileEvent(treeId, fileId, true)).isRedacted()) {
-      await this.client.redactEvent(treeId, listing.event_id);
-      await this.client.redactEvent(treeId, metadataEventId);
-      this.fileNames.delete(this.fileNameKey(treeId, fileId));
-      throw new StorageError("file was deleted while renaming; the rename was removed");
-    }
-    this.fileNames.set(this.fileNameKey(treeId, fileId), name);
+      const listing = await this.client.sendStateEvent(
+        treeId,
+        UNSTABLE_MSC3089_BRANCH.name,
+        { active: true, metadata_event_id: metadataEventId } as never,
+        fileId,
+      );
+      // Another device can delete the attachment after the preflight check.
+      // Its redaction wins over this rename, including a late listing update.
+      if ((await this.getOriginalFileEvent(treeId, fileId, true)).isRedacted()) {
+        await this.client.redactEvent(treeId, listing.event_id);
+        await this.client.redactEvent(treeId, metadataEventId);
+        this.fileNames.delete(this.fileNameKey(treeId, fileId));
+        throw new StorageError("file was deleted while renaming; the rename was removed");
+      }
+      this.fileNames.set(this.fileNameKey(treeId, fileId), name);
     } catch (error) {
       if (error instanceof StorageError && error.message === "file was deleted while renaming; the rename was removed") throw error;
       throw new MutationPartialError("rename file", [metadataEventId],
