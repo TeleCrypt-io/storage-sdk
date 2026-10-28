@@ -129,6 +129,8 @@ or renaming encrypted metadata and before closing. Omit `fileId` for a vault or 
 the attachment and current name encryption sessions in the active server backup, including reused keys that produce no
 new backup-progress event. If verification fails, retain the local profile and retry backup;
 the metadata mutation has already committed.
+For a partial rename, pass each retained backup target's `metadataEventId` in the existing options
+object so verification includes the acknowledged event even if its pointer write failed.
 
 Pending setup state is kept beside the login's IndexedDB crypto data. A platform that snapshots
 IndexedDB to disk, such as the CLI, must supply `onKeySafeStateChanged` at creation and durably flush
@@ -156,6 +158,10 @@ restoration, the room key may not have been delivered to that device; membership
 New folders inherit the parent's joined and invited readers; browsing accepts their folder
 invitations. If reader access fails after folder creation, the partial-completion error retains
 the created folder ID. Retry sharing the parent vault to complete access to that folder.
+Unsharing bans the person from the selected folder and its descendants until an explicit share
+unbans and invites them. Previously delivered keys remain usable. Inheritance checks for a child
+ban before sharing or changing its role; Matrix does not make the membership check and a separate
+power-level update atomic.
 
 New Storage spaces use the upstream file-tree power-level template with the Storage file index and
 encrypted metadata events writable by Editors. Room reads leave permissions and join rules

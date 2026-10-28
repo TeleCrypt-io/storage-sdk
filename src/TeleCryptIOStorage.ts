@@ -819,7 +819,13 @@ export class TeleCryptIOStorage {
     if (signal?.aborted) throw new StorageError("operation cancelled");
     const transactionId = signal ? this.client.makeTxnId() : undefined;
     const unregister = signal && transactionId ? registerMetadataRequest(this.client, transactionId, signal) : undefined;
-    const pending = this.client.sendMessage(roomId, content as never, transactionId);
+    let pending: ReturnType<MatrixClient["sendMessage"]>;
+    try {
+      pending = this.client.sendMessage(roomId, content as never, transactionId);
+    } catch (error) {
+      unregister?.();
+      throw error;
+    }
     void pending.finally(() => unregister?.()).catch(() => undefined);
     const response = signal ? await new Promise<Awaited<typeof pending>>((resolve, reject) => {
       const abort = () => reject(new MutationOutcomeUnknownError("encrypted metadata write"));

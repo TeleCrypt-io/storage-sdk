@@ -135,6 +135,24 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
+ it("retains a tree rename receipt after cancellation following its pointer acknowledgement", async () => {
+   const tree = await vault("Before cancelled rename", []);
+   const controller = new AbortController();
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     const result = await sendState(...args);
+     if (args[0] === tree.id && args[1] === "io.telecrypt.storage.metadata") controller.abort();
+     return result;
+   });
+   try {
+     const error = await core.renameVault(owner.storage, tree.id, "Accepted rename", { signal: controller.signal })
+       .then(() => null, (failure: unknown) => failure);
+     expect(error).toBeInstanceOf(MutationPartialError);
+     expect((error as MutationPartialError).backupTargets).toEqual([{ treeId: tree.id }]);
+     expect(await owner.storage.waitForKeyBackup(tree.id)).toBe("backed_up");
+   } finally { spy.mockRestore(); }
+ }, 120000);
  it.each(["metadata", "listing", "readback"])("bounds stalled rename %s requests", async (stage) => {
    const tree = await vault(`Rename deadline ${stage}`, []);
    const file = await upload(owner.storage, tree.id, "before.txt", "contents");
