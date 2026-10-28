@@ -89,7 +89,7 @@ describe("Storage access regressions", () => {
       expect(await core.listSubfolders(reader.storage, added.id)).toEqual([addedNested]);
       await core.unshareVault(owner.storage, vault.id, reader.user.userId);
       for (const id of [vault.id, child.id, nested.id, added.id, addedNested.id]) {
-        expect(await owner.storage.getRoomMembership(id, reader.user.userId)).toBe("leave");
+        expect(await owner.storage.getRoomMembership(id, reader.user.userId)).toBe("ban");
       }
       await core.deleteFile(owner.storage, nested.id, file.id);
       for (const folder of [nested, child, addedNested, added]) {

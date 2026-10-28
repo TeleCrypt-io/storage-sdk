@@ -316,7 +316,7 @@ describe("sharing", () => {
         "io.telecrypt.storage.metadata": 0,
       };
       customLevels.invite = 1;
-      customLevels.kick = 0;
+      customLevels.ban = 0;
       customLevels.users = { ...customLevels.users, [bobUser.userId]: 1 };
       await alice.sendStateEvent(vault.id, EventType.RoomPowerLevels, customLevels, "");
       await aliceStore.refreshRoomState(vault.id);
@@ -363,7 +363,7 @@ describe("sharing", () => {
         canUnshare: true,
       });
       await core.unshareVault(bobStore, vault.id, charlieUser.userId);
-      expect(await bobStore.getRoomMembership(vault.id, charlieUser.userId)).toBe("leave");
+      expect(await bobStore.getRoomMembership(vault.id, charlieUser.userId)).toBe("ban");
       const secondFile = await core.uploadFile(
         bobStore,
         vault.id,
@@ -446,7 +446,7 @@ describe("sharing", () => {
         .toBe(TreePermissions.Owner);
       const removed = await core.unshareVault(aliceStore, tree.id, bobUser.userId);
       expect(removed.removed).toBe(true);
-      expect(await aliceStore.getRoomMembership(tree.id, bobUser.userId)).toBe("leave");
+      expect(await aliceStore.getRoomMembership(tree.id, bobUser.userId)).toBe("ban");
     } finally {
       if (vaultId) {
         try { await core.deleteVault(new TeleCryptIOStorage(alice), vaultId); } catch { /* report by test result */ }
@@ -512,7 +512,7 @@ describe("sharing", () => {
         completedIds: [root.id],
       });
       expect((partialUnshare as Error & { cause?: { errcode?: string } }).cause?.errcode).toBe("M_FORBIDDEN");
-      expect(await aliceStore.getRoomMembership(root.id, charlieUser.userId)).toBe("leave");
+      expect(await aliceStore.getRoomMembership(root.id, charlieUser.userId)).toBe("ban");
       expect(await aliceStore.getRoomMembership(child.id, charlieUser.userId)).toBe("join");
 
       await core.unshareVault(aliceStore, root.id, bobUser.userId);

@@ -218,7 +218,7 @@ it("refreshes changed child links and recovers unshare when a descendant is not 
   }
 
   if (firstResult) {
-    expect(await ownerB.getRoomMembership(grandchild!.id, reader.user.userId)).toBe("leave");
+    expect(await ownerB.getRoomMembership(grandchild!.id, reader.user.userId)).toBe("ban");
   } else {
     expect(firstError).toBeTruthy();
     expect(await ownerB.getRoomMembership(grandchild!.id, reader.user.userId)).toBe(readerMembershipBefore);
@@ -234,7 +234,7 @@ it("refreshes changed child links and recovers unshare when a descendant is not 
     grandchild: await ownerB.getRoomMembership(grandchild!.id, reader.user.userId),
   };
   expect(removal.removed).toBe(true);
-  expect(memberships).toEqual({ root: "leave", child: "leave", grandchild: "leave" });
+  expect(memberships).toEqual({ root: "ban", child: "ban", grandchild: "ban" });
 
   const uploadedAfterRemoval = await core.uploadFile(
     ownerB,
@@ -430,9 +430,8 @@ it("reconciles an editor invite when a second owner unshares during folder creat
       root: await ownerB.getRoomMembership(vault.id, reader.user.userId),
       child: await ownerB.getRoomMembership(created.id, reader.user.userId),
     };
-    expect(memberships.root).toBe("leave");
-    expect(["leave", null]).toContain(memberships.child);
-    expect(["leave", null]).toContain(await reader.storage.getRoomMembership(created.id, reader.user.userId));
+    expect(memberships.root).toBe("ban");
+    expect(memberships.child).toBe("ban");
     await core.deleteFolder(ownerB, created.id);
     rooms.splice(rooms.indexOf(childRef), 1);
     await core.deleteVault(ownerB, vault.id);
