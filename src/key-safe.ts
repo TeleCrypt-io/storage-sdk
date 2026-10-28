@@ -79,19 +79,25 @@ export class DecryptionKeySafe {
       throw error;
     }
   }
-  private serial<T>(operation: () => Promise<T>): Promise<T> {
+  private serial<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const result = this.tail.then(operation);
     this.tail = result.catch(() => undefined);
-    return result;
+    if (!signal) return result;
+    if (signal.aborted) return Promise.reject(new StorageError("operation cancelled"));
+    return new Promise<T>((resolve, reject) => {
+      const abort = () => reject(new StorageError("operation cancelled"));
+      signal.addEventListener("abort", abort, { once: true });
+      result.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
   }
-  private async refreshAccountData(type: string): Promise<Record<string, unknown> | null> {
+  private async refreshAccountData(type: string, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
     const user = this.client.getUserId();
     if (!user) throw new StorageError("Matrix login is not initialized");
     const path = encodeUri("/user/$userId/account_data/$type", { $userId: user, $type: type });
     let content: Record<string, unknown> | null;
     try {
       content = await this.client.http.authedRequest<Record<string, unknown>>(
-        Method.Get, path, undefined, undefined, { prefix: ClientPrefix.V3 },
+        Method.Get, path, undefined, undefined, { prefix: ClientPrefix.V3, abortSignal: signal },
       );
     } catch (error) {
       if (!(error instanceof MatrixError) || error.errcode !== "M_NOT_FOUND") throw error;
@@ -112,36 +118,36 @@ export class DecryptionKeySafe {
    * API before native secret-storage code reads them. Seed those exact records
    * through the public Store API used by Matrix sync itself.
    */
-  private async refreshSecretStorageAccountData(force = false): Promise<string | null> {
-    const defaultKey = await this.refreshAccountData("m.secret_storage.default_key");
+  private async refreshSecretStorageAccountData(force = false, signal?: AbortSignal): Promise<string | null> {
+    const defaultKey = await this.refreshAccountData("m.secret_storage.default_key", signal);
     const keyId = typeof defaultKey?.key === "string" ? defaultKey.key : null;
     if (keyId && (force || this.refreshedKeyDescriptorId !== keyId)) {
-      await this.refreshAccountData(`m.secret_storage.key.${keyId}`);
+      await this.refreshAccountData(`m.secret_storage.key.${keyId}`, signal);
       this.refreshedKeyDescriptorId = keyId;
     }
     if (force || !this.secretRecordsRefreshed) {
       await Promise.all([
-        this.refreshAccountData("m.cross_signing.master"),
-        this.refreshAccountData("m.cross_signing.self_signing"),
-        this.refreshAccountData("m.cross_signing.user_signing"),
-        this.refreshAccountData("m.megolm_backup.v1"),
+        this.refreshAccountData("m.cross_signing.master", signal),
+        this.refreshAccountData("m.cross_signing.self_signing", signal),
+        this.refreshAccountData("m.cross_signing.user_signing", signal),
+        this.refreshAccountData("m.megolm_backup.v1", signal),
       ]);
       this.secretRecordsRefreshed = true;
     }
     return keyId;
   }
-  private async topology(forceAccountDataRefresh = false) {
+  private async topology(forceAccountDataRefresh = false, signal?: AbortSignal) {
     const [defaultKeyId, backup] = await Promise.all([
-      this.refreshSecretStorageAccountData(forceAccountDataRefresh), this.serverBackup(),
+      this.refreshSecretStorageAccountData(forceAccountDataRefresh, signal), this.serverBackup(signal),
     ]);
     const key = await this.client.secretStorage.getKey();
     return { key, defaultKeyId, backup };
   }
-  private async serverBackup(): Promise<KeyBackupInfo | null> {
+  private async serverBackup(signal?: AbortSignal): Promise<KeyBackupInfo | null> {
     // CryptoApi.getKeyBackupInfo caches absence and maps request failures to
     // null. Neither can authorize creating a new server backup on retry.
     try {
-      return await this.client.http.authedRequest<KeyBackupInfo>(Method.Get, "/room_keys/version", undefined, undefined, { prefix: ClientPrefix.V3 });
+      return await this.client.http.authedRequest<KeyBackupInfo>(Method.Get, "/room_keys/version", undefined, undefined, { prefix: ClientPrefix.V3, abortSignal: signal });
     } catch (error) {
       if (error instanceof MatrixError && error.errcode === "M_NOT_FOUND") return null;
       throw error;
@@ -163,8 +169,10 @@ export class DecryptionKeySafe {
     return this.serial(async () => {
       this.active(options.signal);
       const local = await this.local();
+      this.active(options.signal);
       if (local.recoveryKey) return { state: "confirmation-required", recoveryKey: local.recoveryKey };
-      const { key, defaultKeyId, backup } = await this.topology();
+      const { key, defaultKeyId, backup } = await this.topology(false, options.signal);
+      this.active(options.signal);
       if (!key && !defaultKeyId && !backup) return { state: "setup-required" };
       if (local.confirmed && key?.[0] === local.keyId && backup?.version === local.backupVersion && await this.signingReady()) {
         await this.crypto().checkKeyBackupAndEnable();
@@ -175,7 +183,7 @@ export class DecryptionKeySafe {
       }
       this.active(options.signal);
       return { state: "restore-required" };
-    });
+    }, signal);
   }
   async requireReady(options: KeySafeOptions = {}): Promise<void> {
     const status = await this.getStatus(options.signal);
@@ -232,7 +240,7 @@ export class DecryptionKeySafe {
   private async configure(encoded: string, signal?: AbortSignal): Promise<void> {
     const crypto = this.crypto();
     const privateKey = decodeRecoveryKey(encoded);
-    const { key, defaultKeyId, backup } = await this.topology(true);
+    const { key, defaultKeyId, backup } = await this.topology(true, signal);
     if (!key && defaultKeyId) throw new StorageError("The existing Decryption Key Safe is incomplete; it will not be replaced");
     if (key && !(await this.client.secretStorage.checkKey(privateKey, key[1]))) {
       throw new StorageError("This key does not unlock the existing Decryption Key Safe");
@@ -274,7 +282,7 @@ export class DecryptionKeySafe {
       this.active(options.signal);
       let local = await this.local();
       if (!local.recoveryKey) {
-        const { key, defaultKeyId, backup } = await this.topology(true);
+        const { key, defaultKeyId, backup } = await this.topology(true, options.signal);
         if (key || defaultKeyId || backup) throw new StorageError("A Decryption Key Safe already exists; enter its saved key to unlock it");
         const generated = await this.crypto().createRecoveryKeyFromPassphrase();
         if (!generated.encodedPrivateKey) throw new StorageError("Could not create the Decryption Key Safe key");
@@ -284,7 +292,7 @@ export class DecryptionKeySafe {
       this.active(options.signal);
       await this.configure(local.recoveryKey!, options.signal);
       return { recoveryKey: local.recoveryKey! };
-    });
+    }, signal);
   }
   confirmSaved(signal?: AbortSignal): Promise<{ state: "ready" }> {
     const options = { signal };
@@ -293,13 +301,13 @@ export class DecryptionKeySafe {
       const local = await this.local();
       if (!local.recoveryKey) throw new StorageError("Set up the Decryption Key Safe and save its key before confirming");
       await this.configure(local.recoveryKey, options.signal);
-      const { key, defaultKeyId, backup } = await this.topology(true);
+      const { key, defaultKeyId, backup } = await this.topology(true, options.signal);
       if (!key && defaultKeyId) throw new StorageError("The existing Decryption Key Safe is incomplete; it will not be replaced");
       if (!key || !backup?.version) throw new StorageError("Decryption Key Safe setup is incomplete");
       this.active(options.signal);
       await this.save({ confirmed: true, keyId: key[0], backupVersion: backup.version });
       return { state: "ready" };
-    });
+    }, signal);
   }
   restore(recoveryKey: string, signal?: AbortSignal): Promise<{ imported: number; total: number; state: "ready" }> {
     const options = { signal };
@@ -308,7 +316,7 @@ export class DecryptionKeySafe {
       let privateKey: Uint8Array<ArrayBuffer>;
       try { privateKey = decodeRecoveryKey(recoveryKey); }
       catch (cause) { throw new StorageError("Invalid Decryption Key Safe key", { cause }); }
-      const { key, defaultKeyId, backup } = await this.topology(true);
+      const { key, defaultKeyId, backup } = await this.topology(true, options.signal);
       if (!key && defaultKeyId) throw new StorageError("The existing Decryption Key Safe is incomplete; it will not be replaced");
       if (!key || !(await this.client.secretStorage.checkKey(privateKey, key[1]))) {
         throw new StorageError("This key does not unlock the existing Decryption Key Safe");
@@ -334,11 +342,11 @@ export class DecryptionKeySafe {
         await this.startSync?.(options.signal);
         if (!(await this.signingReady())) throw new StorageError("This login's account signing setup is incomplete");
         this.active(options.signal);
-        const currentBackup = await this.serverBackup();
+        const currentBackup = await this.serverBackup(options.signal);
         if (!currentBackup?.version) throw new StorageError("Decryption Key Safe backup is unavailable");
         await this.save({ confirmed: true, keyId: key[0], backupVersion: currentBackup.version });
         return { imported: result.imported, total: result.total, state: "ready" };
       }, options.signal);
-    });
+    }, signal);
   }
 }

@@ -2231,6 +2231,7 @@ export class TeleCryptIOStorage {
             await verifyHistorySharing();
           }
           await this.refreshRoomState(tree.id, { signal: effectiveSignal });
+          if (await this.getRoomMembership(tree.id, member.userId, { signal: effectiveSignal }) === "ban") continue;
           if (childMember?.role !== member.role) {
             await withMatrixMutationAbort(() => tree.setPermissions(member.userId, member.role), effectiveSignal);
             await this.refreshRoomState(tree.id, { signal: effectiveSignal });

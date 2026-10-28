@@ -88,7 +88,7 @@ interface OperationDeadline {
   close: () => void;
 }
 
-type OperationKind = "read" | "mutation";
+type OperationKind = "read" | "mutation" | "settled-mutation";
 
 function createOperationDeadline(options?: OperationOptions): OperationDeadline {
   const timeoutMs = options?.timeoutMs;
@@ -124,6 +124,7 @@ async function raceOperationDeadline<T>(
   pending: Promise<T>,
   kind: OperationKind,
 ): Promise<T> {
+  if (kind === "settled-mutation") return pending;
   let onAbort: (() => void) | undefined;
   try {
     const abort = new Promise<never>((_, reject) => {
@@ -637,8 +638,8 @@ export async function createVault(
   name: string,
   options?: OperationOptions,
 ): Promise<VaultInfo> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     let tree: TreeSpace;
     try {
       tree = await withRateLimitRetry(() => storage.createTree(name, signal), signal);
@@ -659,8 +660,8 @@ export async function listVaults(
   storage: TeleCryptIOStorage,
   options?: OperationOptions,
 ): Promise<VaultInfo[]> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const trees = await storage.listTrees(signal);
     const topLevel = trees.filter((tree) => tree.isTopLevel);
     return Promise.all(
@@ -748,8 +749,8 @@ export async function joinVault(
   vaultId: string,
   options?: OperationOptions,
 ): Promise<JoinResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const joined = new Set<string>();
     const pending = [vaultId];
     try {
@@ -804,8 +805,8 @@ export async function listPendingInvites(
   storage: TeleCryptIOStorage,
   options?: OperationOptions,
 ): Promise<VaultInfo[]> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const client = storage.getClient();
     const rooms = client.getRooms();
     const invites: VaultInfo[] = [];
@@ -847,8 +848,8 @@ export async function declineInvite(
   vaultId: string,
   options?: OperationOptions,
 ): Promise<{ vaultId: string; declined: boolean }> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const client = storage.getClient();
     try {
       const room = client.getRoom(vaultId);
@@ -946,13 +947,13 @@ export async function shareVault(
   role: TreeRole,
   options?: OperationOptions,
 ): Promise<ShareResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   if (role !== "viewer" && role !== "editor" && role !== "owner") {
     throw new StorageError("invalid storage role");
   }
   const operation = createOperationDeadline(options);
   const completedRoomIds = new Set<string>();
   try {
+    await storage.keySafe.requireReady({ signal: operation.signal });
     ensureOperationActive(operation.signal);
     const tree = await resolveTree(storage, vaultId, operation.signal);
     const pending = withTreeMutation(storage.getClient(), async () => {
@@ -1059,10 +1060,10 @@ export async function unshareVault(
   userId: string,
   options?: OperationOptions,
 ): Promise<UnshareResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   const operation = createOperationDeadline(options);
   const completedRoomIds = new Set<string>();
   try {
+    await storage.keySafe.requireReady({ signal: operation.signal });
     ensureOperationActive(operation.signal);
     const tree = await resolveTree(storage, vaultId, operation.signal);
     const pending = withTreeMutation(storage.getClient(), async () => {
@@ -1158,8 +1159,8 @@ export async function listMembers(
   vaultId: string,
   options?: OperationOptions,
 ): Promise<Member[]> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, vaultId, signal);
     try {
       return await withRateLimitRetry(() => storage.listMembers(tree, { signal }), signal);
@@ -1175,8 +1176,8 @@ export async function listFiles(
   treeId: string,
   options?: OperationOptions,
 ): Promise<ListedFileInfo[]> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     try {
       await storage.refreshRoomState(treeId, { signal });
@@ -1361,8 +1362,8 @@ export async function getTreeActionCapabilities(
   treeId: string,
   options?: OperationOptions,
 ): Promise<TreeActionCapabilities> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     await storage.refreshRoomState(tree.id, { signal });
     const client = storage.getClient();
@@ -1404,8 +1405,8 @@ export async function getMemberActionCapabilities(
   targetUserIds: string[],
   options?: OperationOptions,
 ): Promise<Record<string, MemberActionCapabilities>> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, vaultId, signal);
     await storage.refreshRoomState(tree.id, { signal });
     const client = storage.getClient();
@@ -1447,8 +1448,8 @@ export async function listSubfolders(
   parentId: string,
   options?: OperationOptions,
 ): Promise<FolderInfo[]> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, parentId, signal);
     await storage.refreshRoomState(parentId, { signal });
     ensureOperationActive(signal);
@@ -1469,9 +1470,9 @@ export async function createSubfolder(
   name: string,
   options?: OperationOptions,
 ): Promise<FolderInfo> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   validateName(name, "name");
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, parentId, signal);
     let sub: TreeSpace;
     try {
@@ -1496,6 +1497,7 @@ async function renameTree(
 ): Promise<RenameResult> {
   validateName(name, "name");
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     let mutationAccepted = false;
     try {
@@ -1537,7 +1539,6 @@ export async function renameVault(
   name: string,
   options?: OperationOptions,
 ): Promise<RenameResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return renameTree(storage, vaultId, name, options);
 }
 
@@ -1548,7 +1549,6 @@ export async function renameFolder(
   name: string,
   options?: OperationOptions,
 ): Promise<RenameResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return renameTree(storage, folderId, name, options);
 }
 
@@ -1560,6 +1560,7 @@ async function deleteTree(
   const operation = createOperationDeadline(options);
   const client = storage.getClient();
   try {
+    await storage.keySafe.requireReady({ signal: operation.signal });
     ensureOperationActive(operation.signal);
     const pending = withTreeMutation(client, async () => {
       if (isTreeDeleted(client, treeId)) return { id: treeId, deleted: true };
@@ -1615,7 +1616,6 @@ export async function deleteVault(
   vaultId: string,
   options?: OperationOptions,
 ): Promise<DeleteResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return deleteTree(storage, vaultId, options);
 }
 
@@ -1625,7 +1625,6 @@ export async function deleteFolder(
   folderId: string,
   options?: OperationOptions,
 ): Promise<DeleteResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return deleteTree(storage, folderId, options);
 }
 
@@ -1636,15 +1635,15 @@ export async function renameFile(
   name: string,
   options?: OperationOptions,
 ): Promise<RenameResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   validateName(name, "file name");
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
     let mutationAccepted = false;
     try {
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => branch.setName(name), signal),
+        () => branch.setName(name),
         signal,
       );
       mutationAccepted = true;
@@ -1674,7 +1673,7 @@ export async function renameFile(
       throw new StorageError("rename file failed", { cause: error });
     }
     return { id: fileId, name };
-  }, "mutation");
+  }, "settled-mutation");
 }
 
 async function deleteFileMedia(
@@ -1706,8 +1705,8 @@ export async function deleteFile(
   fileId: string,
   options?: OperationOptions,
 ): Promise<DeleteResult> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     await storage.refreshRoomState(treeId, { signal });
     const state = await storage.getOriginalFileEventState(tree.id, fileId);
@@ -1803,10 +1802,10 @@ export async function uploadFile(
   mimetype: string,
   options?: OperationOptions,
 ): Promise<FileInfo> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   const deadline = createOperationDeadline(options);
   try {
     const signal = deadline.signal;
+    await storage.keySafe.requireReady({ signal });
     ensureOperationActive(signal);
     // Unlike a read, an upload must retain a receipt returned by an in-flight
     // mutation after cancellation. The uploader stops before another write
@@ -1861,8 +1860,8 @@ export async function cleanupFileUpload(
   fileId?: string,
   options?: OperationOptions,
 ): Promise<void> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     await storage.cleanupFileUpload(treeId, mediaId, fileId, { signal });
   }, "mutation");
 }
@@ -1873,8 +1872,8 @@ export async function downloadFile(
   fileId: string,
   options?: OperationOptions,
 ): Promise<DownloadedFile> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
     let result;
@@ -1905,8 +1904,8 @@ export async function getFileDetails(
   fileId: string,
   options?: OperationOptions,
 ): Promise<FileDetails> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
   return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     await resolveFile(storage, tree, fileId, signal);
     const name = await storage.getFileName(tree.id, fileId, { signal });
@@ -1971,8 +1970,10 @@ export async function getVaultDetails(
   vaultId: string,
   options?: OperationOptions,
 ): Promise<VaultDetails> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
-  return withOperationDeadline(options, (signal) => getTreeDetails(storage, vaultId, signal));
+  return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
+    return getTreeDetails(storage, vaultId, signal);
+  });
 }
 
 /** Returns details for a nested folder. */
@@ -1981,6 +1982,8 @@ export async function getFolderDetails(
   folderId: string,
   options?: OperationOptions,
 ): Promise<FolderDetails> {
-  await storage.keySafe.requireReady({ signal: options?.signal });
-  return withOperationDeadline(options, (signal) => getTreeDetails(storage, folderId, signal));
+  return withOperationDeadline(options, async (signal) => {
+    await storage.keySafe.requireReady({ signal });
+    return getTreeDetails(storage, folderId, signal);
+  });
 }
