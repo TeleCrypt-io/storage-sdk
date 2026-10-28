@@ -518,8 +518,8 @@ describe("Matrix device trust and Storage metadata authorship", () => {
       await core.unshareVault(owner.storage, tree.id, reader.user.userId);
       const serverMembership = await owner.storage.getRoomMembership(tree.id, reader.user.userId);
       const localMembership = ownerClient.getRoom(tree.id)?.getMember(reader.user.userId)?.membership;
-      expect(serverMembership).toBe("leave");
-      expect(localMembership).toBe("leave");
+      expect(serverMembership).toBe("ban");
+      expect(localMembership).toBe("ban");
 
       await retainedTree.setName("post-removal tree name");
       expect(await owner.storage.getTreeName(tree.id)).toBe("post-removal tree name");
