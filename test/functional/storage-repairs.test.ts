@@ -151,6 +151,45 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
+ it("settles an initial creation name without a pointer after cleanup failure and reload", async () => {
+   const creator = await storageUser("creation_no_pointer");
+   const client = creator.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   let roomId: string | undefined;
+   let pointerAttempts = 0;
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     if (args[1] === "io.telecrypt.storage.metadata") {
+       pointerAttempts++;
+       roomId = args[0];
+       failCleanupRoom = roomId;
+       throw new Error("controlled initial pointer failure");
+     }
+     return await sendState(...args);
+   });
+   let restored: TeleCryptIOStorage | undefined;
+   try {
+     blockedBackupToken = creator.user.accessToken;
+     const error = await core.createVault(creator.storage, "unlinked creation").then(() => null, (e: unknown) => e);
+     expect(error).toBeInstanceOf(MutationPartialError);
+     const target = (error as MutationPartialError).backupTargets[0]!;
+     expect(target).toMatchObject({ treeId: roomId, metadataEventId: expect.any(String) });
+     const raw = await client.fetchRoomEvent(target.treeId, target.metadataEventId!);
+     await expect(creator.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId, timeoutMs: 2000 })).rejects.toThrow();
+     blockedBackupToken = undefined;
+     expect(await creator.storage.waitForKeyBackup(target.treeId, undefined, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+     expect(pointerAttempts).toBe(1);
+     client.stopClient();
+     restored = await openStorage(await loginNewDevice(creator.user));
+     await restored.keySafe.restore(creator.recoveryKey);
+     expect((await decrypt(restored, raw)).body).toBe("unlinked creation");
+   } finally {
+     spy.mockRestore(); blockedBackupToken = undefined; failCleanupRoom = undefined;
+     if (roomId) {
+       const cleanupClient = restored?.getClient() ?? client;
+       await cleanupClient.leave(roomId); await cleanupClient.forget(roomId);
+     }
+   }
+ }, 120000);
  it.each(["failure", "success"])("retains a post-pointer creation receipt when cleanup is %s", async (cleanup) => {
    const client = owner.storage.getClient();
    const sendState = client.sendStateEvent.bind(client);

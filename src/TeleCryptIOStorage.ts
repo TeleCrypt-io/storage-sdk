@@ -1027,9 +1027,9 @@ export class TeleCryptIOStorage {
           if (options?.metadataEventId) {
             events.push(await this.readEncryptedMetadataMessage(treeId, options.metadataEventId, true, signal));
           }
-          if (fileId === undefined) {
+          if (fileId === undefined && !options?.metadataEventId) {
             events.push(await this.getTreeMetadataEvent(treeId));
-          } else {
+          } else if (fileId !== undefined) {
             // The attachment contains the file key; a later rename may use a
             // different session. Both must be recoverable.
             events.push(await this.getOriginalFileEvent(treeId, fileId));
