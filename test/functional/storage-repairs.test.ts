@@ -149,11 +149,11 @@ describe("SDK repair regressions", () => {
      const error = await core.renameVault(owner.storage, tree.id, "Accepted rename", { signal: controller.signal })
        .then(() => null, (failure: unknown) => failure);
      expect(error).toBeInstanceOf(MutationPartialError);
-     expect((error as MutationPartialError).backupTargets).toEqual([{ treeId: tree.id }]);
+     expect((error as MutationPartialError).backupTargets).toEqual([{ treeId: tree.id, metadataEventId: expect.any(String) }]);
      expect(await owner.storage.waitForKeyBackup(tree.id)).toBe("backed_up");
    } finally { spy.mockRestore(); }
  }, 120000);
- it.each(["metadata", "listing", "readback"])("bounds stalled rename %s requests", async (stage) => {
+ it.each(["metadata", "listing", "readback", "verification"])("bounds stalled rename %s requests", async (stage) => {
    const tree = await vault(`Rename deadline ${stage}`, []);
    const file = await upload(owner.storage, tree.id, "before.txt", "contents");
    const client = owner.storage.getClient();
@@ -165,11 +165,13 @@ describe("SDK repair regressions", () => {
      return result;
    });
    observedAbort = false;
+   let readsAfterListing = 0;
    stallRequest = (url, method) => stage === "metadata"
      ? method === "PUT" && url.includes("/send/m.room.encrypted/")
      : stage === "listing"
        ? method === "PUT" && url.includes("/state/") && url.includes(encodeURIComponent(file.id))
-       : listingAccepted && method === "GET" && url.includes(`/event/${encodeURIComponent(file.id)}`);
+       : listingAccepted && method === "GET" && url.includes(`/event/${encodeURIComponent(file.id)}`) &&
+         ++readsAfterListing >= (stage === "verification" ? 2 : 1);
    const started = Date.now();
    try {
      const error = await core.renameFile(owner.storage, tree.id, file.id, "after.txt", { timeoutMs: 1000 })

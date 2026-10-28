@@ -1505,9 +1505,10 @@ async function renameTree(
     await storage.keySafe.requireReady({ signal });
     const tree = await resolveTree(storage, treeId, signal);
     let mutationAccepted = false;
+    let metadataEventId: string | undefined;
     try {
       await withRateLimitRetry(
-        () => (tree.setName as (value: string, signal?: AbortSignal) => Promise<void>)(name, signal),
+        () => (tree.setName as (value: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void) => Promise<void>)(name, signal, (eventId) => { metadataEventId = eventId; }),
         signal,
       );
       mutationAccepted = true;
@@ -1527,7 +1528,7 @@ async function renameTree(
           "rename tree",
           [treeId],
           "the encrypted name write was accepted but could not be read back",
-          { cause: error, treeId, backupTargets: [{ treeId }] },
+          { cause: error, treeId, backupTargets: [{ treeId, ...(metadataEventId ? { metadataEventId } : {}) }] },
         );
       }
       if (signal.aborted) throw new StorageError("operation cancelled");
@@ -1646,9 +1647,10 @@ export async function renameFile(
     const tree = await resolveTree(storage, treeId, signal);
     const branch = await resolveFile(storage, tree, fileId, signal);
     let mutationAccepted = false;
+    let metadataEventId: string | undefined;
     try {
       await withRateLimitRetry(
-        () => (branch.setName as (value: string, signal?: AbortSignal) => Promise<void>)(name, signal),
+        () => (branch.setName as (value: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void) => Promise<void>)(name, signal, (eventId) => { metadataEventId = eventId; }),
         signal,
       );
       mutationAccepted = true;
@@ -1671,7 +1673,7 @@ export async function renameFile(
           "rename file",
           [fileId],
           "the encrypted name write was accepted but could not be read back",
-          { cause: error, treeId, backupTargets: [{ treeId, fileId }] },
+          { cause: error, treeId, backupTargets: [{ treeId, fileId, ...(metadataEventId ? { metadataEventId } : {}) }] },
         );
       }
       if (error instanceof StorageError && error.message === "file was deleted while renaming; the rename was removed") throw error;

@@ -882,12 +882,13 @@ export class TeleCryptIOStorage {
     return event;
   }
 
-  private async writeTreeName(roomId: string, name: string, signal?: AbortSignal): Promise<void> {
+  private async writeTreeName(roomId: string, name: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void): Promise<void> {
     validateName(name, "name");
     const metadataEventId = await this.sendEncryptedMetadataMessage(roomId, {
       msgtype: STORAGE_METADATA_MSGTYPE,
       body: name,
     }, signal);
+    onMetadata?.(metadataEventId);
     try {
       await this.client.sendStateEvent(
         roomId,
@@ -918,7 +919,7 @@ export class TeleCryptIOStorage {
       throw new StorageError("encrypted storage name is unavailable");
     }
     const metadataEventId = validateMatrixEventId(pointerContent.event_id, "storage metadata event ID");
-    const event = await this.readEncryptedMetadataMessage(roomId, metadataEventId);
+    const event = await this.readEncryptedMetadataMessage(roomId, metadataEventId, false, matrixRequestSignal(options));
     if (event.getSender() !== pointer.getSender()) {
       throw new StorageError("encrypted storage name author does not match its pointer");
     }
@@ -985,7 +986,7 @@ export class TeleCryptIOStorage {
             events.push(await this.readEncryptedMetadataMessage(treeId, options.metadataEventId, true, signal));
           }
           if (fileId === undefined) {
-            events.push(await this.getTreeMetadataEvent(treeId, { signal }));
+            events.push(await this.getTreeMetadataEvent(treeId));
           } else {
             // The attachment contains the file key; a later rename may use a
             // different session. Both must be recoverable.
@@ -1044,7 +1045,7 @@ export class TeleCryptIOStorage {
     return deleted ? "deleted" : "backed_up";
   }
 
-  private async writeFileName(treeId: string, fileId: string, name: string, signal?: AbortSignal): Promise<void> {
+  private async writeFileName(treeId: string, fileId: string, name: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void): Promise<void> {
     validateName(name, "file name");
     validateMatrixEventId(fileId, "file event ID");
     await this.refreshRoomState(treeId, { signal });
@@ -1071,6 +1072,7 @@ export class TeleCryptIOStorage {
       body: name,
       file_event_id: fileId,
     }, signal);
+    onMetadata?.(metadataEventId);
     let listingEventId: string | undefined;
     try {
       if (signal?.aborted) throw new StorageError("operation cancelled");
@@ -1107,7 +1109,7 @@ export class TeleCryptIOStorage {
   ): Promise<string> {
     if (options?.signal?.aborted) throw new StorageError("operation cancelled");
     if (options?.refreshState !== false) await this.refreshRoomState(treeId, options);
-    if ((await this.getOriginalFileEventState(treeId, fileId)).redacted) {
+    if ((await this.getOriginalFileEventStateWithSignal(treeId, fileId, matrixRequestSignal(options))).redacted) {
       throw new StorageError("file not found");
     }
     const tree = this.getTree(treeId);
@@ -1130,7 +1132,7 @@ export class TeleCryptIOStorage {
     );
     let event: MatrixEvent;
     try {
-      event = await this.readEncryptedMetadataMessage(treeId, metadataEventId);
+      event = await this.readEncryptedMetadataMessage(treeId, metadataEventId, false, matrixRequestSignal(options));
     } catch (error) {
       // File IDs remain listable on a fresh device while its room keys are
       // being restored. The caller can resolve the private name on retry.
@@ -1245,7 +1247,20 @@ export class TeleCryptIOStorage {
     treeId: string,
     fileId: string,
   ): Promise<{ ownerUserId: string; redacted: boolean; canRedact: boolean }> {
-    const rawEvent = await this.client.fetchRoomEvent(treeId, fileId);
+    return this.getOriginalFileEventStateWithSignal(treeId, fileId);
+  }
+
+  private async getOriginalFileEventStateWithSignal(
+    treeId: string,
+    fileId: string,
+    signal?: AbortSignal,
+  ): Promise<{ ownerUserId: string; redacted: boolean; canRedact: boolean }> {
+    const rawEvent = signal
+      ? await requireMatrixHttpTransport(this.client).authedRequest<Awaited<ReturnType<MatrixClient["fetchRoomEvent"]>>>(
+        Method.Get, `/rooms/${encodeURIComponent(treeId)}/event/${encodeURIComponent(fileId)}`,
+        undefined, undefined, { prefix: ClientPrefix.V3, abortSignal: signal },
+      )
+      : await this.client.fetchRoomEvent(treeId, fileId);
     const event = this.client.getEventMapper()(rawEvent);
     const ownerUserId = event.getSender();
     if (
@@ -1891,7 +1906,7 @@ export class TeleCryptIOStorage {
       };
     }
     tree.createDirectory = (name: string) => this.createSubtree(tree, name);
-    tree.setName = (name: string, signal?: AbortSignal) => this.writeTreeName(tree.id, name, signal);
+    tree.setName = (name: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void) => this.writeTreeName(tree.id, name, signal, onMetadata);
     tree.listFiles = () => originalListFiles().map((branch) => this.decorateFileBranch(tree.id, branch));
     tree.getFile = (fileId: string) => {
       const branch = originalGetFile(fileId);
@@ -1912,7 +1927,7 @@ export class TeleCryptIOStorage {
         value: () => this.fileNames.get(nameKey) ?? GENERIC_FILE_NAME,
       },
       setName: {
-        value: (name: string, signal?: AbortSignal) => this.writeFileName(treeId, branch.id, name, signal),
+        value: (name: string, signal?: AbortSignal, onMetadata?: (eventId: string) => void) => this.writeFileName(treeId, branch.id, name, signal, onMetadata),
       },
       delete: {
         value: async () => {
