@@ -40,12 +40,21 @@ async function waitForTreeName(
   }, { label, timeoutMs: 15000 });
 }
 
+function selectCreationVersion(roomVersion: string, onRequest?: (options: Record<string, unknown>) => void) {
+  const originalFetch = globalThis.fetch.bind(globalThis);
+  return vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith("/_matrix/client/v3/createRoom") && init?.method === "POST" && typeof init.body === "string") {
+      const options = JSON.parse(init.body) as Record<string, unknown>;
+      onRequest?.(options);
+      return originalFetch(input, { ...init, body: JSON.stringify({ ...options, room_version: roomVersion }) });
+    }
+    return originalFetch(input, init);
+  });
+}
+
 async function createImplicitCreatorTree(storage: TeleCryptIOStorage, name: string) {
-  const client = storage.getClient();
-  const createRoom = client.createRoom.bind(client);
-  const versionSelection = vi.spyOn(client, "createRoom").mockImplementation((options) =>
-    createRoom({ ...options, room_version: "12" }),
-  );
+  const versionSelection = selectCreationVersion("12");
   try {
     const vault = await core.createVault(storage, name);
     return await waitFor(
@@ -89,16 +98,10 @@ describe("sharing", () => {
     try {
       const aliceStore = await readyStorage(alice);
       const bobStore = await readyStorage(bob);
-      const createRoom = alice.createRoom.bind(alice);
-      let selectedRoomVersion: string | undefined;
-      creationSpy = vi.spyOn(alice, "createRoom").mockImplementation((options) => {
-        const request = { ...options, room_version: roomVersion };
-        selectedRoomVersion = request.room_version;
-        return createRoom(request);
-      });
+      let requestedOptions: Record<string, unknown> | undefined;
+      creationSpy = selectCreationVersion(roomVersion, (options) => { requestedOptions = options; });
       const vault = await core.createVault(aliceStore, `Fresh v${roomVersion} encrypted name`);
-      const requestedOptions = creationSpy.mock.calls[0]?.[0];
-      expect(selectedRoomVersion).toBe(roomVersion);
+      expect(requestedOptions).toBeDefined();
       expect(requestedOptions?.room_version).toBeUndefined();
       expect(requestedOptions?.power_level_content_override).not.toHaveProperty("users");
       creationSpy.mockRestore();
