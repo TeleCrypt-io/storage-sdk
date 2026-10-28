@@ -317,6 +317,7 @@ interface MatrixHttpTransport {
 }
 
 const metadataRequestSignals = new WeakMap<MatrixClient, Map<string, AbortSignal>>();
+const metadataSchedulers = new WeakMap<NonNullable<MatrixClient["scheduler"]>, Map<string, AbortSignal>>();
 
 /** Matrix's encrypted send API accepts a transaction ID but no request signal.
  * Attach the caller's signal only to that native transaction's HTTP request. */
@@ -331,12 +332,40 @@ function registerMetadataRequest(client: MatrixClient, transactionId: string, si
       const key = path.split("/").at(-1);
       const requestSignal = key ? registered.get(decodeURIComponent(key)) : undefined;
       return original(method, path, query, body,
-        requestSignal ? { ...options, abortSignal: requestSignal } : options);
+        requestSignal ? { ...options, abortSignal: requestSignal, localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS } : options);
     };
     metadataRequestSignals.set(client, signals);
   }
+  const scheduler = client.scheduler;
+  let queuedSignals = scheduler && metadataSchedulers.get(scheduler);
+  if (scheduler && !queuedSignals) {
+    queuedSignals = new Map();
+    const registered = queuedSignals;
+    const queueEvent = scheduler.queueEvent.bind(scheduler);
+    scheduler.queueEvent = (event) => {
+      const pending = queueEvent(event);
+      const transaction = event.getTxnId();
+      const requestSignal = transaction ? registered.get(transaction) : undefined;
+      if (!pending || !requestSignal) return pending;
+      return new Promise((resolve, reject) => {
+        const abort = () => {
+          const queue = scheduler.getQueueForEvent(event);
+          if (queue && queue.findIndex((candidate) => candidate.getId() === event.getId()) > 0 &&
+              scheduler.removeEventFromQueue(event)) {
+            requestSignal.removeEventListener("abort", abort);
+            reject(new StorageError("operation cancelled"));
+          }
+        };
+        requestSignal.addEventListener("abort", abort, { once: true });
+        if (requestSignal.aborted) queueMicrotask(abort);
+        pending.then(resolve, reject).finally(() => requestSignal.removeEventListener("abort", abort));
+      });
+    };
+    metadataSchedulers.set(scheduler, queuedSignals);
+  }
   signals.set(transactionId, signal);
-  return () => signals.delete(transactionId);
+  queuedSignals?.set(transactionId, signal);
+  return () => { signals.delete(transactionId); queuedSignals?.delete(transactionId); };
 }
 
 function matrixRequestTimeout(options?: MatrixRequestOptions): number | undefined {
@@ -826,13 +855,18 @@ export class TeleCryptIOStorage {
       unregister?.();
       throw error;
     }
-    void pending.finally(() => unregister?.()).catch(() => undefined);
-    const response = signal ? await new Promise<Awaited<typeof pending>>((resolve, reject) => {
-      const abort = () => reject(new MutationOutcomeUnknownError("encrypted metadata write"));
-      signal.addEventListener("abort", abort, { once: true });
-      if (signal.aborted) abort();
-      pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-    }) : await pending;
+    let response: Awaited<typeof pending>;
+    try {
+      // Native encryption and the scheduler can still be working after abort.
+      // Keep the transaction registered and wait for that exact send to settle;
+      // a late successful response is an acknowledgement that must survive.
+      response = await pending;
+    } catch (error) {
+      if (signal?.aborted) throw new MutationOutcomeUnknownError("encrypted metadata write", { cause: error });
+      throw error;
+    } finally {
+      unregister?.();
+    }
     return validateMatrixEventId(
       (response as unknown as { event_id?: unknown } | undefined)?.event_id,
       "storage metadata response event ID",

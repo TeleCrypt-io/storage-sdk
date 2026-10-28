@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { MatrixEvent } from "matrix-js-sdk";
+import { MatrixScheduler } from "matrix-js-sdk/lib/scheduler.js";
 import { writeFile } from "node:fs/promises";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
 import * as core from "../../src/core/operations.js";
@@ -22,6 +23,9 @@ let syncGate = Promise.resolve();
 let failEventId: string | undefined;
 let stallRequest: ((url: string, method: string) => boolean) | undefined;
 let observedAbort = false;
+let holdRequest: ((url: string) => Promise<void> | undefined) | undefined;
+let blockedBackupToken: string | undefined;
+afterEach(() => { blockedBackupToken = undefined; failEventId = undefined; });
 
 async function openStorage(user: Awaited<ReturnType<typeof registerTestUser>>) {
   const storage = await TeleCryptIOStorage.create({
@@ -95,6 +99,13 @@ async function decrypt(storage: TeleCryptIOStorage, raw: object) {
 beforeAll(async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    await holdRequest?.(url);
+    const requestHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    if (blockedBackupToken && requestHeaders.get("authorization") === `Bearer ${blockedBackupToken}` &&
+        (init?.method ?? "GET") === "PUT" && url.includes("/room_keys/keys")) {
+      return new Response(JSON.stringify({ errcode: "M_UNKNOWN", error: "controlled backup outage" }),
+        { status: 503, headers: { "content-type": "application/json" } });
+    }
     if (failEventId && url.includes(`/event/${encodeURIComponent(failEventId)}`)) throw new Error("audit post-commit readback outage");
     if (stallRequest?.(url, init?.method ?? "GET")) {
       return await new Promise<Response>((_resolve, reject) => {
@@ -135,6 +146,162 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
+ it("backs up the first exact rename session after another device replaces the pointer", async () => {
+   const tree = await vault("Concurrent rename sessions", []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const secondUser = await loginNewDevice(owner.user);
+   const second = await openStorage(secondUser);
+   await second.keySafe.restore(owner.recoveryKey);
+   const client = second.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     const result = await sendState(...args);
+     if (args[0] === tree.id && args[3] === file.id) failEventId = file.id;
+     return result;
+   });
+   blockedBackupToken = secondUser.accessToken;
+   let firstError: unknown;
+   try {
+     firstError = await core.renameFile(second, tree.id, file.id, "first-rename.txt").then(() => null, (error: unknown) => error);
+   } finally { spy.mockRestore(); failEventId = undefined; }
+   if (!(firstError instanceof MutationPartialError)) throw firstError ?? new Error("rename unexpectedly succeeded");
+   const target = (firstError as MutationPartialError).backupTargets[0]!;
+   expect(target.metadataEventId).toBeTruthy();
+   const firstRaw = await client.fetchRoomEvent(tree.id, target.metadataEventId!);
+   const firstSession = firstRaw.content.session_id as string;
+   const headers = { Authorization: `Bearer ${secondUser.accessToken}` };
+   const versionResponse = await nativeFetch(`http://localhost:8008/_matrix/client/v3/room_keys/version`, { headers });
+   const version = (await versionResponse.json() as { version: string }).version;
+   const backupUrl = `http://localhost:8008/_matrix/client/v3/room_keys/keys/${encodeURIComponent(tree.id)}/${encodeURIComponent(firstSession)}?version=${encodeURIComponent(version)}`;
+   expect((await nativeFetch(backupUrl, { headers })).status).toBe(404);
+   await core.renameFile(owner.storage, tree.id, file.id, "second-rename.txt");
+   const secondId = await owner.storage.getFileMetadataEventId(tree.id, file.id);
+   const secondRaw = await owner.storage.getClient().fetchRoomEvent(tree.id, secondId!);
+   expect(secondRaw.content.session_id).not.toBe(firstSession);
+   blockedBackupToken = undefined;
+   expect(await second.waitForKeyBackup(tree.id, file.id, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+   expect((await nativeFetch(backupUrl, { headers })).status).toBe(200);
+   client.stopClient();
+   const reloaded = await openStorage(await loginNewDevice(owner.user));
+   await reloaded.keySafe.restore(owner.recoveryKey);
+   expect((await decrypt(reloaded, firstRaw)).body).toBe("first-rename.txt");
+ }, 120000);
+ it("settles a cancelled native queued send without cancelling the unrelated send ahead of it", async () => {
+   const tree = await vault("Queued cancellation", []);
+   const other = await vault("Queue predecessor", []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const client = owner.storage.getClient();
+   const internal = client as unknown as { scheduler?: MatrixScheduler; sendEventHttpRequest: (event: MatrixEvent) => Promise<{ event_id: string }> };
+   const previous = internal.scheduler;
+   const scheduler = new MatrixScheduler(() => -1);
+   const queueEvent = scheduler.queueEvent.bind(scheduler);
+   let queueCount = 0;
+   vi.spyOn(scheduler, "queueEvent").mockImplementation((event) => {
+     const result = queueEvent(event);
+     queueCount++;
+     return result;
+   });
+   scheduler.setProcessFunction(async (event) => {
+     const result = await internal.sendEventHttpRequest(event);
+     client.getRoom(event.getRoomId()!)?.updatePendingEvent(event, "sent" as never, result.event_id);
+     return result;
+   });
+   internal.scheduler = scheduler;
+   let release!: () => void;
+   let reached!: () => void;
+   const gate = new Promise<void>((resolve) => { release = resolve; });
+   const ready = new Promise<void>((resolve) => { reached = resolve; });
+   const txn = client.makeTxnId();
+   holdRequest = (url) => url.endsWith(`/${encodeURIComponent(txn)}`) ? (reached(), gate) : undefined;
+   let firstSettled = false;
+   const first = client.sendMessage(other.id, { msgtype: "m.text", body: "unrelated queue predecessor" } as never, txn)
+     .finally(() => { firstSettled = true; });
+   const controller = new AbortController();
+   let settled = false;
+   let pending: Promise<unknown> | undefined;
+   try {
+     await ready;
+     pending = core.renameFile(owner.storage, tree.id, file.id, "queued-name.txt", { signal: controller.signal })
+       .then(() => null, (error: unknown) => error).finally(() => { settled = true; });
+     await waitFor(() => queueCount >= 2, { label: "rename waits in native send queue", timeoutMs: 15000 });
+     controller.abort();
+     expect(await pending).toBeInstanceOf(MutationOutcomeUnknownError);
+     expect(settled).toBe(true);
+     expect(firstSettled).toBe(false);
+     release();
+     expect((await first).event_id).toBeTruthy();
+     expect(await owner.storage.getFileName(tree.id, file.id)).toBe("before.txt");
+   } finally {
+     release();
+     holdRequest = undefined;
+     controller.abort();
+     if (pending) await pending;
+     internal.scheduler = previous;
+   }
+ }, 120000);
+ it("waits for native encryption after cancellation without aborting an unrelated send", async () => {
+   const tree = await vault("Encryption cancellation", []);
+   const other = await vault("Unrelated send", []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const client = owner.storage.getClient();
+   const backend = (client as unknown as { cryptoBackend: { encryptEvent: (event: MatrixEvent, room: unknown) => Promise<void> } }).cryptoBackend;
+   const encrypt = backend.encryptEvent.bind(backend);
+   let release!: () => void;
+   let reached!: () => void;
+   const gate = new Promise<void>((resolve) => { release = resolve; });
+   const ready = new Promise<void>((resolve) => { reached = resolve; });
+   const spy = vi.spyOn(backend, "encryptEvent").mockImplementation(async (event, room) => {
+     if (event.getContent().body === "encryption-gated.txt") { reached(); await gate; }
+     await encrypt(event, room);
+   });
+   const controller = new AbortController();
+   let settled = false;
+   const pending = core.renameFile(owner.storage, tree.id, file.id, "encryption-gated.txt", { signal: controller.signal })
+     .then(() => null, (error: unknown) => error).finally(() => { settled = true; });
+   try {
+     await ready;
+     controller.abort();
+     await new Promise((resolve) => setTimeout(resolve, 100));
+     expect(settled).toBe(false);
+     const unrelated = await core.uploadFile(owner.storage, other.id, "unrelated.txt", new TextEncoder().encode("unrelated"), "text/plain");
+     files.push({ storage: owner.storage, room: other.id, id: unrelated.id });
+     release();
+     expect(await pending).toBeInstanceOf(MutationOutcomeUnknownError);
+     expect(await owner.storage.getFileName(tree.id, file.id)).toBe("before.txt");
+   } finally { release(); spy.mockRestore(); }
+ }, 120000);
+
+ it("keeps a late native acknowledgement after cancellation", async () => {
+   const tree = await vault("Late acknowledgement", []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const client = owner.storage.getClient();
+   const send = client.sendMessage.bind(client);
+   let release!: () => void;
+   let acknowledged!: () => void;
+   const gate = new Promise<void>((resolve) => { release = resolve; });
+   const ready = new Promise<void>((resolve) => { acknowledged = resolve; });
+   const spy = vi.spyOn(client, "sendMessage").mockImplementation(async (...args) => {
+     const result = await send(...args);
+     if (typeof args[1] === "object" && args[1]?.body === "late-ack.txt") { acknowledged(); await gate; }
+     return result;
+   });
+   const controller = new AbortController();
+   let settled = false;
+   const pending = core.renameFile(owner.storage, tree.id, file.id, "late-ack.txt", { signal: controller.signal })
+     .then(() => null, (error: unknown) => error).finally(() => { settled = true; });
+   try {
+     await ready;
+     controller.abort();
+     await new Promise((resolve) => setTimeout(resolve, 100));
+     expect(settled).toBe(false);
+     release();
+     const error = await pending;
+     expect(error).toBeInstanceOf(MutationPartialError);
+     const target = (error as MutationPartialError).backupTargets[0]!;
+     expect(target.metadataEventId).toBeTruthy();
+     expect(await owner.storage.waitForKeyBackup(tree.id, file.id, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+   } finally { release(); spy.mockRestore(); }
+ }, 120000);
  it("retains a tree rename receipt after cancellation following its pointer acknowledgement", async () => {
    const tree = await vault("Before cancelled rename", []);
    const controller = new AbortController();
