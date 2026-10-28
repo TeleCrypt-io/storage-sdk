@@ -1013,6 +1013,7 @@ export class TeleCryptIOStorage {
       body: name,
       file_event_id: fileId,
     });
+    try {
     const listing = await this.client.sendStateEvent(
       treeId,
       UNSTABLE_MSC3089_BRANCH.name,
@@ -1028,6 +1029,12 @@ export class TeleCryptIOStorage {
       throw new StorageError("file was deleted while renaming; the rename was removed");
     }
     this.fileNames.set(this.fileNameKey(treeId, fileId), name);
+    } catch (error) {
+      if (error instanceof StorageError && error.message === "file was deleted while renaming; the rename was removed") throw error;
+      throw new MutationPartialError("rename file", [metadataEventId],
+        "the encrypted name was accepted but the rename could not be completed or verified",
+        { cause: error, treeId, backupTargets: [{ treeId, fileId }] });
+    }
   }
 
   /** Resolves an encrypted file name from the MSC3089 index pointer. */
@@ -1212,6 +1219,8 @@ export class TeleCryptIOStorage {
         throw new StorageError("encrypted media upload returned no content URI");
       }
       mediaId = uploaded.content_uri;
+      if (signal?.aborted) throw new StorageError("operation cancelled");
+      await this.refreshRoomState(treeId, { signal });
       if (signal?.aborted) throw new StorageError("operation cancelled");
       const fileContent: Record<string, unknown> = {
         ...additionalContent,
@@ -1503,14 +1512,12 @@ export class TeleCryptIOStorage {
       // stopClient is idempotent in matrix-js-sdk and is also required after
       // init/timeout failures: crypto startup can have installed listeners or
       // a sync task before the awaited operation rejects.
-      if (!storage) {
-        try {
-          client.stopClient();
-        } catch (cleanupError) {
-          throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
-            cause: error,
-          });
-        }
+      try {
+        client.stopClient();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "storage bootstrap and client cleanup failed", {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -2216,6 +2223,7 @@ export class TeleCryptIOStorage {
         const childByUser = new Map(childMembers.map((member) => [member.userId, member]));
         for (const member of desired.values()) {
           if (effectiveSignal?.aborted) throw new StorageError("operation cancelled");
+          if (await this.getRoomMembership(tree.id, member.userId, { signal: effectiveSignal }) === "ban") continue;
           const childMember = childByUser.get(member.userId);
           if (!childMember || (childMember.membership !== "join" && childMember.membership !== "invite")) {
             const verifyHistorySharing = await prepareReaderHistorySharing(this.client, member.userId);
@@ -2258,7 +2266,6 @@ export class TeleCryptIOStorage {
         }
       };
       try {
-        await reconcileInheritedAccess();
         await reconcileInheritedAccess();
       } catch (error) {
         throw new MutationPartialError(

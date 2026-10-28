@@ -620,10 +620,6 @@ function removeRoomFromLocalStore(client: MatrixClient, roomId: string): void {
   client.store?.removeRoom(roomId);
 }
 
-function isRevocableMembership(membership: string | null): boolean {
-  return membership === "join" || membership === "invite" || membership === "knock";
-}
-
 function safePartialDetail(error: unknown): string | undefined {
   // Provider/Matrix errors can contain response bodies, URLs, or credentials.
   // StorageError messages are authored by this package; retain those local
@@ -977,9 +973,17 @@ export async function shareVault(
             operation.signal,
           );
           let memberRole = members.find((candidate) => candidate.userId === userId)?.role;
-          const membership = await storage.getRoomMembership(space.id, userId, {
+          let membership = await storage.getRoomMembership(space.id, userId, {
             signal: operation.signal,
           });
+          if (membership === "ban") {
+            await withRateLimitRetry(
+              () => withMatrixMutationAbort(() => client.unban(space.id, userId), operation.signal),
+              operation.signal,
+            );
+            completedRoomIds.add(space.id);
+            membership = await storage.getRoomMembership(space.id, userId, { signal: operation.signal });
+          }
           if (membership !== "join") {
             // Only new or pending memberships run Matrix's native history-share
             // path. Updating a joined member's role does not reinvite them.
@@ -1078,12 +1082,12 @@ export async function unshareVault(
             if (isGoneError(error)) return;
             throw error;
           }
-          if (!isRevocableMembership(membership)) return;
+          if (membership === "ban") return;
           try {
             await withRateLimitRetry(
               () =>
                 withMatrixMutationAbort(
-                  () => storage.getClient().kick(space.id, userId, "unshared"),
+                  () => storage.getClient().ban(space.id, userId, "unshared"),
                   operation.signal,
                 ),
               operation.signal,
@@ -1091,7 +1095,7 @@ export async function unshareVault(
             const afterKick = await storage.getRoomMembership(space.id, userId, {
               signal: operation.signal,
             });
-            if (isRevocableMembership(afterKick)) {
+            if (afterKick !== "ban") {
               throw new StorageError("room membership removal could not be verified");
             }
             completedRoomIds.add(space.id);
@@ -1101,7 +1105,7 @@ export async function unshareVault(
               const afterForbidden = await storage.getRoomMembership(space.id, userId, {
                 signal: operation.signal,
               });
-              if (!isRevocableMembership(afterForbidden)) return;
+              if (afterForbidden === "ban") return;
             }
             throw error;
           }
@@ -1109,12 +1113,17 @@ export async function unshareVault(
         // Revoke the root first. A concurrently created child linked after
         // this point will observe the changed parent membership; children
         // already linked are collected only after the root revoke is visible.
-        await revokeFromSpace(tree);
-        await storage.refreshRoomState(tree.id, { signal: operation.signal });
-        const spaces = await refreshTreeSpaces(storage, tree, operation.signal);
-        for (const space of spaces) {
-          if (space.id === tree.id) continue;
+        const pendingSpaces = [tree];
+        const seen = new Set<string>();
+        while (pendingSpaces.length) {
+          const space = pendingSpaces.pop()!;
+          if (seen.has(space.id)) continue;
+          seen.add(space.id);
           await revokeFromSpace(space);
+          await storage.refreshRoomState(space.id, { signal: operation.signal });
+          const refreshed = storage.getTree(space.id);
+          if (!refreshed) throw new StorageError("storage space lookup failed");
+          pendingSpaces.push(...await activeTreeDirectories(storage, refreshed, operation.signal));
         }
       } catch (error) {
         if (error instanceof MutationOutcomeUnknownError) throw error;
@@ -1291,6 +1300,21 @@ function mayKickMember(
   );
 }
 
+function mayBanMember(
+  room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
+  client: MatrixClient,
+  targetUserId: string,
+): boolean {
+  const actorId = client.getUserId();
+  if (!actorId || actorId === targetUserId) return false;
+  const state = room.currentState;
+  const actor = state.getMember(actorId);
+  const target = state.getMember(targetUserId);
+  const targetPower = target?.powerLevel ?? configuredUserPower(powerLevelContent(room), targetUserId);
+  return Boolean(actor?.membership === "join" && actor.powerLevel > targetPower &&
+    state.hasSufficientPowerLevelFor("ban", actor.powerLevel));
+}
+
 function mayDeleteTreeRoom(
   client: MatrixClient,
   room: NonNullable<ReturnType<MatrixClient["getRoom"]>>,
@@ -1394,7 +1418,7 @@ export async function getMemberActionCapabilities(
       const joined = member?.membership === "join";
       const canInvite = Boolean(room && userId && userId !== targetUserId && (
         joined || mayInviteMember(room, client, room.currentState.getMember(userId)?.powerLevel ?? -Infinity)
-      ));
+      ) && (member?.membership !== "ban" || mayBanMember(room, client, targetUserId)));
       const canChangeRole = Object.fromEntries(roles.map((role) => [
         role,
         Boolean(room && mayAssignTreeRole(room, client, targetUserId, role)),
@@ -1410,7 +1434,7 @@ export async function getMemberActionCapabilities(
       result[targetUserId] = {
         canShare: roleForShare,
         canChangeRole,
-        canUnshare: Boolean(room && mayKickMember(room, client, targetUserId)),
+        canUnshare: Boolean(room && (member?.membership === "ban" || mayBanMember(room, client, targetUserId))),
       };
     }
     return result;
@@ -1490,8 +1514,7 @@ async function renameTree(
         { timeoutMs: 15000, signal },
       );
     } catch (error) {
-      if (error instanceof MutationOutcomeUnknownError) throw error;
-      if (signal.aborted) throw new StorageError("operation cancelled");
+      if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
       if (mutationAccepted) {
         throw new MutationPartialError(
           "rename tree",
@@ -1500,6 +1523,7 @@ async function renameTree(
           { cause: error, treeId, backupTargets: [{ treeId }] },
         );
       }
+      if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("rename failed", { cause: error });
     }
     return { id: treeId, name };
@@ -1637,8 +1661,7 @@ export async function renameFile(
         { timeoutMs: 15000, signal },
       );
     } catch (error) {
-      if (error instanceof MutationOutcomeUnknownError) throw error;
-      if (signal.aborted) throw new StorageError("operation cancelled");
+      if (error instanceof MutationOutcomeUnknownError || error instanceof MutationPartialError) throw error;
       if (mutationAccepted) {
         throw new MutationPartialError(
           "rename file",
@@ -1647,6 +1670,7 @@ export async function renameFile(
           { cause: error, treeId, backupTargets: [{ treeId, fileId }] },
         );
       }
+      if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("rename file failed", { cause: error });
     }
     return { id: fileId, name };
