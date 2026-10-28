@@ -298,6 +298,7 @@ export function boundedMatrixFetch(fetchFn: typeof fetch): typeof fetch {
 
 export interface MatrixRequestOptions {
   signal?: AbortSignal;
+  metadataEventId?: string;
   timeoutMs?: number;
   /** Matrix SDK transport deadline, when making a direct authenticated request. */
   localTimeoutMs?: number;
@@ -309,10 +310,33 @@ interface MatrixHttpTransport {
   authedRequest: <T>(
     method: Method,
     path: string,
-    query?: undefined,
-    body?: undefined,
+    query?: unknown,
+    body?: unknown,
     options?: MatrixRequestOptions & { prefix?: string },
   ) => Promise<T>;
+}
+
+const metadataRequestSignals = new WeakMap<MatrixClient, Map<string, AbortSignal>>();
+
+/** Matrix's encrypted send API accepts a transaction ID but no request signal.
+ * Attach the caller's signal only to that native transaction's HTTP request. */
+function registerMetadataRequest(client: MatrixClient, transactionId: string, signal: AbortSignal): () => void {
+  let signals = metadataRequestSignals.get(client);
+  if (!signals) {
+    signals = new Map();
+    const transport = requireMatrixHttpTransport(client);
+    const original = transport.authedRequest.bind(transport);
+    const registered = signals;
+    transport.authedRequest = (method, path, query, body, options) => {
+      const key = path.split("/").at(-1);
+      const requestSignal = key ? registered.get(decodeURIComponent(key)) : undefined;
+      return original(method, path, query, body,
+        requestSignal ? { ...options, abortSignal: requestSignal } : options);
+    };
+    metadataRequestSignals.set(client, signals);
+  }
+  signals.set(transactionId, signal);
+  return () => signals.delete(transactionId);
 }
 
 function matrixRequestTimeout(options?: MatrixRequestOptions): number | undefined {
@@ -788,10 +812,21 @@ export class TeleCryptIOStorage {
   private async sendEncryptedMetadataMessage(
     roomId: string,
     content: MetadataEventContent,
+    signal?: AbortSignal,
   ): Promise<string> {
-    await this.refreshRoomState(roomId);
+    await this.refreshRoomState(roomId, { signal });
     this.requireEncryptedStorageRoom(roomId);
-    const response = await this.client.sendMessage(roomId, content as never);
+    if (signal?.aborted) throw new StorageError("operation cancelled");
+    const transactionId = signal ? this.client.makeTxnId() : undefined;
+    const unregister = signal && transactionId ? registerMetadataRequest(this.client, transactionId, signal) : undefined;
+    const pending = this.client.sendMessage(roomId, content as never, transactionId);
+    void pending.finally(() => unregister?.()).catch(() => undefined);
+    const response = signal ? await new Promise<Awaited<typeof pending>>((resolve, reject) => {
+      const abort = () => reject(new MutationOutcomeUnknownError("encrypted metadata write"));
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    }) : await pending;
     return validateMatrixEventId(
       (response as unknown as { event_id?: unknown } | undefined)?.event_id,
       "storage metadata response event ID",
@@ -808,8 +843,14 @@ export class TeleCryptIOStorage {
     roomId: string,
     eventId: string,
     allowRedacted = false,
+    signal?: AbortSignal,
   ): Promise<MatrixEvent> {
-    const rawEvent = await this.client.fetchRoomEvent(roomId, eventId);
+    const rawEvent = signal
+      ? await requireMatrixHttpTransport(this.client).authedRequest<Awaited<ReturnType<MatrixClient["fetchRoomEvent"]>>>(
+        Method.Get, `/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`,
+        undefined, undefined, { prefix: ClientPrefix.V3, abortSignal: signal },
+      )
+      : await this.client.fetchRoomEvent(roomId, eventId);
     const event = this.client.getEventMapper()(rawEvent);
     if (
       event.getId() !== eventId ||
@@ -835,18 +876,25 @@ export class TeleCryptIOStorage {
     return event;
   }
 
-  private async writeTreeName(roomId: string, name: string): Promise<void> {
+  private async writeTreeName(roomId: string, name: string, signal?: AbortSignal): Promise<void> {
     validateName(name, "name");
     const metadataEventId = await this.sendEncryptedMetadataMessage(roomId, {
       msgtype: STORAGE_METADATA_MSGTYPE,
       body: name,
-    });
-    await this.client.sendStateEvent(
-      roomId,
-      STORAGE_METADATA_EVENT_TYPE as never,
-      { event_id: metadataEventId } as never,
-      "",
-    );
+    }, signal);
+    try {
+      await this.client.sendStateEvent(
+        roomId,
+        STORAGE_METADATA_EVENT_TYPE as never,
+        { event_id: metadataEventId } as never,
+        "",
+        { abortSignal: signal },
+      );
+    } catch (error) {
+      throw new MutationPartialError("rename tree", [metadataEventId],
+        "the encrypted name was accepted but its pointer could not be written",
+        { cause: error, treeId: roomId, backupTargets: [{ treeId: roomId, metadataEventId }] });
+    }
     this.treeNames.set(roomId, name);
   }
 
@@ -909,6 +957,7 @@ export class TeleCryptIOStorage {
   ): Promise<"backed_up" | "deleted"> {
     validateMatrixRoomId(treeId);
     if (fileId !== undefined) validateMatrixEventId(fileId, "file event ID");
+    if (options?.metadataEventId !== undefined) validateMatrixEventId(options.metadataEventId, "metadata event ID");
     const timeoutMs = matrixRequestTimeout({ timeoutMs: options?.timeoutMs ?? options?.localTimeoutMs ?? 20_000 });
     const signal = matrixRequestSignal(options);
     const crypto = this.client.getCrypto();
@@ -926,6 +975,9 @@ export class TeleCryptIOStorage {
         }
         if (!sessionIds) {
           const events: MatrixEvent[] = [];
+          if (options?.metadataEventId) {
+            events.push(await this.readEncryptedMetadataMessage(treeId, options.metadataEventId, true, signal));
+          }
           if (fileId === undefined) {
             events.push(await this.getTreeMetadataEvent(treeId, { signal }));
           } else {
@@ -986,10 +1038,10 @@ export class TeleCryptIOStorage {
     return deleted ? "deleted" : "backed_up";
   }
 
-  private async writeFileName(treeId: string, fileId: string, name: string): Promise<void> {
+  private async writeFileName(treeId: string, fileId: string, name: string, signal?: AbortSignal): Promise<void> {
     validateName(name, "file name");
     validateMatrixEventId(fileId, "file event ID");
-    await this.refreshRoomState(treeId);
+    await this.refreshRoomState(treeId, { signal });
     this.requireEncryptedStorageRoom(treeId);
     const branch = this.getTree(treeId)?.getFile(fileId);
     const indexEvent = branch?.indexEvent;
@@ -1005,24 +1057,28 @@ export class TeleCryptIOStorage {
     ) {
       throw new StorageError("file not found");
     }
-    const originalEvent = await this.getOriginalFileEvent(treeId, fileId, true);
+    const originalEvent = await this.getOriginalFileEventWithSignal(treeId, fileId, true, signal);
     if (originalEvent.isRedacted()) throw new StorageError("file not found");
 
     const metadataEventId = await this.sendEncryptedMetadataMessage(treeId, {
       msgtype: STORAGE_METADATA_MSGTYPE,
       body: name,
       file_event_id: fileId,
-    });
+    }, signal);
+    let listingEventId: string | undefined;
     try {
+      if (signal?.aborted) throw new StorageError("operation cancelled");
       const listing = await this.client.sendStateEvent(
         treeId,
         UNSTABLE_MSC3089_BRANCH.name,
         { active: true, metadata_event_id: metadataEventId } as never,
         fileId,
+        { abortSignal: signal },
       );
+      listingEventId = listing.event_id;
       // Another device can delete the attachment after the preflight check.
       // Its redaction wins over this rename, including a late listing update.
-      if ((await this.getOriginalFileEvent(treeId, fileId, true)).isRedacted()) {
+      if ((await this.getOriginalFileEventWithSignal(treeId, fileId, true, signal)).isRedacted()) {
         await this.client.redactEvent(treeId, listing.event_id);
         await this.client.redactEvent(treeId, metadataEventId);
         this.fileNames.delete(this.fileNameKey(treeId, fileId));
@@ -1031,9 +1087,9 @@ export class TeleCryptIOStorage {
       this.fileNames.set(this.fileNameKey(treeId, fileId), name);
     } catch (error) {
       if (error instanceof StorageError && error.message === "file was deleted while renaming; the rename was removed") throw error;
-      throw new MutationPartialError("rename file", [metadataEventId],
+      throw new MutationPartialError("rename file", [metadataEventId, ...(listingEventId ? [listingEventId] : [])],
         "the encrypted name was accepted but the rename could not be completed or verified",
-        { cause: error, treeId, backupTargets: [{ treeId, fileId }] });
+        { cause: error, treeId, backupTargets: [{ treeId, fileId, metadataEventId }] });
     }
   }
 
@@ -1154,7 +1210,16 @@ export class TeleCryptIOStorage {
     fileId: string,
     allowRedacted = false,
   ): Promise<MatrixEvent> {
-    const event = await this.readEncryptedMetadataMessage(treeId, fileId, allowRedacted);
+    return this.getOriginalFileEventWithSignal(treeId, fileId, allowRedacted);
+  }
+
+  private async getOriginalFileEventWithSignal(
+    treeId: string,
+    fileId: string,
+    allowRedacted: boolean,
+    signal?: AbortSignal,
+  ): Promise<MatrixEvent> {
+    const event = await this.readEncryptedMetadataMessage(treeId, fileId, allowRedacted, signal);
     if (event.isRedacted() && allowRedacted) return event;
     const content = event.getContent();
     if (
@@ -1820,7 +1885,7 @@ export class TeleCryptIOStorage {
       };
     }
     tree.createDirectory = (name: string) => this.createSubtree(tree, name);
-    tree.setName = (name: string) => this.writeTreeName(tree.id, name);
+    tree.setName = (name: string, signal?: AbortSignal) => this.writeTreeName(tree.id, name, signal);
     tree.listFiles = () => originalListFiles().map((branch) => this.decorateFileBranch(tree.id, branch));
     tree.getFile = (fileId: string) => {
       const branch = originalGetFile(fileId);
@@ -1841,7 +1906,7 @@ export class TeleCryptIOStorage {
         value: () => this.fileNames.get(nameKey) ?? GENERIC_FILE_NAME,
       },
       setName: {
-        value: (name: string) => this.writeFileName(treeId, branch.id, name),
+        value: (name: string, signal?: AbortSignal) => this.writeFileName(treeId, branch.id, name, signal),
       },
       delete: {
         value: async () => {
@@ -2231,6 +2296,7 @@ export class TeleCryptIOStorage {
           const childMember = childByUser.get(member.userId);
           if (!childMember || (childMember.membership !== "join" && childMember.membership !== "invite")) {
             const verifyHistorySharing = await prepareReaderHistorySharing(this.client, member.userId);
+            if (await this.getRoomMembership(tree.id, member.userId, { signal: effectiveSignal }) === "ban") continue;
             await withMatrixMutationAbort(() => tree.invite(member.userId, false), effectiveSignal);
             await verifyHistorySharing();
           }

@@ -1087,19 +1087,16 @@ export async function unshareVault(
           try {
             await withRateLimitRetry(
               () =>
-                withMatrixMutationAbort(
-                  () => storage.getClient().ban(space.id, userId, "unshared"),
-                  operation.signal,
-                ),
+                storage.getClient().ban(space.id, userId, "unshared"),
               operation.signal,
             );
+            completedRoomIds.add(space.id);
             const afterKick = await storage.getRoomMembership(space.id, userId, {
               signal: operation.signal,
             });
             if (afterKick !== "ban") {
               throw new StorageError("room membership removal could not be verified");
             }
-            completedRoomIds.add(space.id);
           } catch (error) {
             if (isGoneError(error)) return;
             if (error instanceof MatrixError && error.errcode === "M_FORBIDDEN") {
@@ -1148,7 +1145,15 @@ export async function unshareVault(
       }
       return { vaultId, userId, removed: true };
     }, operation.signal);
-    return await raceOperationDeadline(operation, pending, "mutation");
+    try {
+      return await raceOperationDeadline(operation, pending, "mutation");
+    } catch (error) {
+      if (error instanceof MutationOutcomeUnknownError && completedRoomIds.size > 0) {
+        throw new MutationPartialError("unshare", [...completedRoomIds],
+          "cancellation interrupted the remaining room removals", { cause: error });
+      }
+      throw error;
+    }
   } finally {
     operation.close();
   }
@@ -1502,7 +1507,7 @@ async function renameTree(
     let mutationAccepted = false;
     try {
       await withRateLimitRetry(
-        () => withMatrixMutationAbort(() => tree.setName(name), signal),
+        () => (tree.setName as (value: string, signal?: AbortSignal) => Promise<void>)(name, signal),
         signal,
       );
       mutationAccepted = true;
@@ -1529,7 +1534,7 @@ async function renameTree(
       throw new StorageError("rename failed", { cause: error });
     }
     return { id: treeId, name };
-  }, "mutation");
+  }, "settled-mutation");
 }
 
 /** Renames a top-level Vault. */
@@ -1643,7 +1648,7 @@ export async function renameFile(
     let mutationAccepted = false;
     try {
       await withRateLimitRetry(
-        () => branch.setName(name),
+        () => (branch.setName as (value: string, signal?: AbortSignal) => Promise<void>)(name, signal),
         signal,
       );
       mutationAccepted = true;

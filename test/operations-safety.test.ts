@@ -2119,4 +2119,30 @@ describe("operation safety", () => {
       completedIds: [root.id],
     });
   });
+
+  it("retains an acknowledged ban when cancellation interrupts descendant traversal", async () => {
+    const child = makeTree("!child-cancel:example.test", "Child", false);
+    const root = makeTree("!root-cancel:example.test", "Root", true);
+    root.setChildLinks([child]);
+    const target = "@target:example.test";
+    const controller = new AbortController();
+    const client = { ...sharingCrypto(), getUserId: () => "@owner:example.test", getRoom: roomLookup(root, child),
+      ban: vi.fn(async (roomId: string) => {
+        setTestMembership([root, child], roomId, target, "ban");
+      }),
+    };
+    const storage = { keySafe: { requireReady: async () => undefined },
+      getTree: (roomId: string) => roomId === root.id ? root : roomId === child.id ? child : null,
+      getClient: () => client,
+      refreshRoomState: vi.fn().mockResolvedValue(undefined),
+      getRoomMembership: vi.fn(async (roomId: string, userId: string) => {
+        const membership = await testMembership([root, child])(roomId, userId);
+        if (membership === "ban") controller.abort();
+        return membership;
+      }),
+    } as unknown as TeleCryptIOStorage;
+    await expect(unshareVault(storage, root.id, target, { signal: controller.signal })).rejects.toMatchObject({
+      code: "MUTATION_PARTIAL", operation: "unshare", completedIds: [root.id],
+    });
+  });
 });

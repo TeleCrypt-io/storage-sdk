@@ -28,7 +28,7 @@ export class MutationPartialError extends StorageError {
   readonly completedIds: readonly string[];
   /** Room containing the partial mutation, when the operation can target a nested folder. */
   readonly treeId?: string;
-  readonly backupTargets: readonly { treeId: string; fileId?: string }[];
+  readonly backupTargets: readonly { treeId: string; fileId?: string; metadataEventId?: string }[];
 
   constructor(
     operation: string,
@@ -36,7 +36,7 @@ export class MutationPartialError extends StorageError {
     detail?: string,
     options?: ErrorOptions & {
       treeId?: string;
-      backupTargets?: readonly { treeId: string; fileId?: string }[];
+      backupTargets?: readonly { treeId: string; fileId?: string; metadataEventId?: string }[];
     },
   ) {
     super(

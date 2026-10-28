@@ -3,6 +3,7 @@ import { MatrixEvent } from "matrix-js-sdk";
 import { writeFile } from "node:fs/promises";
 import { TeleCryptIOStorage } from "../../src/TeleCryptIOStorage.js";
 import * as core from "../../src/core/operations.js";
+import { MutationOutcomeUnknownError, MutationPartialError } from "../../src/core/errors.js";
 import { registerTestUser, loginNewDevice } from "../harness/users.js";
 import { waitFor } from "../harness/waitFor.js";
 
@@ -18,6 +19,9 @@ let pauseToken: string | undefined;
 let syncHeld = false;
 let releaseSync: (() => void) | undefined;
 let syncGate = Promise.resolve();
+let failEventId: string | undefined;
+let stallRequest: ((url: string, method: string) => boolean) | undefined;
+let observedAbort = false;
 
 async function openStorage(user: Awaited<ReturnType<typeof registerTestUser>>) {
   const storage = await TeleCryptIOStorage.create({
@@ -91,6 +95,15 @@ async function decrypt(storage: TeleCryptIOStorage, raw: object) {
 beforeAll(async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (failEventId && url.includes(`/event/${encodeURIComponent(failEventId)}`)) throw new Error("audit post-commit readback outage");
+    if (stallRequest?.(url, init?.method ?? "GET")) {
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+        const abort = () => { observedAbort = true; reject(new DOMException("aborted", "AbortError")); };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
     const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
     const response = await nativeFetch(input, init);
     if (pauseToken && new URL(url).pathname.endsWith("/sync") && headers.get("authorization") === `Bearer ${pauseToken}`) {
@@ -122,6 +135,67 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
+ it.each(["metadata", "listing", "readback"])("bounds stalled rename %s requests", async (stage) => {
+   const tree = await vault(`Rename deadline ${stage}`, []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   let listingAccepted = false;
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     const result = await sendState(...args);
+     if (args[0] === tree.id && args[3] === file.id) listingAccepted = true;
+     return result;
+   });
+   observedAbort = false;
+   stallRequest = (url, method) => stage === "metadata"
+     ? method === "PUT" && url.includes("/send/m.room.encrypted/")
+     : stage === "listing"
+       ? method === "PUT" && url.includes("/state/") && url.includes(encodeURIComponent(file.id))
+       : listingAccepted && method === "GET" && url.includes(`/event/${encodeURIComponent(file.id)}`);
+   const started = Date.now();
+   try {
+     const error = await core.renameFile(owner.storage, tree.id, file.id, "after.txt", { timeoutMs: 1000 })
+       .then(() => null, (failure: unknown) => failure);
+     expect(error).toBeInstanceOf(stage === "metadata" ? MutationOutcomeUnknownError : MutationPartialError);
+     expect(Date.now() - started).toBeLessThan(5000);
+     expect(observedAbort).toBe(true);
+     if (stage !== "metadata") expect((error as MutationPartialError).backupTargets[0]?.metadataEventId).toBeTruthy();
+   } finally { stallRequest = undefined; spy.mockRestore(); }
+ }, 120000);
+ it("retains and backs up the exact acknowledged tree name when its pointer fails", async () => {
+   const tree = await vault("Before pointer failure", []);
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     if (args[0] === tree.id && args[1] === "io.telecrypt.storage.metadata") throw new Error("pointer unavailable");
+     return sendState(...args);
+   });
+   const error = await core.renameVault(owner.storage, tree.id, "Unlinked name").then(() => null, (failure: unknown) => failure);
+   spy.mockRestore();
+   expect(error).toBeInstanceOf(MutationPartialError);
+   const target = (error as MutationPartialError).backupTargets[0]!;
+   expect(target.treeId).toBe(tree.id);
+   expect(target.metadataEventId).toBeTruthy();
+   expect(await owner.storage.waitForKeyBackup(tree.id, undefined, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+   expect(await owner.storage.getTreeName(tree.id)).toBe("Before pointer failure");
+ }, 120000);
+ it("backs up acknowledged file metadata when its listing write fails", async () => {
+   const tree = await vault("File pointer failure", []);
+   const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   const client = owner.storage.getClient();
+   const sendState = client.sendStateEvent.bind(client);
+   const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
+     if (args[0] === tree.id && args[3] === file.id) throw new Error("listing unavailable");
+     return sendState(...args);
+   });
+   const error = await core.renameFile(owner.storage, tree.id, file.id, "Unlinked name").then(() => null, (failure: unknown) => failure);
+   spy.mockRestore();
+   expect(error).toBeInstanceOf(MutationPartialError);
+   const target = (error as MutationPartialError).backupTargets[0]!;
+   expect(target).toMatchObject({ treeId: tree.id, fileId: file.id, metadataEventId: expect.any(String) });
+   expect(await owner.storage.waitForKeyBackup(tree.id, file.id, { metadataEventId: target.metadataEventId })).toBe("backed_up");
+   expect(await owner.storage.getFileName(tree.id, file.id)).toBe("before.txt");
+ }, 120000);
  it("rotates after removal during upload", async () => {
    const tree = await vault("Audit removal during media upload");
    const before = await upload(owner.storage, tree.id, "before.txt", "prior content");
@@ -156,27 +230,22 @@ describe("SDK repair regressions", () => {
    await owner.storage.waitForKeyBackup(tree.id, file.id);
    const c = owner.storage.getClient();
    const originalState = c.sendStateEvent.bind(c);
-   const originalFetch = c.fetchRoomEvent.bind(c);
    let committed = false;
    const stateSpy = vi.spyOn(c, "sendStateEvent").mockImplementation(async (...args) => {
      const result = await originalState(...args);
-     if (args[0] === tree.id && args[3] === file.id) committed = true;
+     if (args[0] === tree.id && args[3] === file.id) { committed = true; failEventId = file.id; }
      return result;
-   });
-   const fetchSpy = vi.spyOn(c, "fetchRoomEvent").mockImplementation(async (...args) => {
-     if (committed && args[0] === tree.id && args[1] === file.id) throw new Error("audit post-commit readback outage");
-     return originalFetch(...args);
    });
    let failure: unknown;
    try { await core.renameFile(owner.storage, tree.id, file.id, "committed-rename.txt"); }
    catch (error) { failure = error; }
-   finally { stateSpy.mockRestore(); fetchSpy.mockRestore(); }
+   finally { stateSpy.mockRestore(); failEventId = undefined; }
    const error = failure as Error & {backupTargets?: unknown};
    const actualName = await owner.storage.getFileName(tree.id, file.id);
    await save("rename_partial_tracking", {committed, actualName, errorName: error?.name, message:error?.message, backupTargets: error?.backupTargets ?? null});
    expect(actualName).toBe("committed-rename.txt");
    expect(error.name).toBe("MutationPartialError");
-   expect(error.backupTargets).toEqual([{ treeId: tree.id, fileId: file.id }]);
+   expect(error.backupTargets).toEqual([{ treeId: tree.id, fileId: file.id, metadataEventId: expect.any(String) }]);
  }, 120000);
 
  it("does not restore access after concurrent removal", async () => {
