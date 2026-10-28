@@ -730,8 +730,10 @@ export async function withTreeMutation<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const previous = treeMutationQueues.get(client) ?? Promise.resolve();
+  let started = false;
   const run = previous.catch(() => undefined).then(() => {
     if (signal?.aborted) throw new StorageError("operation cancelled");
+    started = true;
     return operation(signal);
   });
   const settled = run.then(
@@ -739,7 +741,13 @@ export async function withTreeMutation<T>(
     () => undefined,
   );
   treeMutationQueues.set(client, settled);
-  return run;
+  if (!signal) return run;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { if (!started) reject(new StorageError("operation cancelled")); };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    run.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 }
 
 export class TeleCryptIOStorage {
@@ -1685,37 +1693,6 @@ export class TeleCryptIOStorage {
     });
   }
 
-  /** Bounds a Matrix mutation without cancelling a shared client's other
-   * requests. A timeout means the server may have committed the mutation. */
-  private static withMutationTimeout<T>(
-    promise: Promise<T>,
-    ms: number,
-    operation: string,
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new MutationOutcomeUnknownError(operation));
-      }, ms);
-      promise.then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        },
-        (error: unknown) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(error);
-        },
-      );
-    });
-  }
-
   /** Wait until the client reaches Prepared/Syncing. Ignores transient
    * pre-sync states instead of rejecting on the first Sync event (which can
    * race `startClient`), and handles the case where sync already completed
@@ -1981,12 +1958,11 @@ export class TeleCryptIOStorage {
     const cleanupSignal = new AbortController().signal;
     let safeToForget = true;
     const failures: unknown[] = [];
+    const http = requireMatrixHttpTransport(this.client);
     try {
-      await TeleCryptIOStorage.withTimeout(
-        withMatrixMutationAbort(() => this.client.leave(roomId), cleanupSignal),
-        CLEANUP_TIMEOUT_MS,
-        "room leave cleanup",
-        cleanupSignal,
+      await http.authedRequest(
+        Method.Post, `/rooms/${encodeURIComponent(roomId)}/leave`, undefined, {},
+        { prefix: ClientPrefix.V3, abortSignal: cleanupSignal, localTimeoutMs: CLEANUP_TIMEOUT_MS },
       );
     } catch (error) {
       if (!isGoneRoomError(error)) {
@@ -1998,12 +1974,12 @@ export class TeleCryptIOStorage {
     }
     if (safeToForget) {
       try {
-        await TeleCryptIOStorage.withTimeout(
-          withMatrixMutationAbort(() => this.client.forget(roomId), cleanupSignal),
-          CLEANUP_TIMEOUT_MS,
-          "room forget cleanup",
-          cleanupSignal,
+        await http.authedRequest(
+          Method.Post, `/rooms/${encodeURIComponent(roomId)}/forget`, undefined, undefined,
+          { prefix: ClientPrefix.V3, abortSignal: cleanupSignal, localTimeoutMs: CLEANUP_TIMEOUT_MS },
         );
+        this.client.store?.removeRoom(roomId);
+        this.client.emit?.(ClientEvent.DeleteRoom, roomId);
       } catch (error) {
         if (!isGoneRoomError(error)) {
           failures.push(error);
@@ -2037,8 +2013,15 @@ export class TeleCryptIOStorage {
     const getSender = (event as { getSender?: () => string | null }).getSender;
     if (!currentUserId || typeof getSender !== "function" || getSender() !== currentUserId) return false;
     const eventId = validateMatrixEventId(event.getId(), "state event ID");
-    await withMatrixMutationAbort(() => this.client.redactEvent(roomId, eventId), signal);
+    await this.redactRelationLink(roomId, eventId, signal);
     return true;
+  }
+
+  private async redactRelationLink(roomId: string, eventId: string, signal?: AbortSignal): Promise<void> {
+    await requireMatrixHttpTransport(this.client).authedRequest(
+      Method.Put, `/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${encodeURIComponent(this.client.makeTxnId())}`,
+      undefined, {}, { prefix: ClientPrefix.V3, abortSignal: signal, localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS },
+    );
   }
 
   private async removeChildLink(parentId: string, childId: string, signal?: AbortSignal): Promise<boolean> {
@@ -2055,14 +2038,9 @@ export class TeleCryptIOStorage {
     signal?: AbortSignal,
   ): Promise<TreeSpace> {
     if (signal?.aborted) throw new StorageError("operation cancelled");
-    const response = await TeleCryptIOStorage.withMutationTimeout(
-      withMatrixMutationAbort(
-        () => this.client.createRoom(this.treeRoomOptions(name)),
-        signal,
-        `${operation} room creation`,
-      ),
-      MATRIX_HTTP_TIMEOUT_MS,
-      `${operation} room creation`,
+    const response = await requireMatrixHttpTransport(this.client).authedRequest<{ room_id: string }>(
+      Method.Post, "/createRoom", undefined, this.treeRoomOptions(name),
+      { prefix: ClientPrefix.V3, abortSignal: signal, localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS },
     ).catch((error: unknown) => {
       // createRoom is a server-side mutation. A rejected HTTP promise does
       // not prove that the request was rejected before commit, so every
@@ -2083,17 +2061,30 @@ export class TeleCryptIOStorage {
     try {
       const tree = await this.waitForTreeSpace(roomId, operation, signal);
       try {
-        await this.writeTreeName(roomId, name);
+        await this.writeTreeName(roomId, name, signal);
+        if (signal?.aborted) throw new StorageError("operation cancelled");
       } catch (error) {
         try {
           await this.cleanupCreatedRoom(roomId);
         } catch (cleanupError) {
+          if (error instanceof MutationPartialError) {
+            throw new MutationPartialError(operation, [roomId, ...error.completedIds],
+              "the encrypted name was accepted and room cleanup failed",
+              { cause: new AggregateError([error, cleanupError], "creation and cleanup failed"),
+                treeId: roomId, backupTargets: error.backupTargets });
+          }
           throwWithCleanupDetail(error, roomId, cleanupError);
+        }
+        if (error instanceof MutationPartialError) {
+          throw new MutationPartialError(operation, [roomId, ...error.completedIds],
+            "the encrypted name was accepted and the created room was cleaned up",
+            { cause: error, treeId: roomId });
         }
         throw new StorageError(`${operation}: encrypted name initialization failed`, { cause: error });
       }
       return tree;
     } catch (error) {
+      if (error instanceof MutationPartialError) throw error;
       if (
         error instanceof StorageError &&
         error.message === `${operation}: encrypted name initialization failed`
@@ -2161,19 +2152,12 @@ export class TeleCryptIOStorage {
 
         parentLinkAttempted = true;
         pendingLink = "parent";
-        const parentLink = await TeleCryptIOStorage.withMutationTimeout(
-          withMatrixMutationAbort(
-            () =>
-              this.client.sendStateEvent(
-                currentParent.id,
-                EventType.SpaceChild,
-                { via: [via] },
-                tree.id,
-              ),
-            effectiveSignal,
-          ),
-          MATRIX_HTTP_TIMEOUT_MS,
-          "parent link",
+        const parentLink = await this.client.sendStateEvent(
+          currentParent.id,
+          EventType.SpaceChild,
+          { via: [via] },
+          tree.id,
+          { abortSignal: effectiveSignal, localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS },
         );
         pendingLink = undefined;
         if ((parentLink as { event_id?: unknown } | undefined)?.event_id !== undefined) {
@@ -2184,19 +2168,12 @@ export class TeleCryptIOStorage {
         }
         childLinkAttempted = true;
         pendingLink = "child";
-        const childLink = await TeleCryptIOStorage.withMutationTimeout(
-          withMatrixMutationAbort(
-            () =>
-              this.client.sendStateEvent(
-                tree.id,
-                EventType.SpaceParent,
-                { via: [via] },
-                currentParent.id,
-              ),
-            effectiveSignal,
-          ),
-          MATRIX_HTTP_TIMEOUT_MS,
-          "child link",
+        const childLink = await this.client.sendStateEvent(
+          tree.id,
+          EventType.SpaceParent,
+          { via: [via] },
+          currentParent.id,
+          { abortSignal: effectiveSignal, localTimeoutMs: MATRIX_HTTP_TIMEOUT_MS },
         );
         pendingLink = undefined;
         if ((childLink as { event_id?: unknown } | undefined)?.event_id !== undefined) {
@@ -2235,15 +2212,7 @@ export class TeleCryptIOStorage {
         if (parentLinkAttempted) {
           try {
             if (parentLinkEventId) {
-              await TeleCryptIOStorage.withTimeout(
-                withMatrixMutationAbort(
-                  () => this.client.redactEvent(currentParent.id, parentLinkEventId!),
-                  compensationSignal,
-                ),
-                MATRIX_HTTP_TIMEOUT_MS,
-                "parent link rollback",
-                compensationSignal,
-              );
+              await this.redactRelationLink(currentParent.id, parentLinkEventId, compensationSignal);
               await this.refreshRoomState(currentParent.id, { signal: compensationSignal });
               const remaining = this.client
                 .getRoom(currentParent.id)
@@ -2278,15 +2247,7 @@ export class TeleCryptIOStorage {
         if (childLinkAttempted) {
           try {
             if (childLinkEventId) {
-              await TeleCryptIOStorage.withTimeout(
-                withMatrixMutationAbort(
-                  () => this.client.redactEvent(tree.id, childLinkEventId!),
-                  compensationSignal,
-                ),
-                MATRIX_HTTP_TIMEOUT_MS,
-                "child link rollback",
-                compensationSignal,
-              );
+              await this.redactRelationLink(tree.id, childLinkEventId, compensationSignal);
               await this.refreshRoomState(tree.id, { signal: compensationSignal });
               const remaining = this.client
                 .getRoom(tree.id)

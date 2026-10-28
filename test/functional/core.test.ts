@@ -82,7 +82,7 @@ describe("core operations", () => {
       expect(listed).toContainEqual(folder);
 
       const renamed = await core.renameFolder(storage, folder.id, "Renamed");
-      expect(renamed).toEqual({ id: folder.id, name: "Renamed" });
+      expect(renamed).toMatchObject({ id: folder.id, name: "Renamed", backupTarget: { treeId: folder.id, metadataEventId: expect.any(String) } });
       const details = await core.getFolderDetails(storage, folder.id);
       expect(details).toMatchObject({ id: folder.id, name: "Renamed" });
 
@@ -204,7 +204,7 @@ describe("core operations", () => {
       );
 
       const renamed = await core.renameFile(storage, vault.id, uploaded.id, "after.txt");
-      expect(renamed).toEqual({ id: uploaded.id, name: "after.txt" });
+      expect(renamed).toMatchObject({ id: uploaded.id, name: "after.txt", backupTarget: { treeId: vault.id, fileId: uploaded.id, metadataEventId: expect.any(String) } });
 
       const filesAfter = await waitFor(
         async () => {

@@ -75,6 +75,7 @@ export interface DeleteResult {
 export interface RenameResult {
   id: string;
   name: string;
+  backupTarget?: { treeId: string; fileId?: string; metadataEventId?: string };
 }
 
 /** Bytes in/out are always `Uint8Array` — never a file path. */

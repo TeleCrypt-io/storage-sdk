@@ -650,9 +650,10 @@ export async function createVault(
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("create vault failed", { cause: error });
     }
-    ensureOperationActive(signal);
+    if (signal.aborted) throw new MutationPartialError("create vault", [tree.id],
+      "the vault was created before cancellation", { treeId: tree.id, backupTargets: [{ treeId: tree.id }] });
     return { id: tree.id, name };
-  }, "mutation");
+  }, "settled-mutation");
 }
 
 /** Top-level vaults only — excludes subdirectories of an existing tree. */
@@ -1489,9 +1490,10 @@ export async function createSubfolder(
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("create folder failed", { cause: error });
     }
-    ensureOperationActive(signal);
+    if (signal.aborted) throw new MutationPartialError("create folder", [sub.id],
+      "the folder was created before cancellation", { treeId: sub.id, backupTargets: [{ treeId: sub.id }] });
     return { id: sub.id, name };
-  }, "mutation");
+  }, "settled-mutation");
 }
 
 async function renameTree(
@@ -1534,7 +1536,7 @@ async function renameTree(
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("rename failed", { cause: error });
     }
-    return { id: treeId, name };
+    return { id: treeId, name, ...(metadataEventId ? { backupTarget: { treeId, metadataEventId } } : {}) };
   }, "settled-mutation");
 }
 
@@ -1680,7 +1682,7 @@ export async function renameFile(
       if (signal.aborted) throw new StorageError("operation cancelled");
       throw new StorageError("rename file failed", { cause: error });
     }
-    return { id: fileId, name };
+    return { id: fileId, name, ...(metadataEventId ? { backupTarget: { treeId, fileId, metadataEventId } } : {}) };
   }, "settled-mutation");
 }
 

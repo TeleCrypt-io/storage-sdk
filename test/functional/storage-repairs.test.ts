@@ -25,7 +25,8 @@ let stallRequest: ((url: string, method: string) => boolean) | undefined;
 let observedAbort = false;
 let holdRequest: ((url: string) => Promise<void> | undefined) | undefined;
 let blockedBackupToken: string | undefined;
-afterEach(() => { blockedBackupToken = undefined; failEventId = undefined; });
+let failCleanupRoom: string | undefined;
+afterEach(() => { blockedBackupToken = undefined; failEventId = undefined; failCleanupRoom = undefined; });
 
 async function openStorage(user: Awaited<ReturnType<typeof registerTestUser>>) {
   const storage = await TeleCryptIOStorage.create({
@@ -100,6 +101,10 @@ beforeAll(async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     await holdRequest?.(url);
+    if (failCleanupRoom && url.includes(`/rooms/${encodeURIComponent(failCleanupRoom)}/leave`)) {
+      return new Response(JSON.stringify({ errcode: "M_UNKNOWN", error: "controlled cleanup failure" }),
+        { status: 503, headers: { "content-type": "application/json" } });
+    }
     const requestHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
     if (blockedBackupToken && requestHeaders.get("authorization") === `Bearer ${blockedBackupToken}` &&
         (init?.method ?? "GET") === "PUT" && url.includes("/room_keys/keys")) {
@@ -146,9 +151,84 @@ afterAll(async () => {
 
 
 describe("SDK repair regressions", () => {
- it("backs up the first exact rename session after another device replaces the pointer", async () => {
+ it.each(["failure", "success"])("retains a late creation acknowledgement through cleanup %s", async (cleanup) => {
+   const client = owner.storage.getClient();
+   const send = client.sendMessage.bind(client);
+   let release!: () => void;
+   let acknowledged!: () => void;
+   let roomId: string | undefined;
+   const gate = new Promise<void>((resolve) => { release = resolve; });
+   const ready = new Promise<void>((resolve) => { acknowledged = resolve; });
+   const sendSpy = vi.spyOn(client, "sendMessage").mockImplementation(async (...args) => {
+     const result = await send(...args);
+     if (typeof args[1] === "object" && args[1]?.body === "late-create") {
+       roomId = args[0];
+       if (cleanup === "failure") failCleanupRoom = roomId;
+       acknowledged(); await gate;
+     }
+     return result;
+   });
+   const controller = new AbortController();
+   const pending = core.createVault(owner.storage, "late-create", { signal: controller.signal })
+     .then(() => null, (error: unknown) => error);
+   try {
+     await ready;
+     controller.abort();
+     release();
+     const error = await pending;
+     expect(error).toBeInstanceOf(MutationPartialError);
+     expect((error as MutationPartialError).completedIds).toContain(roomId);
+     if (cleanup === "failure") {
+       expect((error as MutationPartialError).backupTargets[0]).toMatchObject({ treeId: roomId, metadataEventId: expect.any(String) });
+       expect((error as Error).cause).toBeInstanceOf(AggregateError);
+     } else {
+       expect((error as MutationPartialError).backupTargets).toEqual([]);
+     }
+   } finally {
+     release(); sendSpy.mockRestore(); failCleanupRoom = undefined;
+     if (roomId && cleanup === "failure") { await client.leave(roomId); await client.forget(roomId); }
+   }
+ }, 120000);
+ it.each(["vault", "folder"])("settles cancelled %s creation through encryption and cleanup", async (kind) => {
+   const parent = kind === "folder" ? await vault("Creation parent", []) : undefined;
+   const client = owner.storage.getClient();
+   const backend = (client as unknown as { cryptoBackend: { encryptEvent: (event: MatrixEvent, room: unknown) => Promise<void> } }).cryptoBackend;
+   const encrypt = backend.encryptEvent.bind(backend);
+   let releaseEncryption!: () => void;
+   let releaseCleanup!: () => void;
+   let encryptionStarted!: () => void;
+   let cleanupStarted!: () => void;
+   const encryptionGate = new Promise<void>((resolve) => { releaseEncryption = resolve; });
+   const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+   const encryptionReady = new Promise<void>((resolve) => { encryptionStarted = resolve; });
+   const cleanupReady = new Promise<void>((resolve) => { cleanupStarted = resolve; });
+   const encryptionSpy = vi.spyOn(backend, "encryptEvent").mockImplementation(async (event, room) => {
+     if (event.getContent().body === "cancelled-creation") { encryptionStarted(); await encryptionGate; }
+     await encrypt(event, room);
+   });
+   holdRequest = (url) => url.endsWith("/leave") ? (cleanupStarted(), cleanupGate) : undefined;
+   const controller = new AbortController();
+   let settled = false;
+   const operation = kind === "vault"
+     ? core.createVault(owner.storage, "cancelled-creation", { signal: controller.signal })
+     : core.createSubfolder(owner.storage, parent!.id, "cancelled-creation", { signal: controller.signal });
+   const pending = operation.then(() => null, (error: unknown) => error).finally(() => { settled = true; });
+   try {
+     await encryptionReady;
+     controller.abort();
+     await new Promise((resolve) => setTimeout(resolve, 100));
+     expect(settled).toBe(false);
+     releaseEncryption();
+     await cleanupReady;
+     expect(settled).toBe(false);
+     releaseCleanup();
+     expect(await pending).toBeInstanceOf(Error);
+   } finally { releaseEncryption(); releaseCleanup(); holdRequest = undefined; encryptionSpy.mockRestore(); }
+ }, 120000);
+ it.each(["partial", "success"])("backs up the first exact %s rename session after another device replaces the pointer", async (outcome) => {
    const tree = await vault("Concurrent rename sessions", []);
    const file = await upload(owner.storage, tree.id, "before.txt", "contents");
+   await owner.storage.waitForKeyBackup(tree.id, file.id);
    const secondUser = await loginNewDevice(owner.user);
    const second = await openStorage(secondUser);
    await second.keySafe.restore(owner.recoveryKey);
@@ -156,16 +236,19 @@ describe("SDK repair regressions", () => {
    const sendState = client.sendStateEvent.bind(client);
    const spy = vi.spyOn(client, "sendStateEvent").mockImplementation(async (...args) => {
      const result = await sendState(...args);
-     if (args[0] === tree.id && args[3] === file.id) failEventId = file.id;
+     if (outcome === "partial" && args[0] === tree.id && args[3] === file.id) failEventId = file.id;
      return result;
    });
    blockedBackupToken = secondUser.accessToken;
-   let firstError: unknown;
+   let firstResult: unknown;
    try {
-     firstError = await core.renameFile(second, tree.id, file.id, "first-rename.txt").then(() => null, (error: unknown) => error);
+     firstResult = await core.renameFile(second, tree.id, file.id, "first-rename.txt").then((result) => result, (error: unknown) => error);
    } finally { spy.mockRestore(); failEventId = undefined; }
-   if (!(firstError instanceof MutationPartialError)) throw firstError ?? new Error("rename unexpectedly succeeded");
-   const target = (firstError as MutationPartialError).backupTargets[0]!;
+   if (outcome === "partial" && !(firstResult instanceof MutationPartialError)) throw firstResult ?? new Error("rename unexpectedly succeeded");
+   if (outcome === "success" && firstResult instanceof Error) throw firstResult;
+   const target = outcome === "partial"
+     ? (firstResult as MutationPartialError).backupTargets[0]!
+     : (firstResult as { backupTarget: { treeId: string; fileId: string; metadataEventId: string } }).backupTarget;
    expect(target.metadataEventId).toBeTruthy();
    const firstRaw = await client.fetchRoomEvent(tree.id, target.metadataEventId!);
    const firstSession = firstRaw.content.session_id as string;

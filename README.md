@@ -131,6 +131,8 @@ new backup-progress event. If verification fails, retain the local profile and r
 the metadata mutation has already committed.
 For a partial rename, pass each retained backup target's `metadataEventId` in the existing options
 object so verification includes the acknowledged event even if its pointer write failed.
+Successful renames also return an optional `backupTarget`; use it for the same exact-event check
+even if another device changes the name before backup completes.
 
 Pending setup state is kept beside the login's IndexedDB crypto data. A platform that snapshots
 IndexedDB to disk, such as the CLI, must supply `onKeySafeStateChanged` at creation and durably flush

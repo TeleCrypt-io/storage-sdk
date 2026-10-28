@@ -103,7 +103,7 @@ function fixture() {
     }),
     getRooms: () => [room],
     getRoom: (roomId: string) => roomId === ROOM_ID ? room : null,
-    createRoom: vi.fn(async () => ({ room_id: ROOM_ID })),
+    createRoom: vi.fn(async (_options?: unknown) => ({ room_id: ROOM_ID })),
     unstableGetFileTreeSpace: () => tree,
     sendMessage: vi.fn(async (roomId: string, content: Record<string, unknown>) => {
       const eventId = content.msgtype === MsgType.File ? "$file-event" : `$message-${++idSequence}`;
@@ -135,7 +135,8 @@ function fixture() {
     fetchRoomEvent: vi.fn(async (_roomId: string, eventId: string) => ({ event_id: eventId })),
     getEventMapper: () => (raw: { event_id: string }) => events.get(raw.event_id),
     decryptEventIfNeeded: vi.fn().mockResolvedValue(undefined),
-    http: { authedRequest: vi.fn().mockResolvedValue([]) },
+    http: { authedRequest: vi.fn(async (method: string, path: string, _query: unknown, body: unknown) =>
+      method === "POST" && path === "/createRoom" ? client.createRoom(body) : []) },
   };
   return {
     client,

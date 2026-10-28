@@ -72,6 +72,27 @@ function storageForTest(rawClient: unknown): TeleCryptIOStorage {
   if (typeof client.sendMessage !== "function") {
     client.sendMessage = vi.fn(async () => ({ event_id: `$encrypted-name-${++messageId}` }));
   }
+  client.makeTxnId ??= () => `test-${++messageId}`;
+  const http = (client.http ??= {}) as { authedRequest?: (...args: unknown[]) => Promise<unknown> };
+  const authedRequest = http.authedRequest?.bind(http);
+  http.authedRequest = vi.fn((method: unknown, path: unknown, query: unknown, body: unknown, options: unknown) => {
+    if (method === "POST" && path === "/createRoom") {
+      return (client.createRoom as (body: unknown) => Promise<unknown>)(body);
+    }
+    if (typeof path === "string") {
+      const cleanup = path.match(/^\/rooms\/([^/]+)\/(leave|forget)$/);
+      if (method === "POST" && cleanup) {
+        return (client[cleanup[2]!] as (roomId: string) => Promise<unknown>)(decodeURIComponent(cleanup[1]!));
+      }
+      const redact = path.match(/^\/rooms\/([^/]+)\/redact\/([^/]+)\//);
+      if (method === "PUT" && redact) {
+        return (client.redactEvent as (roomId: string, eventId: string) => Promise<unknown>)(
+          decodeURIComponent(redact[1]!), decodeURIComponent(redact[2]!),
+        );
+      }
+    }
+    return authedRequest ? authedRequest(method, path, query, body, options) : Promise.resolve([]);
+  });
   const sendStateEvent = client.sendStateEvent as
     | ((roomId: string, type: string, content: unknown, stateKey: string) => Promise<unknown>)
     | undefined;
@@ -232,10 +253,10 @@ describe("tree mutations", () => {
     await Promise.resolve();
     await Promise.resolve();
     controller.abort();
-    releaseFirst();
-    await expect(first).resolves.toBe("first");
     await expect(second).rejects.toThrow("operation cancelled");
     expect(secondStarted).toBe(false);
+    releaseFirst();
+    await expect(first).resolves.toBe("first");
     expect(abort).not.toHaveBeenCalled();
   });
 
@@ -403,6 +424,7 @@ describe("tree mutations", () => {
       "m.space.child",
       { via: ["example.test"] },
       createdChildren[0].id,
+      expect.objectContaining({ localTimeoutMs: 30000 }),
     );
   });
 
